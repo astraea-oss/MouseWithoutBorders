@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -43,6 +45,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    let connection_status = connect_once(&config, &identity).await;
+
+    #[cfg(windows)]
+    {
+        if !args.dry_run {
+            edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
+            let status = match connection_status {
+                Ok(status) => status,
+                Err(err) => format!("Disconnected: {err:#}"),
+            };
+            tracing::info!(%status, "starting tray loop");
+            edge_windows_input::run_tray(&status).context("failed to run tray app")?;
+            return Ok(());
+        }
+    }
+
+    connection_status?;
+    Ok(())
+}
+
+async fn connect_once(config: &AppConfig, identity: &IdentityKey) -> Result<String> {
     let peer = config
         .peer
         .laptop
@@ -53,7 +76,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to connect to {addr}"))?;
     let (mut session, peer_fingerprint) =
-        initiate_noise_session(stream, &identity, Some(&peer.pinned_fingerprint))
+        initiate_noise_session(stream, identity, Some(&peer.pinned_fingerprint))
             .await
             .with_context(|| format!("failed encrypted handshake with {addr}"))?;
 
@@ -69,7 +92,7 @@ async fn main() -> Result<()> {
     .await?;
 
     tracing::info!(%addr, %peer_fingerprint, "sent encrypted controller hello");
-    Ok(())
+    Ok(format!("Last hello sent to {addr} ({peer_fingerprint})"))
 }
 
 async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame) -> Result<()> {

@@ -1,4 +1,5 @@
 /target/
+/portable/
 /state/
 /controller.toml
 /receiver.toml

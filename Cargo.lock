@@ -396,6 +396,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "windows",
+ "windows-sys",
 ]
 
 [[package]]

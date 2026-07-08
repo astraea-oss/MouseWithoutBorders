@@ -237,13 +237,14 @@ where
     write_packet(&mut io, &out[..len]).await?;
 
     let remote_fingerprint = remote_static_fingerprint(&noise)?;
-    if let Some(expected) = expected_peer_fingerprint {
-        if !expected.is_empty() && expected != remote_fingerprint {
-            return Err(CryptoError::FingerprintMismatch {
-                expected: expected.to_string(),
-                actual: remote_fingerprint,
-            });
-        }
+    if let Some(expected) = expected_peer_fingerprint
+        && !expected.is_empty()
+        && expected != remote_fingerprint
+    {
+        return Err(CryptoError::FingerprintMismatch {
+            expected: expected.to_string(),
+            actual: remote_fingerprint,
+        });
     }
 
     Ok((
