@@ -139,6 +139,12 @@ mod capture {
             alt_down: false,
         };
 
+        if let Some(existing) = STATE.get() {
+            *existing.lock().expect("capture state poisoned") = state;
+            tracing::info!("Windows input capture hooks reused");
+            return Ok(receiver);
+        }
+
         STATE
             .set(Mutex::new(state))
             .map_err(|_| WindowsInputError::CaptureAlreadyRunning)?;
@@ -581,12 +587,12 @@ mod tray {
     use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::OnceLock};
 
     use windows_sys::Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
-                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-                Shell_NotifyIconW,
+                NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
+                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -704,15 +710,24 @@ mod tray {
 
     fn add_tray_icon(hwnd: HWND, status: &str) -> Result<()> {
         let mut data = notify_icon_data(hwnd);
-        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = WM_TRAY_ICON;
         data.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
         copy_wide("edge-kvm", status, &mut data.szTip);
 
         if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
-            return Err(WindowsInputError::Tray(
-                "Shell_NotifyIconW(NIM_ADD) failed".to_string(),
-            ));
+            let error = unsafe { GetLastError() };
+            return Err(WindowsInputError::Tray(format!(
+                "Shell_NotifyIconW(NIM_ADD) failed with Win32 error {error}"
+            )));
+        }
+
+        data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        if unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) } == 0 {
+            let error = unsafe { GetLastError() };
+            return Err(WindowsInputError::Tray(format!(
+                "Shell_NotifyIconW(NIM_SETVERSION) failed with Win32 error {error}"
+            )));
         }
         Ok(())
     }
