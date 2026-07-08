@@ -4,10 +4,9 @@ listen = "0.0.0.0:42420"
 monitor = "eDP-1"
 
 [input]
-backend = "libei"
+backend = "auto"
 
 [clipboard]
 enabled = true
 text_only = true
 max_bytes = 1048576
-

@@ -9,10 +9,9 @@ position = "left"
 pinned_fingerprint = ""
 
 [input]
-backend = "libei"
+backend = "auto"
 
 [clipboard]
 enabled = true
 text_only = true
 max_bytes = 1048576
-

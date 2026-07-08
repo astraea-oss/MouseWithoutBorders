@@ -50,10 +50,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let backend = LibeiBackend::probe();
-    if !backend.is_available() {
-        tracing::warn!("libei was not found through pkg-config; input tests will fail closed");
-    }
+    let backend = ReceiverBackend::from_config(&config)?;
 
     if let Some(test) = args.test_input {
         run_input_test(&backend, test).await?;
@@ -88,7 +85,7 @@ async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
     }
 }
 
-async fn run_input_test(backend: &LibeiBackend, test: TestInput) -> Result<()> {
+async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()> {
     match test {
         TestInput::Pointer => {
             backend
@@ -127,7 +124,11 @@ async fn run_input_test(backend: &LibeiBackend, test: TestInput) -> Result<()> {
     Ok(())
 }
 
-async fn run_receiver(config: AppConfig, allow_pairing: bool, backend: LibeiBackend) -> Result<()> {
+async fn run_receiver(
+    config: AppConfig,
+    allow_pairing: bool,
+    backend: ReceiverBackend,
+) -> Result<()> {
     let state_dir = default_state_dir();
     let identity = IdentityKey::load_or_create(state_dir.join("identity.toml"))
         .await
@@ -228,7 +229,7 @@ async fn run_receiver(config: AppConfig, allow_pairing: bool, backend: LibeiBack
 async fn handle_controller(
     mut session: NoiseSession<TcpStream>,
     config: &AppConfig,
-    backend: &LibeiBackend,
+    backend: &ReceiverBackend,
 ) -> Result<()> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
@@ -276,4 +277,64 @@ async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Fram
 
 fn default_config_path() -> PathBuf {
     portable_config_path("receiver.toml")
+}
+
+#[derive(Debug, Clone)]
+enum ReceiverBackend {
+    Libei(LibeiBackend),
+    LogOnly,
+}
+
+impl ReceiverBackend {
+    fn from_config(config: &AppConfig) -> Result<Self> {
+        let requested = config.input.backend.to_ascii_lowercase();
+        let libei = LibeiBackend::probe();
+
+        match requested.as_str() {
+            "auto" if libei.is_available() => {
+                tracing::info!("using libei input backend");
+                Ok(Self::Libei(libei))
+            }
+            "auto" => {
+                tracing::warn!(
+                    "libei was not found through pkg-config; using log-only input backend for testing"
+                );
+                Ok(Self::LogOnly)
+            }
+            "log" | "mock" | "none" => {
+                tracing::warn!("using log-only input backend; no local input will be injected");
+                Ok(Self::LogOnly)
+            }
+            "libei" if libei.is_available() => {
+                tracing::info!("using libei input backend");
+                Ok(Self::Libei(libei))
+            }
+            "libei" => anyhow::bail!(
+                "input.backend is \"libei\", but libei is not available through pkg-config"
+            ),
+            other => {
+                anyhow::bail!("unsupported input.backend \"{other}\"; expected auto, libei, or log")
+            }
+        }
+    }
+
+    async fn inject(&self, event: InputEvent) -> Result<()> {
+        match self {
+            Self::Libei(backend) => backend.inject(event).await.map_err(Into::into),
+            Self::LogOnly => {
+                tracing::info!(?event, "received input event");
+                Ok(())
+            }
+        }
+    }
+
+    async fn all_keys_up(&self) -> Result<()> {
+        match self {
+            Self::Libei(backend) => backend.all_keys_up().await.map_err(Into::into),
+            Self::LogOnly => {
+                tracing::info!("received all-keys-up");
+                Ok(())
+            }
+        }
+    }
 }

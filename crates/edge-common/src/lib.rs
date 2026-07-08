@@ -82,7 +82,7 @@ pub struct InputConfig {
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
-            backend: "libei".to_string(),
+            backend: "auto".to_string(),
         }
     }
 }

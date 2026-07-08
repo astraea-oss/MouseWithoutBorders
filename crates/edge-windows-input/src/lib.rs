@@ -54,25 +54,23 @@ pub fn run_tray(_status: &str) -> Result<()> {
 mod tray {
     use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::OnceLock};
 
-    use windows_sys::{
-        Win32::{
-            Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-            System::LibraryLoader::GetModuleHandleW,
-            UI::{
-                Shell::{
-                    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-                    Shell_NotifyIconW,
-                },
-                WindowsAndMessaging::{
-                    AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-                    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-                    IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
-                    RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-                    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
-                    WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-                },
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            Shell::{
+                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+                Shell_NotifyIconW,
             },
-        }
+            WindowsAndMessaging::{
+                AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+                IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
+                RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+                TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
+                WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            },
+        },
     };
 
     use crate::{Result, WindowsInputError};
@@ -90,7 +88,9 @@ mod tray {
 
             let instance = GetModuleHandleW(null_mut());
             if instance.is_null() {
-                return Err(WindowsInputError::Tray("GetModuleHandleW failed".to_string()));
+                return Err(WindowsInputError::Tray(
+                    "GetModuleHandleW failed".to_string(),
+                ));
             }
 
             let class_name = to_wide("EdgeKvmTrayWindow");
@@ -122,7 +122,9 @@ mod tray {
                 null_mut::<c_void>(),
             );
             if hwnd.is_null() {
-                return Err(WindowsInputError::Tray("CreateWindowExW failed".to_string()));
+                return Err(WindowsInputError::Tray(
+                    "CreateWindowExW failed".to_string(),
+                ));
             }
 
             add_tray_icon(hwnd, status)?;
@@ -182,7 +184,9 @@ mod tray {
         copy_wide("edge-kvm", status, &mut data.szTip);
 
         if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
-            return Err(WindowsInputError::Tray("Shell_NotifyIconW(NIM_ADD) failed".to_string()));
+            return Err(WindowsInputError::Tray(
+                "Shell_NotifyIconW(NIM_ADD) failed".to_string(),
+            ));
         }
         Ok(())
     }
@@ -243,7 +247,10 @@ mod tray {
     fn copy_wide(prefix: &str, status: &str, target: &mut [u16]) {
         let text = format!("{prefix}: {status}");
         let wide = to_wide(&text);
-        let count = wide.len().saturating_sub(1).min(target.len().saturating_sub(1));
+        let count = wide
+            .len()
+            .saturating_sub(1)
+            .min(target.len().saturating_sub(1));
         target[..count].copy_from_slice(&wide[..count]);
         target[count] = 0;
     }
