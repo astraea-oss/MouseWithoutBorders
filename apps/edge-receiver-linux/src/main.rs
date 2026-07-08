@@ -281,7 +281,6 @@ fn default_config_path() -> PathBuf {
 
 #[derive(Debug, Clone)]
 enum ReceiverBackend {
-    Libei(LibeiBackend),
     LogOnly,
 }
 
@@ -292,11 +291,16 @@ impl ReceiverBackend {
 
         match requested.as_str() {
             "auto" if libei.is_available() => {
-                tracing::info!("using libei input backend");
-                Ok(Self::Libei(libei))
+                tracing::warn!(
+                    pkg_config = libei.pkg_config_name(),
+                    version = libei.version().unwrap_or("unknown"),
+                    "libei is installed, but sender injection is not implemented yet; using log-only input backend for testing"
+                );
+                Ok(Self::LogOnly)
             }
             "auto" => {
                 tracing::warn!(
+                    pkg_config = libei.pkg_config_name(),
                     "libei was not found through pkg-config; using log-only input backend for testing"
                 );
                 Ok(Self::LogOnly)
@@ -306,11 +310,15 @@ impl ReceiverBackend {
                 Ok(Self::LogOnly)
             }
             "libei" if libei.is_available() => {
-                tracing::info!("using libei input backend");
-                Ok(Self::Libei(libei))
+                anyhow::bail!(
+                    "input.backend is \"libei\" and {} {} is installed, but libei sender injection is not implemented yet",
+                    libei.pkg_config_name(),
+                    libei.version().unwrap_or("unknown"),
+                )
             }
             "libei" => anyhow::bail!(
-                "input.backend is \"libei\", but libei is not available through pkg-config"
+                "input.backend is \"libei\", but {} is not available through pkg-config",
+                libei.pkg_config_name()
             ),
             other => {
                 anyhow::bail!("unsupported input.backend \"{other}\"; expected auto, libei, or log")
@@ -320,7 +328,6 @@ impl ReceiverBackend {
 
     async fn inject(&self, event: InputEvent) -> Result<()> {
         match self {
-            Self::Libei(backend) => backend.inject(event).await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!(?event, "received input event");
                 Ok(())
@@ -330,7 +337,6 @@ impl ReceiverBackend {
 
     async fn all_keys_up(&self) -> Result<()> {
         match self {
-            Self::Libei(backend) => backend.all_keys_up().await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!("received all-keys-up");
                 Ok(())

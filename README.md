@@ -9,8 +9,9 @@ This workspace follows `PLAN.md` and is intentionally narrow:
 - Protocol frames are length-prefixed MessagePack.
 - Pairing uses persistent device identities and pinned peer fingerprints.
 - Portable by default: configs and state live beside the running executable.
-- Linux input uses `libei` when available, otherwise `backend = "auto"` falls back
-  to log-only input so the encrypted network path can be tested.
+- Linux input detects CachyOS/Arch `libei-1.0`, but real sender injection is not
+  implemented yet. `backend = "auto"` currently falls back to log-only input so
+  the encrypted network path can be tested honestly.
 
 ## Build
 
@@ -50,9 +51,9 @@ cargo run -p edge-receiver-linux -- --test-clipboard
 cargo run -p edge-receiver-linux -- --test-input pointer
 ```
 
-With `input.backend = "auto"`, `--test-input` logs events if `libei` is not
-discoverable through `pkg-config`. Set `input.backend = "libei"` to require real
-local injection.
+With `input.backend = "auto"`, `--test-input` logs events. The receiver detects
+`libei-1.0` on CachyOS/Arch, but real local injection is still a development
+task. Set `input.backend = "libei"` only once the sender backend is implemented.
 
 ## Windows controller
 
@@ -101,6 +102,6 @@ From Windows, send test events:
 .\edge-controller-win.exe --test-clipboard-text "hello from Windows"
 ```
 
-Expected result with `backend = "auto"` on a machine without `libei`: the
-receiver stays connected and logs each received input or clipboard event. With a
-working `libei` backend, the same commands should inject locally on Hyprland.
+Expected result with `backend = "auto"`: the receiver stays connected and logs
+each received input or clipboard event. Real Hyprland injection is the next
+backend implementation step.

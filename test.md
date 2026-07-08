@@ -23,11 +23,12 @@ allow_pairing=true
 The receiver may log this warning:
 
 ```text
-libei was not found through pkg-config; using log-only input backend for testing
+libei is installed, but sender injection is not implemented yet; using log-only input backend for testing
 ```
 
-That is acceptable for this test. It means input events are logged on Linux
-instead of injected into the desktop.
+That is acceptable for this test. On this CachyOS laptop, `libei` is installed
+as `libei-1.0`, but real sender injection is not implemented yet. Input events
+are logged on Linux instead of injected into the desktop.
 
 ## Windows Setup
 
@@ -222,6 +223,6 @@ The current build passes this phase when:
 ## Known Limit
 
 This does not yet prove real desktop input injection on Linux. On this laptop,
-`libei` is not available through `pkg-config`, so the receiver intentionally uses
-the log-only backend. The next implementation step is the real Linux injection
-backend.
+`libei` is available as `libei-1.0`, but the receiver intentionally uses the
+log-only backend until real libei sender injection is implemented. The next
+implementation step is the real Linux injection backend.

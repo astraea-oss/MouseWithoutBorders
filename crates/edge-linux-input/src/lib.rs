@@ -5,10 +5,14 @@ use edge_protocol::{InputEvent, OutputInfo, ScreenInfo};
 use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, process::Command};
 
+pub const LIBEI_PKG_CONFIG: &str = "libei-1.0";
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinuxInputError {
-    #[error("libei is not available through pkg-config")]
-    LibeiUnavailable,
+    #[error("{pkg_config} is not available through pkg-config")]
+    LibeiUnavailable { pkg_config: &'static str },
+    #[error("{pkg_config} is installed, but libei input injection is not implemented yet")]
+    LibeiInjectionNotImplemented { pkg_config: &'static str },
     #[error("command `{program}` failed: {message}")]
     CommandFailed { program: String, message: String },
     #[error("io error: {0}")]
@@ -24,33 +28,49 @@ pub type Result<T> = std::result::Result<T, LinuxInputError>;
 #[derive(Debug, Clone)]
 pub struct LibeiBackend {
     available: bool,
+    version: Option<String>,
 }
 
 impl LibeiBackend {
     pub fn probe() -> Self {
-        let available = std::process::Command::new("pkg-config")
-            .arg("--exists")
-            .arg("libei")
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        Self { available }
+        let version = std::process::Command::new("pkg-config")
+            .arg("--modversion")
+            .arg(LIBEI_PKG_CONFIG)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|version| !version.is_empty());
+
+        Self {
+            available: version.is_some(),
+            version,
+        }
     }
 
     pub fn is_available(&self) -> bool {
         self.available
     }
 
+    pub fn pkg_config_name(&self) -> &'static str {
+        LIBEI_PKG_CONFIG
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
     pub async fn inject(&self, event: InputEvent) -> Result<()> {
         if !self.available {
-            return Err(LinuxInputError::LibeiUnavailable);
+            return Err(LinuxInputError::LibeiUnavailable {
+                pkg_config: LIBEI_PKG_CONFIG,
+            });
         }
 
-        // The FFI backend is intentionally isolated behind this method. Until generated
-        // bindings are wired in, tests and the receiver can exercise the full command path
-        // while failing closed when the compositor backend is absent.
-        tracing::info!(?event, "libei input injection placeholder");
-        Ok(())
+        tracing::debug!(?event, "libei injection requested");
+        Err(LinuxInputError::LibeiInjectionNotImplemented {
+            pkg_config: LIBEI_PKG_CONFIG,
+        })
     }
 
     pub async fn all_keys_up(&self) -> Result<()> {
