@@ -63,6 +63,7 @@ pub fn windows_scancode_to_evdev(key: WindowsScanCode) -> Option<u16> {
         (0x39, false) => 57,
         (0x1c, true) => 28,
         // Modifiers.
+        (0x3a, false) => 58,
         (0x2a, false) => 42,
         (0x36, false) => 54,
         (0x1d, false) => 29,
@@ -142,6 +143,10 @@ mod tests {
         assert_eq!(
             windows_scancode_to_evdev(WindowsScanCode::new(0x0e, false)),
             Some(14)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x3a, false)),
+            Some(58)
         );
         assert_eq!(
             windows_scancode_to_evdev(WindowsScanCode::new(0x1c, false)),

@@ -30,7 +30,7 @@ use tokio::{net::TcpStream, sync::mpsc, time};
 #[cfg(windows)]
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
 #[cfg(windows)]
-const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
+const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]

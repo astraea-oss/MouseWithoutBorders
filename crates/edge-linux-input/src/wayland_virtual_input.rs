@@ -184,13 +184,19 @@ impl HyprlandVirtualInput {
                 };
                 self.keyboard
                     .key(self.time_ms(), u32::from(evdev_code), state.into());
+                let was_pressed = self.pressed_keys.contains(&evdev_code);
                 if down {
                     self.pressed_keys.insert(evdev_code);
                 } else {
                     self.pressed_keys.remove(&evdev_code);
                 }
-                if self.modifiers.update(evdev_code, down) {
-                    self.keyboard.modifiers(self.modifiers.depressed(), 0, 0, 0);
+                if self.modifiers.update(evdev_code, down, was_pressed) {
+                    self.keyboard.modifiers(
+                        self.modifiers.depressed(),
+                        0,
+                        self.modifiers.locked(),
+                        0,
+                    );
                 }
             }
             InputEvent::AllKeysUp => self.all_keys_up(),
@@ -207,8 +213,8 @@ impl HyprlandVirtualInput {
             self.keyboard
                 .key(time, u32::from(key), wl_keyboard::KeyState::Released.into());
         }
-        if self.modifiers.clear() {
-            self.keyboard.modifiers(0, 0, 0, 0);
+        if self.modifiers.clear_depressed() {
+            self.keyboard.modifiers(0, 0, self.modifiers.locked(), 0);
         }
         for button in std::mem::take(&mut self.pressed_buttons) {
             self.pointer
@@ -236,10 +242,23 @@ struct ModifierState {
     control: u8,
     alt: u8,
     logo: u8,
+    caps_lock: bool,
 }
 
 impl ModifierState {
-    fn update(&mut self, evdev_code: u16, down: bool) -> bool {
+    fn update(&mut self, evdev_code: u16, down: bool, was_pressed: bool) -> bool {
+        if evdev_code == 58 {
+            if down && !was_pressed {
+                self.caps_lock = !self.caps_lock;
+                return true;
+            }
+            return false;
+        }
+
+        if down && was_pressed {
+            return false;
+        }
+
         let counter = match evdev_code {
             42 | 54 => &mut self.shift,
             29 | 97 => &mut self.control,
@@ -255,12 +274,15 @@ impl ModifierState {
             *counter = counter.saturating_sub(1);
         }
 
-        previous == 0 || *counter == 0
+        (previous > 0) != (*counter > 0)
     }
 
-    fn clear(&mut self) -> bool {
+    fn clear_depressed(&mut self) -> bool {
         let had_modifiers = self.depressed() != 0;
-        *self = Self::default();
+        self.shift = 0;
+        self.control = 0;
+        self.alt = 0;
+        self.logo = 0;
         had_modifiers
     }
 
@@ -279,6 +301,10 @@ impl ModifierState {
             mask |= 1 << 6;
         }
         mask
+    }
+
+    fn locked(&self) -> u32 {
+        if self.caps_lock { 1 << 1 } else { 0 }
     }
 }
 
@@ -410,9 +436,9 @@ mod tests {
     fn tracks_control_modifier_mask() {
         let mut modifiers = ModifierState::default();
 
-        assert!(modifiers.update(29, true));
+        assert!(modifiers.update(29, true, false));
         assert_eq!(modifiers.depressed(), 1 << 2);
-        assert!(modifiers.update(29, false));
+        assert!(modifiers.update(29, false, true));
         assert_eq!(modifiers.depressed(), 0);
     }
 
@@ -420,12 +446,12 @@ mod tests {
     fn keeps_modifier_active_until_both_sides_release() {
         let mut modifiers = ModifierState::default();
 
-        assert!(modifiers.update(29, true));
-        assert!(!modifiers.update(97, true));
+        assert!(modifiers.update(29, true, false));
+        assert!(!modifiers.update(97, true, false));
         assert_eq!(modifiers.depressed(), 1 << 2);
-        assert!(!modifiers.update(29, false));
+        assert!(!modifiers.update(29, false, true));
         assert_eq!(modifiers.depressed(), 1 << 2);
-        assert!(modifiers.update(97, false));
+        assert!(modifiers.update(97, false, true));
         assert_eq!(modifiers.depressed(), 0);
     }
 
@@ -433,11 +459,36 @@ mod tests {
     fn tracks_common_modifier_masks() {
         let mut modifiers = ModifierState::default();
 
-        assert!(modifiers.update(42, true));
-        assert!(modifiers.update(56, true));
-        assert!(modifiers.update(125, true));
+        assert!(modifiers.update(42, true, false));
+        assert!(modifiers.update(56, true, false));
+        assert!(modifiers.update(125, true, false));
         assert_eq!(modifiers.depressed(), (1 << 0) | (1 << 3) | (1 << 6));
-        assert!(modifiers.clear());
+        assert!(modifiers.clear_depressed());
         assert_eq!(modifiers.depressed(), 0);
+    }
+
+    #[test]
+    fn toggles_caps_lock_locked_mask() {
+        let mut modifiers = ModifierState::default();
+
+        assert!(modifiers.update(58, true, false));
+        assert_eq!(modifiers.locked(), 1 << 1);
+        assert!(!modifiers.update(58, true, true));
+        assert_eq!(modifiers.locked(), 1 << 1);
+        assert!(!modifiers.update(58, false, true));
+        assert_eq!(modifiers.locked(), 1 << 1);
+        assert!(modifiers.update(58, true, false));
+        assert_eq!(modifiers.locked(), 0);
+    }
+
+    #[test]
+    fn clearing_depressed_modifiers_preserves_caps_lock() {
+        let mut modifiers = ModifierState::default();
+
+        assert!(modifiers.update(58, true, false));
+        assert!(modifiers.update(29, true, false));
+        assert!(modifiers.clear_depressed());
+        assert_eq!(modifiers.depressed(), 0);
+        assert_eq!(modifiers.locked(), 1 << 1);
     }
 }
