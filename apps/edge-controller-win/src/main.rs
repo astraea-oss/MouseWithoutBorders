@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
+use std::sync::mpsc::RecvTimeoutError;
+#[cfg(windows)]
 use std::{fs::OpenOptions, io::Write, path::Path, time::SystemTime};
 use std::{path::PathBuf, time::Duration};
 
@@ -500,7 +502,7 @@ async fn handle_remote_clipboard_event(
 fn start_live_input(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
-) -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>> {
+) -> Result<Option<mpsc::Receiver<Frame>>> {
     let peer = config
         .peer
         .laptop
@@ -515,15 +517,29 @@ fn start_live_input(
         remote_size,
     })
     .context("failed to start Windows live input capture")?;
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(512);
     std::thread::spawn(move || {
-        while let Ok(event) = capture.recv() {
-            let frame = match event {
-                edge_windows_input::CapturedInput::Input(event) => Frame::Input(event),
-                edge_windows_input::CapturedInput::Control(event) => Frame::Control(event),
-            };
-            if sender.send(frame).is_err() {
-                break;
+        let mut pending_motion = PendingMotion::default();
+        loop {
+            match capture.recv_timeout(Duration::from_millis(4)) {
+                Ok(event) => {
+                    let frame = captured_input_to_frame(event);
+                    if pending_motion.coalesce(&frame) {
+                        continue;
+                    }
+                    if !pending_motion.flush(&sender) || sender.blocking_send(frame).is_err() {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if !pending_motion.flush(&sender) {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = pending_motion.flush(&sender);
+                    break;
+                }
             }
         }
     });
@@ -535,16 +551,55 @@ fn start_live_input(
 fn start_live_input(
     _config: &AppConfig,
     _screen_info: Option<ScreenInfo>,
-) -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>> {
+) -> Result<Option<mpsc::Receiver<Frame>>> {
     Ok(None)
 }
 
-async fn recv_live_input(
-    receiver: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>,
-) -> Option<Frame> {
+async fn recv_live_input(receiver: &mut Option<mpsc::Receiver<Frame>>) -> Option<Frame> {
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(windows)]
+fn captured_input_to_frame(event: edge_windows_input::CapturedInput) -> Frame {
+    match event {
+        edge_windows_input::CapturedInput::Input(event) => Frame::Input(event),
+        edge_windows_input::CapturedInput::Control(event) => Frame::Control(event),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PendingMotion {
+    dx: f64,
+    dy: f64,
+}
+
+#[cfg(windows)]
+impl PendingMotion {
+    fn coalesce(&mut self, frame: &Frame) -> bool {
+        if let Frame::Input(InputEvent::PointerMotion { dx, dy }) = frame {
+            self.dx += dx;
+            self.dy += dy;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn flush(&mut self, sender: &mpsc::Sender<Frame>) -> bool {
+        if self.dx == 0.0 && self.dy == 0.0 {
+            return true;
+        }
+        let frame = Frame::Input(InputEvent::PointerMotion {
+            dx: self.dx,
+            dy: self.dy,
+        });
+        self.dx = 0.0;
+        self.dy = 0.0;
+        sender.blocking_send(frame).is_ok()
     }
 }
 
