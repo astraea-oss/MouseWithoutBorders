@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -39,6 +41,7 @@ enum TestInput {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    let run_tray = should_run_tray(&args);
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
 
@@ -53,19 +56,33 @@ async fn main() -> Result<()> {
         .await
         .context("failed to load controller identity")?;
 
-    let mut connection = connect_session(&config, &identity).await?;
-    read_initial_frames(&mut connection.session).await?;
-
     #[cfg(windows)]
     {
-        if args.tray {
+        if run_tray {
+            let connection = match connect_session(&config, &identity).await {
+                Ok(mut connection) => {
+                    read_initial_frames(&mut connection.session).await?;
+                    Some(connection)
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "starting tray without receiver connection");
+                    None
+                }
+            };
+
             edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
-            let status = connection.status();
+            let status = connection
+                .as_ref()
+                .map(ControllerConnection::status)
+                .unwrap_or_else(|| "Disconnected".to_string());
             tracing::info!(%status, "starting tray loop");
             edge_windows_input::run_tray(&status).context("failed to run tray app")?;
             return Ok(());
         }
     }
+
+    let mut connection = connect_session(&config, &identity).await?;
+    read_initial_frames(&mut connection.session).await?;
 
     if let Some(test) = args.test_input {
         send_test_input(&mut connection.session, test).await?;
@@ -89,6 +106,10 @@ async fn main() -> Result<()> {
     }
 
     run_connected(connection).await
+}
+
+fn should_run_tray(args: &Args) -> bool {
+    args.tray || (!args.dry_run && args.test_input.is_none() && args.test_clipboard_text.is_none())
 }
 
 struct ControllerConnection {
