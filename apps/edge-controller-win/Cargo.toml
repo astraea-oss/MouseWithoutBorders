@@ -10,9 +10,9 @@ anyhow.workspace = true
 clap.workspace = true
 edge-common = { path = "../../crates/edge-common" }
 edge-crypto = { path = "../../crates/edge-crypto" }
+edge-geometry = { path = "../../crates/edge-geometry" }
 edge-keymap = { path = "../../crates/edge-keymap" }
 edge-protocol = { path = "../../crates/edge-protocol" }
 edge-windows-input = { path = "../../crates/edge-windows-input" }
 tokio.workspace = true
 tracing.workspace = true
-

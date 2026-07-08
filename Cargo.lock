@@ -382,6 +382,7 @@ dependencies = [
  "clap",
  "edge-common",
  "edge-crypto",
+ "edge-geometry",
  "edge-keymap",
  "edge-protocol",
  "edge-windows-input",

@@ -4,11 +4,17 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+#[cfg(windows)]
+use edge_common::PeerPosition;
 use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
 use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session};
+#[cfg(windows)]
+use edge_geometry::Size;
+#[cfg(windows)]
+use edge_protocol::Edge;
 use edge_protocol::{
-    ClipboardEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION, decode_frame,
-    encode_frame,
+    ClipboardEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION, ScreenInfo,
+    decode_frame, encode_frame,
 };
 use tokio::{net::TcpStream, time};
 
@@ -62,8 +68,8 @@ async fn main() -> Result<()> {
         if run_tray {
             let connection = match connect_session(&config, &identity).await {
                 Ok(mut connection) => {
-                    read_initial_frames(&mut connection.session).await?;
-                    Some(connection)
+                    let screen_info = read_initial_frames(&mut connection.session).await?;
+                    Some((connection, screen_info))
                 }
                 Err(err) => {
                     tracing::warn!(%err, "starting tray without receiver connection");
@@ -74,16 +80,26 @@ async fn main() -> Result<()> {
             edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
             let status = connection
                 .as_ref()
-                .map(ControllerConnection::status)
+                .map(|(connection, _)| connection.status())
                 .unwrap_or_else(|| "Disconnected".to_string());
             tracing::info!(%status, "starting tray loop");
-            edge_windows_input::run_tray(&status).context("failed to run tray app")?;
+            std::thread::spawn(move || {
+                if let Err(err) = edge_windows_input::run_tray(&status) {
+                    tracing::warn!(%err, "Windows tray exited with error");
+                }
+            });
+
+            if let Some((connection, screen_info)) = connection {
+                return run_connected(connection, &config, screen_info).await;
+            }
+
+            std::future::pending::<()>().await;
             return Ok(());
         }
     }
 
     let mut connection = connect_session(&config, &identity).await?;
-    read_initial_frames(&mut connection.session).await?;
+    let screen_info = read_initial_frames(&mut connection.session).await?;
 
     if let Some(test) = args.test_input {
         send_test_input(&mut connection.session, test).await?;
@@ -106,7 +122,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_connected(connection).await
+    run_connected(connection, &config, screen_info).await
 }
 
 #[cfg(windows)]
@@ -163,7 +179,8 @@ async fn connect_session(
     })
 }
 
-async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<()> {
+async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<Option<ScreenInfo>> {
+    let mut screen_info = None;
     loop {
         match time::timeout(Duration::from_millis(750), read_secure_frame(session)).await {
             Ok(Ok(Frame::Hello(hello))) => {
@@ -179,14 +196,15 @@ async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<()
                     outputs = info.outputs.len(),
                     "receiver screen info"
                 );
-                return Ok(());
+                screen_info = Some(info);
+                return Ok(screen_info);
             }
             Ok(Ok(Frame::Error(err))) => {
                 anyhow::bail!("receiver error: {}: {}", err.code, err.message)
             }
             Ok(Ok(frame)) => tracing::debug!(?frame, "initial receiver frame"),
             Ok(Err(err)) => return Err(err).context("failed to read receiver frame"),
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(screen_info),
         }
     }
 }
@@ -243,8 +261,13 @@ async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput)
     Ok(())
 }
 
-async fn run_connected(mut connection: ControllerConnection) -> Result<()> {
+async fn run_connected(
+    mut connection: ControllerConnection,
+    config: &AppConfig,
+    screen_info: Option<ScreenInfo>,
+) -> Result<()> {
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
+    let mut input_rx = start_live_input(config, screen_info)?;
 
     loop {
         tokio::select! {
@@ -252,6 +275,11 @@ async fn run_connected(mut connection: ControllerConnection) -> Result<()> {
                 write_secure_frame(&mut connection.session, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
                 tracing::info!("shutdown requested");
                 return Ok(());
+            }
+            event = recv_live_input(&mut input_rx) => {
+                if let Some(frame) = event {
+                    write_secure_frame(&mut connection.session, &frame).await?;
+                }
             }
             frame = read_secure_frame(&mut connection.session) => {
                 match frame? {
@@ -263,6 +291,82 @@ async fn run_connected(mut connection: ControllerConnection) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn start_live_input(
+    config: &AppConfig,
+    screen_info: Option<ScreenInfo>,
+) -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>> {
+    let peer = config
+        .peer
+        .laptop
+        .as_ref()
+        .context("missing [peer.laptop] config")?;
+    let Some(remote_size) = remote_size(screen_info.as_ref()) else {
+        tracing::warn!("receiver did not provide screen info; live edge capture disabled");
+        return Ok(None);
+    };
+    let capture = edge_windows_input::start_capture(edge_windows_input::CaptureConfig {
+        edge: peer_position_to_edge(peer.position),
+        remote_size,
+    })
+    .context("failed to start Windows live input capture")?;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = capture.recv() {
+            let frame = match event {
+                edge_windows_input::CapturedInput::Input(event) => Frame::Input(event),
+                edge_windows_input::CapturedInput::Control(event) => Frame::Control(event),
+            };
+            if sender.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    tracing::info!("live Windows edge capture enabled");
+    Ok(Some(receiver))
+}
+
+#[cfg(not(windows))]
+fn start_live_input(
+    _config: &AppConfig,
+    _screen_info: Option<ScreenInfo>,
+) -> Result<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>> {
+    Ok(None)
+}
+
+async fn recv_live_input(
+    receiver: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>,
+) -> Option<Frame> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(windows)]
+fn remote_size(screen_info: Option<&ScreenInfo>) -> Option<Size> {
+    let info = screen_info?;
+    let output = info
+        .outputs
+        .iter()
+        .find(|output| output.name == info.primary_output)
+        .or_else(|| info.outputs.first())?;
+    Some(Size {
+        width: output.width,
+        height: output.height,
+    })
+}
+
+#[cfg(windows)]
+fn peer_position_to_edge(position: PeerPosition) -> Edge {
+    match position {
+        PeerPosition::Left => Edge::Left,
+        PeerPosition::Right => Edge::Right,
+        PeerPosition::Top => Edge::Top,
+        PeerPosition::Bottom => Edge::Bottom,
     }
 }
 

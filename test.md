@@ -235,6 +235,45 @@ controller connected
 If `wl-copy` is available on Linux, clipboard text should be written. If it
 fails, report the Linux receiver error text.
 
+## Live Control Test
+
+After the protocol tests pass, run the controller normally from
+`portable-windows`:
+
+```powershell
+.\edge-controller-win.exe
+```
+
+Expected Windows-side signs:
+
+```text
+receiver hello
+receiver screen info
+live Windows edge capture enabled
+```
+
+With the current config:
+
+```toml
+[peer.laptop]
+position = "left"
+```
+
+Move the Windows cursor into the left edge of the Windows desktop. Expected
+behavior:
+
+- control switches to Linux;
+- Windows cursor is held near the edge while remote control is active;
+- mouse movement moves the Linux cursor;
+- mouse buttons, wheel events, and mapped keyboard keys are sent to Linux;
+- typing into a focused Linux text field works;
+- `Ctrl+Alt+Pause` releases control back to Windows;
+- moving far enough right while remote control is active should also release
+  back to Windows.
+
+The Linux Waybar tray should update its input counter while live control is
+active.
+
 ## Pass Criteria
 
 The current build passes this phase when:
@@ -244,6 +283,9 @@ The current build passes this phase when:
 - `--dry-run` completes successfully.
 - Pointer, click, and key test commands complete successfully and affect the
   Linux desktop.
+- Normal controller mode activates at the configured Windows edge and sends
+  live mouse/keyboard input to Linux.
+- `Ctrl+Alt+Pause` releases live control back to Windows.
 - Waybar shows the `edge-kvm receiver` tray item while the Linux receiver is
   running.
 - No command requires `%APPDATA%`; `controller.toml` and `state\` stay beside
