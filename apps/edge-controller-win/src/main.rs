@@ -54,6 +54,7 @@ struct Args {
 enum TestInput {
     Pointer,
     Click,
+    Wheel,
     Key,
 }
 
@@ -294,6 +295,13 @@ async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput)
                     button: MouseButton::Left,
                     down: false,
                 }),
+            )
+            .await?;
+        }
+        TestInput::Wheel => {
+            write_secure_frame(
+                session,
+                &Frame::Input(InputEvent::PointerWheel { x: 0.0, y: -1.0 }),
             )
             .await?;
         }

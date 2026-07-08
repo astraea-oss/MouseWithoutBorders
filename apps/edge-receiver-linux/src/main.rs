@@ -43,6 +43,7 @@ struct Args {
 enum TestInput {
     Pointer,
     Click,
+    Wheel,
     Key,
 }
 
@@ -114,6 +115,11 @@ async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()
                     button: edge_protocol::MouseButton::Left,
                     down: false,
                 })
+                .await?;
+        }
+        TestInput::Wheel => {
+            backend
+                .inject(InputEvent::PointerWheel { x: 0.0, y: -1.0 })
                 .await?;
         }
         TestInput::Key => {

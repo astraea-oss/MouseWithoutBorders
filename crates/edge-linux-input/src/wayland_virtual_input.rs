@@ -49,6 +49,7 @@ const XKB_KEYMAP: &str = r#"xkb_keymap {
     xkb_symbols   { include "pc+us+inet(evdev)" };
 };
 "#;
+const WHEEL_AXIS_STEP: f64 = 15.0;
 
 #[derive(Debug, Clone)]
 pub struct HyprlandVirtualInputBackend {
@@ -168,11 +169,15 @@ impl HyprlandVirtualInput {
             InputEvent::PointerWheel { x, y } => {
                 let time = self.time_ms();
                 if x != 0.0 {
-                    self.pointer
-                        .axis(time, wl_pointer::Axis::HorizontalScroll, x);
+                    self.pointer.axis(
+                        time,
+                        wl_pointer::Axis::HorizontalScroll,
+                        x * WHEEL_AXIS_STEP,
+                    );
                 }
                 if y != 0.0 {
-                    self.pointer.axis(time, wl_pointer::Axis::VerticalScroll, y);
+                    self.pointer
+                        .axis(time, wl_pointer::Axis::VerticalScroll, -y * WHEEL_AXIS_STEP);
                 }
                 self.pointer.frame();
             }
