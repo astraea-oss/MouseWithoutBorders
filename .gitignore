@@ -1,3 +1,5 @@
 /target/
-/.edge-kvm-state/
+/state/
+/controller.toml
+/receiver.toml
 *.log

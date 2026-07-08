@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use edge_common::{AppConfig, Role, default_state_dir, init_tracing};
+use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
 use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session};
 use edge_protocol::{Frame, Hello, PROTOCOL_VERSION, encode_frame};
 use tokio::net::TcpStream;
@@ -96,17 +96,5 @@ async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
 }
 
 fn default_config_path() -> PathBuf {
-    std::env::var_os("EDGE_KVM_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .map(|path| path.join("edge-kvm/controller.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".config/edge-kvm/controller.toml"))
-        })
-        .unwrap_or_else(|| PathBuf::from("controller.toml"))
+    portable_config_path("controller.toml")
 }

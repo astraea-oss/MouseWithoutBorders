@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use edge_common::{AppConfig, Role, default_state_dir, init_tracing};
+use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
 use edge_crypto::{IdentityKey, NoiseSession, PinDecision, PinStore, accept_noise_session};
 use edge_linux_input::{
     LibeiBackend, hyprland_screen_info, read_clipboard_text, write_clipboard_text,
@@ -275,17 +275,5 @@ async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Fram
 }
 
 fn default_config_path() -> PathBuf {
-    std::env::var_os("EDGE_KVM_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join("edge-kvm/receiver.toml"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".config/edge-kvm/receiver.toml"))
-        })
-        .unwrap_or_else(|| PathBuf::from("receiver.toml"))
+    portable_config_path("receiver.toml")
 }

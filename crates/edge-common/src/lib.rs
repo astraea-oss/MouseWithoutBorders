@@ -186,17 +186,21 @@ pub fn init_tracing() {
 pub fn default_state_dir() -> PathBuf {
     std::env::var_os("EDGE_KVM_STATE_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join("edge-kvm"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".local/state/edge-kvm"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".edge-kvm-state"))
+        .unwrap_or_else(|| portable_app_dir().join("state"))
+}
+
+pub fn portable_config_path(file_name: &str) -> PathBuf {
+    std::env::var_os("EDGE_KVM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| portable_app_dir().join(file_name))
+}
+
+pub fn portable_app_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
