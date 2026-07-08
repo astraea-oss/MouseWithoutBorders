@@ -47,6 +47,33 @@ cargo run -p edge-receiver-linux -- --test-input key
 
 All three initialize the Hyprland Wayland virtual input backend and exit 0.
 
+## Linux Tray
+
+The Linux receiver publishes a KDE/freedesktop StatusNotifierItem by default,
+which Waybar's tray module can display. The tray shows:
+
+- current receiver state;
+- listen address;
+- active input backend;
+- connected peer;
+- connection, input, and clipboard counters;
+- last receiver error when one occurs.
+
+The tray menu includes a `Quit receiver` action. Use `--no-tray` for diagnostic
+or headless runs:
+
+```bash
+cargo run -p edge-receiver-linux -- --pair --no-tray
+```
+
+Verified on Lua's Waybar session:
+
+```text
+org.kde.StatusNotifierWatcher                  waybar
+org.kde.StatusNotifierItem-<pid>-1             edge-receiver-l
+Title: edge-kvm receiver: Listening
+```
+
 Later portability work:
 
 - Probe multiple pkg-config names if needed, starting with `libei-1.0`.

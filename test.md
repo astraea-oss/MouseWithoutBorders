@@ -35,6 +35,22 @@ using Hyprland Wayland virtual input backend
 using Hyprland virtual input backend
 ```
 
+The Linux receiver also starts a StatusNotifier tray item by default. On this
+Waybar setup, the item should appear in the Waybar tray with a tooltip like:
+
+```text
+edge-kvm receiver
+Status: Listening
+Listen: 0.0.0.0:42420
+Input backend: hyprland
+```
+
+If the tray item interferes with diagnostics, start the receiver with:
+
+```bash
+cargo run -p edge-receiver-linux -- --pair --no-tray
+```
+
 ## Windows Setup
 
 From the Windows repo checkout:
@@ -228,6 +244,8 @@ The current build passes this phase when:
 - `--dry-run` completes successfully.
 - Pointer, click, and key test commands complete successfully and affect the
   Linux desktop.
+- Waybar shows the `edge-kvm receiver` tray item while the Linux receiver is
+  running.
 - No command requires `%APPDATA%`; `controller.toml` and `state\` stay beside
   `edge-controller-win.exe`.
 

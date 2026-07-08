@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{future, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -14,8 +14,12 @@ use edge_protocol::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     time,
 };
+
+mod tray;
+use tray::{ReceiverTrayHandle, TrayCommand};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Linux receiver daemon for edge-kvm")]
@@ -28,6 +32,8 @@ struct Args {
     test_input: Option<TestInput>,
     #[arg(long)]
     test_clipboard: bool,
+    #[arg(long, help = "Disable the StatusNotifier tray item")]
+    no_tray: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -66,7 +72,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_receiver(config, args.pair, backend).await
+    run_receiver(config, args.pair, backend, !args.no_tray).await
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
@@ -129,6 +135,7 @@ async fn run_receiver(
     config: AppConfig,
     allow_pairing: bool,
     backend: ReceiverBackend,
+    enable_tray: bool,
 ) -> Result<()> {
     let state_dir = default_state_dir();
     let identity = IdentityKey::load_or_create(state_dir.join("identity.toml"))
@@ -146,6 +153,23 @@ async fn run_receiver(
         .await
         .with_context(|| format!("failed to bind {listen}"))?;
 
+    let (tray, mut tray_commands) = if enable_tray {
+        match ReceiverTrayHandle::spawn(listen.clone(), backend.label().to_string(), allow_pairing)
+            .await
+        {
+            Ok((tray, commands)) => {
+                tray.listening().await;
+                (Some(tray), Some(commands))
+            }
+            Err(err) => {
+                tracing::warn!(%err, "failed to start tray status item");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     tracing::info!(
         listen,
         fingerprint = %identity.fingerprint(),
@@ -154,12 +178,24 @@ async fn run_receiver(
     );
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = tokio::select! {
+            command = recv_tray_command(&mut tray_commands) => {
+                if matches!(command, Some(TrayCommand::Quit)) {
+                    tracing::info!("quit requested from tray");
+                    break;
+                }
+                continue;
+            }
+            incoming = listener.accept() => incoming?,
+        };
         tracing::info!(%addr, "controller connected");
 
         let (mut session, peer_fingerprint) = match accept_noise_session(stream, &identity).await {
             Ok(session) => session,
             Err(err) => {
+                if let Some(tray) = &tray {
+                    tray.error(format!("Noise handshake failed: {err}")).await;
+                }
                 tracing::warn!(%err, "Noise handshake failed");
                 continue;
             }
@@ -172,6 +208,9 @@ async fn run_receiver(
                 continue;
             }
             Err(err) => {
+                if let Some(tray) = &tray {
+                    tray.error(format!("failed to read Hello: {err}")).await;
+                }
                 tracing::warn!(%err, "failed to read Hello");
                 continue;
             }
@@ -197,9 +236,17 @@ async fn run_receiver(
                 )
                 .await
                 .ok();
+                if let Some(tray) = &tray {
+                    tray.error(err.to_string()).await;
+                }
                 tracing::warn!(%err, "rejected controller");
                 continue;
             }
+        }
+
+        if let Some(tray) = &tray {
+            tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
+                .await;
         }
 
         write_secure_frame(
@@ -220,18 +267,47 @@ async fn run_receiver(
             }
         }
 
-        if let Err(err) = handle_controller(session, &config, &backend).await {
-            tracing::warn!(%err, "controller session ended");
+        match handle_controller(
+            session,
+            &config,
+            &backend,
+            tray.as_ref(),
+            &mut tray_commands,
+        )
+        .await
+        {
+            Ok(ControllerSessionExit::QuitRequested) => {
+                tracing::info!("quit requested from tray");
+                break;
+            }
+            Err(err) => {
+                if let Some(tray) = &tray {
+                    tray.disconnected(Some(err.to_string())).await;
+                }
+                tracing::warn!(%err, "controller session ended");
+            }
         }
         backend.all_keys_up().await.ok();
     }
+
+    backend.all_keys_up().await.ok();
+    if let Some(tray) = &tray {
+        tray.shutdown().await;
+    }
+    Ok(())
+}
+
+enum ControllerSessionExit {
+    QuitRequested,
 }
 
 async fn handle_controller(
     mut session: NoiseSession<TcpStream>,
     config: &AppConfig,
     backend: &ReceiverBackend,
-) -> Result<()> {
+    tray: Option<&ReceiverTrayHandle>,
+    tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
+) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
 
@@ -241,12 +317,30 @@ async fn handle_controller(
                 heartbeat_sequence += 1;
                 write_secure_frame(&mut session, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
             }
+            command = recv_tray_command(tray_commands) => {
+                if matches!(command, Some(TrayCommand::Quit)) {
+                    return Ok(ControllerSessionExit::QuitRequested);
+                }
+            }
             frame = read_secure_frame(&mut session) => {
                 match frame? {
-                    Frame::Input(InputEvent::AllKeysUp) => backend.all_keys_up().await?,
-                    Frame::Input(event) => backend.inject(event).await?,
+                    Frame::Input(InputEvent::AllKeysUp) => {
+                        backend.all_keys_up().await?;
+                        if let Some(tray) = tray {
+                            tray.input_event().await;
+                        }
+                    }
+                    Frame::Input(event) => {
+                        backend.inject(event).await?;
+                        if let Some(tray) = tray {
+                            tray.input_event().await;
+                        }
+                    }
                     Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) => {
                         write_clipboard_text(&config.clipboard, &text).await?;
+                        if let Some(tray) = tray {
+                            tray.clipboard_event().await;
+                        }
                     }
                     Frame::Clipboard(ClipboardEvent::TextRequest) => {
                         if let Some(text) = read_clipboard_text(&config.clipboard).await? {
@@ -254,6 +348,9 @@ async fn handle_controller(
                                 &mut session,
                                 &Frame::Clipboard(ClipboardEvent::TextOffer { sequence: 0, text }),
                             ).await?;
+                            if let Some(tray) = tray {
+                                tray.clipboard_event().await;
+                            }
                         }
                     }
                     Frame::Heartbeat(_) => {}
@@ -262,6 +359,15 @@ async fn handle_controller(
                 }
             }
         }
+    }
+}
+
+async fn recv_tray_command(
+    receiver: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
+) -> Option<TrayCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => future::pending().await,
     }
 }
 
@@ -288,6 +394,14 @@ enum ReceiverBackend {
 }
 
 impl ReceiverBackend {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Libei(_) => "libei",
+            Self::Hyprland(_) => "hyprland",
+            Self::LogOnly => "log",
+        }
+    }
+
     fn from_config(config: &AppConfig) -> Result<Self> {
         let requested = config.input.backend.to_ascii_lowercase();
         let libei = LibeiBackend::probe();
