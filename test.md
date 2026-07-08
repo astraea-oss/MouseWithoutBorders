@@ -95,7 +95,7 @@ backend = "auto"
 
 ## Connectivity Check
 
-Run:
+Preferred PowerShell check:
 
 ```powershell
 Test-NetConnection 192.168.0.11 -Port 42420
@@ -108,6 +108,42 @@ TcpTestSucceeded : True
 ```
 
 If this fails, the issue is network/firewall/routing, not the Rust protocol.
+
+If `Test-NetConnection` does not exist, use this PowerShell fallback:
+
+```powershell
+$client = New-Object System.Net.Sockets.TcpClient
+$async = $client.BeginConnect("192.168.0.11", 42420, $null, $null)
+if ($async.AsyncWaitHandle.WaitOne(3000)) {
+    $client.EndConnect($async)
+    "TCP connect: OK"
+} else {
+    "TCP connect: TIMEOUT"
+}
+$client.Close()
+```
+
+Pass condition:
+
+```text
+TCP connect: OK
+```
+
+If running from `cmd.exe`, use:
+
+```cmd
+powershell -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient;$a=$c.BeginConnect('192.168.0.11',42420,$null,$null);if($a.AsyncWaitHandle.WaitOne(3000)){$c.EndConnect($a);'TCP connect: OK'}else{'TCP connect: TIMEOUT'};$c.Close()"
+```
+
+If `curl.exe` is available, this is also acceptable:
+
+```powershell
+curl.exe telnet://192.168.0.11:42420 --connect-timeout 3
+```
+
+For `curl.exe`, a successful TCP connection may hang or print a protocol-related
+error because this is not HTTP. That still proves the port is reachable. A
+timeout means the TCP path is blocked.
 
 ## Protocol Tests
 
