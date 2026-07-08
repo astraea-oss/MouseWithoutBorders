@@ -23,12 +23,17 @@ allow_pairing=true
 The receiver may log this warning:
 
 ```text
-libei is installed, but sender injection is not implemented yet; using log-only input backend for testing
+failed to initialize libei; trying Hyprland virtual input backend
 ```
 
-That is acceptable for this test. On this CachyOS laptop, `libei` is installed
-as `libei-1.0`, but real sender injection is not implemented yet. Input events
-are logged on Linux instead of injected into the desktop.
+That is acceptable on this CachyOS/Hyprland laptop. The installed portal does
+not expose RemoteDesktop/ConnectToEIS, so `auto` falls back to the Hyprland
+Wayland virtual input backend. The receiver should then log:
+
+```text
+using Hyprland Wayland virtual input backend
+using Hyprland virtual input backend
+```
 
 ## Windows Setup
 
@@ -42,7 +47,7 @@ git rev-parse --short HEAD
 Expected commit must be at least:
 
 ```text
-dd95d02
+3bbd04f
 ```
 
 Build the controller:
@@ -93,6 +98,9 @@ Keep:
 [input]
 backend = "auto"
 ```
+
+For this laptop, `backend = "hyprland"` is also valid and forces the tested
+Hyprland virtual input path.
 
 ## Connectivity Check
 
@@ -180,25 +188,27 @@ paired new controller
 For `--test-input pointer`:
 
 ```text
-received input event event=PointerMotion { dx: 80.0, dy: 0.0 }
-received all-keys-up
+controller connected
 ```
+
+The Linux cursor should move.
 
 For `--test-input click`:
 
 ```text
-received input event event=PointerButton { button: Left, down: true }
-received input event event=PointerButton { button: Left, down: false }
-received all-keys-up
+controller connected
 ```
+
+The Linux desktop should receive a left click.
 
 For `--test-input key`:
 
 ```text
-received input event event=Key { evdev_code: 30, down: true }
-received input event event=Key { evdev_code: 30, down: false }
-received all-keys-up
+controller connected
 ```
+
+The Linux desktop should receive the `a` key. Test with focus in a safe text
+field.
 
 For `--test-clipboard-text "hello from Windows"`:
 
@@ -216,13 +226,14 @@ The current build passes this phase when:
 - Windows builds `edge-controller-win`.
 - Windows reaches `192.168.0.11:42420`.
 - `--dry-run` completes successfully.
-- Pointer, click, and key test commands appear in Linux receiver logs.
+- Pointer, click, and key test commands complete successfully and affect the
+  Linux desktop.
 - No command requires `%APPDATA%`; `controller.toml` and `state\` stay beside
   `edge-controller-win.exe`.
 
-## Known Limit
+## Current Linux Backend
 
-This does not yet prove real desktop input injection on Linux. On this laptop,
-`libei` is available as `libei-1.0`, but the receiver intentionally uses the
-log-only backend until real libei sender injection is implemented. The next
-implementation step is the real Linux injection backend.
+This now proves local desktop injection on Lua's CachyOS/Hyprland laptop through
+the Hyprland/wlroots virtual pointer and virtual keyboard Wayland protocols.
+The libei path remains in the tree for later portability work, but this machine
+currently needs the Hyprland backend because its portal lacks RemoteDesktop/EIS.

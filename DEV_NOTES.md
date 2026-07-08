@@ -19,18 +19,40 @@ extra/libei 1.6.0-1
 Current behavior:
 
 - `input.backend = "auto"` detects `libei-1.0`.
-- Real libei sender injection is not implemented yet.
-- Until sender injection exists, `auto` deliberately uses the log-only backend
-  so end-to-end Windows-to-Linux protocol tests remain honest and safe.
-- `input.backend = "libei"` should fail clearly until the sender FFI is wired.
+- The libei sender path is wired through `liboeffis-1.0`, but this laptop's
+  current Hyprland portal does not expose `org.freedesktop.portal.RemoteDesktop`
+  and there is no direct EIS socket, so libei initialization fails here.
+- After libei fails, `auto` falls back to the Hyprland/wlroots virtual input
+  backend.
+- `input.backend = "hyprland"` forces the Hyprland virtual input backend and is
+  the correct development mode for Lua's current setup.
+- `input.backend = "libei"` is strict and should fail clearly if the portal/EIS
+  path is unavailable.
+
+Verified local commands:
+
+```bash
+EDGE_KVM_CONFIG=/tmp/edge-kvm-hyprland-test.toml \
+EDGE_KVM_STATE_DIR=/tmp/edge-kvm-hyprland-test-state \
+cargo run -p edge-receiver-linux -- --test-input pointer
+
+EDGE_KVM_CONFIG=/tmp/edge-kvm-hyprland-test.toml \
+EDGE_KVM_STATE_DIR=/tmp/edge-kvm-hyprland-test-state \
+cargo run -p edge-receiver-linux -- --test-input click
+
+EDGE_KVM_CONFIG=/tmp/edge-kvm-hyprland-test.toml \
+EDGE_KVM_STATE_DIR=/tmp/edge-kvm-hyprland-test-state \
+cargo run -p edge-receiver-linux -- --test-input key
+```
+
+All three initialize the Hyprland Wayland virtual input backend and exit 0.
 
 Later portability work:
 
 - Probe multiple pkg-config names if needed, starting with `libei-1.0`.
-- Generate or maintain Rust FFI bindings for `/usr/include/libei-1.0/libei.h`.
-- Use `liboeffis-1.0` or the compositor-supported connection path if Hyprland
-  requires a portal/remote-desktop handshake.
+- Replace the manual libei/liboeffis FFI with generated or maintained bindings.
+- Re-test libei when Hyprland/xdg-desktop-portal-hyprland exposes
+  RemoteDesktop/ConnectToEIS or another EIS socket path.
 - Keep a strict `libei` mode that fails if real injection cannot be initialized.
 - Keep `auto` mode useful for diagnostics by falling back to log-only with a
   clear warning.
-

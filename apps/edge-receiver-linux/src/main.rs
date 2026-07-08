@@ -5,7 +5,8 @@ use clap::{Parser, ValueEnum};
 use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
 use edge_crypto::{IdentityKey, NoiseSession, PinDecision, PinStore, accept_noise_session};
 use edge_linux_input::{
-    LibeiBackend, hyprland_screen_info, read_clipboard_text, write_clipboard_text,
+    HyprlandVirtualInputBackend, LibeiBackend, hyprland_screen_info, read_clipboard_text,
+    write_clipboard_text,
 };
 use edge_protocol::{
     ClipboardEvent, Frame, Heartbeat, Hello, InputEvent, PROTOCOL_VERSION, RemoteError,
@@ -281,6 +282,8 @@ fn default_config_path() -> PathBuf {
 
 #[derive(Debug, Clone)]
 enum ReceiverBackend {
+    Libei(LibeiBackend),
+    Hyprland(HyprlandVirtualInputBackend),
     LogOnly,
 }
 
@@ -290,44 +293,84 @@ impl ReceiverBackend {
         let libei = LibeiBackend::probe();
 
         match requested.as_str() {
-            "auto" if libei.is_available() => {
-                tracing::warn!(
-                    pkg_config = libei.pkg_config_name(),
-                    version = libei.version().unwrap_or("unknown"),
-                    "libei is installed, but sender injection is not implemented yet; using log-only input backend for testing"
-                );
-                Ok(Self::LogOnly)
-            }
             "auto" => {
-                tracing::warn!(
-                    pkg_config = libei.pkg_config_name(),
-                    "libei was not found through pkg-config; using log-only input backend for testing"
-                );
-                Ok(Self::LogOnly)
+                if libei.is_available() {
+                    match LibeiBackend::connect() {
+                        Ok(backend) => {
+                            tracing::info!(
+                                pkg_config = backend.pkg_config_name(),
+                                version = backend.version().unwrap_or("unknown"),
+                                "using libei input backend"
+                            );
+                            return Ok(Self::Libei(backend));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                pkg_config = libei.pkg_config_name(),
+                                version = libei.version().unwrap_or("unknown"),
+                                "failed to initialize libei; trying Hyprland virtual input backend"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        pkg_config = libei.pkg_config_name(),
+                        "libei was not found through pkg-config; trying Hyprland virtual input backend"
+                    );
+                }
+
+                match HyprlandVirtualInputBackend::connect() {
+                    Ok(backend) => {
+                        tracing::info!("using Hyprland virtual input backend");
+                        Ok(Self::Hyprland(backend))
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            "failed to initialize Hyprland virtual input backend; using log-only input backend for testing"
+                        );
+                        Ok(Self::LogOnly)
+                    }
+                }
             }
-            "log" | "mock" | "none" => {
-                tracing::warn!("using log-only input backend; no local input will be injected");
-                Ok(Self::LogOnly)
+            "hyprland" => {
+                let backend = HyprlandVirtualInputBackend::connect().context(
+                    "input.backend is \"hyprland\", but Hyprland virtual input initialization failed",
+                )?;
+                tracing::info!("using Hyprland virtual input backend");
+                Ok(Self::Hyprland(backend))
             }
             "libei" if libei.is_available() => {
-                anyhow::bail!(
-                    "input.backend is \"libei\" and {} {} is installed, but libei sender injection is not implemented yet",
-                    libei.pkg_config_name(),
-                    libei.version().unwrap_or("unknown"),
-                )
+                let backend = LibeiBackend::connect()
+                    .context("input.backend is \"libei\", but libei initialization failed")?;
+                tracing::info!(
+                    pkg_config = backend.pkg_config_name(),
+                    version = backend.version().unwrap_or("unknown"),
+                    "using libei input backend"
+                );
+                Ok(Self::Libei(backend))
             }
             "libei" => anyhow::bail!(
                 "input.backend is \"libei\", but {} is not available through pkg-config",
                 libei.pkg_config_name()
             ),
+            "log" | "mock" | "none" => {
+                tracing::warn!("using log-only input backend; no local input will be injected");
+                Ok(Self::LogOnly)
+            }
             other => {
-                anyhow::bail!("unsupported input.backend \"{other}\"; expected auto, libei, or log")
+                anyhow::bail!(
+                    "unsupported input.backend \"{other}\"; expected auto, hyprland, libei, or log"
+                )
             }
         }
     }
 
     async fn inject(&self, event: InputEvent) -> Result<()> {
         match self {
+            Self::Libei(backend) => backend.inject(event).await.map_err(Into::into),
+            Self::Hyprland(backend) => backend.inject(event).await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!(?event, "received input event");
                 Ok(())
@@ -337,6 +380,8 @@ impl ReceiverBackend {
 
     async fn all_keys_up(&self) -> Result<()> {
         match self {
+            Self::Libei(backend) => backend.all_keys_up().await.map_err(Into::into),
+            Self::Hyprland(backend) => backend.all_keys_up().await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!("received all-keys-up");
                 Ok(())
