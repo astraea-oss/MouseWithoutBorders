@@ -63,7 +63,7 @@ git rev-parse --short HEAD
 Expected commit must be at least:
 
 ```text
-f4cd3ce
+0e25133
 ```
 
 Build the controller:
