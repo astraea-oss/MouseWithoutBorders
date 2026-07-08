@@ -85,6 +85,7 @@ struct HyprlandVirtualInput {
     _keymap: File,
     pressed_keys: BTreeSet<u16>,
     pressed_buttons: BTreeSet<u32>,
+    modifiers: ModifierState,
     started_at: Instant,
 }
 
@@ -136,6 +137,7 @@ impl HyprlandVirtualInput {
             _keymap: keymap,
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
+            modifiers: ModifierState::default(),
             started_at: Instant::now(),
         })
     }
@@ -187,6 +189,9 @@ impl HyprlandVirtualInput {
                 } else {
                     self.pressed_keys.remove(&evdev_code);
                 }
+                if self.modifiers.update(evdev_code, down) {
+                    self.keyboard.modifiers(self.modifiers.depressed(), 0, 0, 0);
+                }
             }
             InputEvent::AllKeysUp => self.all_keys_up(),
         }
@@ -201,6 +206,9 @@ impl HyprlandVirtualInput {
         for key in std::mem::take(&mut self.pressed_keys) {
             self.keyboard
                 .key(time, u32::from(key), wl_keyboard::KeyState::Released.into());
+        }
+        if self.modifiers.clear() {
+            self.keyboard.modifiers(0, 0, 0, 0);
         }
         for button in std::mem::take(&mut self.pressed_buttons) {
             self.pointer
@@ -219,6 +227,58 @@ impl HyprlandVirtualInput {
     fn time_ms(&self) -> u32 {
         let elapsed = self.started_at.elapsed().as_millis();
         elapsed.min(u128::from(u32::MAX)) as u32
+    }
+}
+
+#[derive(Debug, Default)]
+struct ModifierState {
+    shift: u8,
+    control: u8,
+    alt: u8,
+    logo: u8,
+}
+
+impl ModifierState {
+    fn update(&mut self, evdev_code: u16, down: bool) -> bool {
+        let counter = match evdev_code {
+            42 | 54 => &mut self.shift,
+            29 | 97 => &mut self.control,
+            56 | 100 => &mut self.alt,
+            125 | 126 => &mut self.logo,
+            _ => return false,
+        };
+
+        let previous = *counter;
+        if down {
+            *counter = counter.saturating_add(1);
+        } else {
+            *counter = counter.saturating_sub(1);
+        }
+
+        previous == 0 || *counter == 0
+    }
+
+    fn clear(&mut self) -> bool {
+        let had_modifiers = self.depressed() != 0;
+        *self = Self::default();
+        had_modifiers
+    }
+
+    fn depressed(&self) -> u32 {
+        let mut mask = 0;
+        if self.shift > 0 {
+            mask |= 1 << 0;
+        }
+        if self.control > 0 {
+            mask |= 1 << 2;
+        }
+        if self.alt > 0 {
+            mask |= 1 << 3;
+        }
+        if self.logo > 0 {
+            mask |= 1 << 6;
+        }
+        mask
     }
 }
 
@@ -339,5 +399,45 @@ fn linux_button_code(button: MouseButton) -> u32 {
         MouseButton::Middle => 0x112,
         MouseButton::Back => 0x116,
         MouseButton::Forward => 0x115,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracks_control_modifier_mask() {
+        let mut modifiers = ModifierState::default();
+
+        assert!(modifiers.update(29, true));
+        assert_eq!(modifiers.depressed(), 1 << 2);
+        assert!(modifiers.update(29, false));
+        assert_eq!(modifiers.depressed(), 0);
+    }
+
+    #[test]
+    fn keeps_modifier_active_until_both_sides_release() {
+        let mut modifiers = ModifierState::default();
+
+        assert!(modifiers.update(29, true));
+        assert!(!modifiers.update(97, true));
+        assert_eq!(modifiers.depressed(), 1 << 2);
+        assert!(!modifiers.update(29, false));
+        assert_eq!(modifiers.depressed(), 1 << 2);
+        assert!(modifiers.update(97, false));
+        assert_eq!(modifiers.depressed(), 0);
+    }
+
+    #[test]
+    fn tracks_common_modifier_masks() {
+        let mut modifiers = ModifierState::default();
+
+        assert!(modifiers.update(42, true));
+        assert!(modifiers.update(56, true));
+        assert!(modifiers.update(125, true));
+        assert_eq!(modifiers.depressed(), (1 << 0) | (1 << 3) | (1 << 6));
+        assert!(modifiers.clear());
+        assert_eq!(modifiers.depressed(), 0);
     }
 }
