@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+use std::{fs::OpenOptions, io::Write, path::Path, time::SystemTime};
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -51,6 +53,8 @@ async fn main() -> Result<()> {
     let run_tray = should_run_tray(&args);
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
+    #[cfg(windows)]
+    let startup_log = default_state_dir().join("controller.log");
 
     if config.role != Role::Controller {
         anyhow::bail!(
@@ -66,16 +70,7 @@ async fn main() -> Result<()> {
     #[cfg(windows)]
     {
         if run_tray {
-            let connection = match connect_session(&config, &identity).await {
-                Ok(mut connection) => {
-                    let screen_info = read_initial_frames(&mut connection.session).await?;
-                    Some((connection, screen_info))
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "starting tray without receiver connection");
-                    None
-                }
-            };
+            let mut connection = connect_for_tray(&config, &identity, &startup_log).await;
 
             edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
             let status = connection
@@ -83,18 +78,35 @@ async fn main() -> Result<()> {
                 .map(|(connection, _)| connection.status())
                 .unwrap_or_else(|| "Disconnected".to_string());
             tracing::info!(%status, "starting tray loop");
+            append_portable_log(&startup_log, format!("starting tray loop: {status}"));
+            let tray_log = startup_log.clone();
             std::thread::spawn(move || {
                 if let Err(err) = edge_windows_input::run_tray(&status) {
                     tracing::warn!(%err, "Windows tray exited with error");
+                    append_portable_log(
+                        &tray_log,
+                        format!("Windows tray exited with error: {err}"),
+                    );
                 }
             });
 
-            if let Some((connection, screen_info)) = connection {
-                return run_connected(connection, &config, screen_info).await;
-            }
+            loop {
+                if let Some((active_connection, screen_info)) = connection {
+                    match run_connected(active_connection, &config, screen_info).await {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            tracing::warn!(%err, "connected session ended; reconnecting");
+                            append_portable_log(
+                                &startup_log,
+                                format!("connected session ended; reconnecting: {err:#}"),
+                            );
+                        }
+                    }
+                }
 
-            std::future::pending::<()>().await;
-            return Ok(());
+                time::sleep(Duration::from_secs(2)).await;
+                connection = connect_for_tray(&config, &identity, &startup_log).await;
+            }
         }
     }
 
@@ -128,6 +140,43 @@ async fn main() -> Result<()> {
 #[cfg(windows)]
 fn should_run_tray(args: &Args) -> bool {
     args.tray || (!args.dry_run && args.test_input.is_none() && args.test_clipboard_text.is_none())
+}
+
+#[cfg(windows)]
+async fn connect_for_tray(
+    config: &AppConfig,
+    identity: &IdentityKey,
+    log_path: &Path,
+) -> Option<(ControllerConnection, Option<ScreenInfo>)> {
+    match connect_session(config, identity).await {
+        Ok(mut connection) => match read_initial_frames(&mut connection.session).await {
+            Ok(screen_info) => Some((connection, screen_info)),
+            Err(err) => {
+                tracing::warn!(%err, "failed to initialize receiver session");
+                append_portable_log(
+                    log_path,
+                    format!("failed to initialize receiver session: {err:#}"),
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(%err, "tray connection attempt failed");
+            append_portable_log(log_path, format!("tray connection attempt failed: {err:#}"));
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn append_portable_log(path: &Path, message: impl AsRef<str>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
+    }
 }
 
 struct ControllerConnection {
@@ -182,15 +231,15 @@ async fn connect_session(
 async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<Option<ScreenInfo>> {
     let mut screen_info = None;
     loop {
-        match time::timeout(Duration::from_millis(750), read_secure_frame(session)).await {
-            Ok(Ok(Frame::Hello(hello))) => {
+        match read_secure_frame(session).await {
+            Ok(Frame::Hello(hello)) => {
                 tracing::info!(
                     device = %hello.device_name,
                     fingerprint = %hello.public_key_fingerprint,
                     "receiver hello"
                 );
             }
-            Ok(Ok(Frame::ScreenInfo(info))) => {
+            Ok(Frame::ScreenInfo(info)) => {
                 tracing::info!(
                     primary = %info.primary_output,
                     outputs = info.outputs.len(),
@@ -199,12 +248,12 @@ async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<Op
                 screen_info = Some(info);
                 return Ok(screen_info);
             }
-            Ok(Ok(Frame::Error(err))) => {
+            Ok(Frame::Heartbeat(_)) => return Ok(screen_info),
+            Ok(Frame::Error(err)) => {
                 anyhow::bail!("receiver error: {}: {}", err.code, err.message)
             }
-            Ok(Ok(frame)) => tracing::debug!(?frame, "initial receiver frame"),
-            Ok(Err(err)) => return Err(err).context("failed to read receiver frame"),
-            Err(_) => return Ok(screen_info),
+            Ok(frame) => tracing::debug!(?frame, "initial receiver frame"),
+            Err(err) => return Err(err).context("failed to read receiver frame"),
         }
     }
 }
