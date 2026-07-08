@@ -169,15 +169,23 @@ impl HyprlandVirtualInput {
             InputEvent::PointerWheel { x, y } => {
                 let time = self.time_ms();
                 if x != 0.0 {
-                    self.pointer.axis(
+                    self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+                    self.pointer.axis_discrete(
                         time,
                         wl_pointer::Axis::HorizontalScroll,
                         x * WHEEL_AXIS_STEP,
+                        x.round() as i32,
                     );
                 }
                 if y != 0.0 {
-                    self.pointer
-                        .axis(time, wl_pointer::Axis::VerticalScroll, -y * WHEEL_AXIS_STEP);
+                    let value = -y * WHEEL_AXIS_STEP;
+                    self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+                    self.pointer.axis_discrete(
+                        time,
+                        wl_pointer::Axis::VerticalScroll,
+                        value,
+                        value.signum() as i32,
+                    );
                 }
                 self.pointer.frame();
             }
