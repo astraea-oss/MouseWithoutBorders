@@ -3,7 +3,10 @@ use std::{future, path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
-use edge_crypto::{IdentityKey, NoiseSession, PinDecision, PinStore, accept_noise_session};
+use edge_crypto::{
+    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinDecision, PinStore,
+    accept_noise_session,
+};
 use edge_linux_input::{
     HyprlandVirtualInputBackend, LibeiBackend, hyprland_screen_info, read_clipboard_text,
     write_clipboard_text,
@@ -302,7 +305,7 @@ enum ControllerSessionExit {
 }
 
 async fn handle_controller(
-    mut session: NoiseSession<TcpStream>,
+    session: NoiseSession<TcpStream>,
     config: &AppConfig,
     backend: &ReceiverBackend,
     tray: Option<&ReceiverTrayHandle>,
@@ -310,20 +313,23 @@ async fn handle_controller(
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
+    let (reader, mut writer) = session.split();
+    let mut frame_rx = spawn_controller_reader(reader);
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 heartbeat_sequence += 1;
-                write_secure_frame(&mut session, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
+                write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
             }
             command = recv_tray_command(tray_commands) => {
                 if matches!(command, Some(TrayCommand::Quit)) {
                     return Ok(ControllerSessionExit::QuitRequested);
                 }
             }
-            frame = read_secure_frame(&mut session) => {
-                match frame? {
+            frame = frame_rx.recv() => {
+                let frame = frame.context("controller frame reader ended")??;
+                match frame {
                     Frame::Input(InputEvent::AllKeysUp) => {
                         backend.all_keys_up().await?;
                         if let Some(tray) = tray {
@@ -344,8 +350,8 @@ async fn handle_controller(
                     }
                     Frame::Clipboard(ClipboardEvent::TextRequest) => {
                         if let Some(text) = read_clipboard_text(&config.clipboard).await? {
-                            write_secure_frame(
-                                &mut session,
+                            write_secure_frame_writer(
+                                &mut writer,
                                 &Frame::Clipboard(ClipboardEvent::TextOffer { sequence: 0, text }),
                             ).await?;
                             if let Some(tray) = tray {
@@ -360,6 +366,22 @@ async fn handle_controller(
             }
         }
     }
+}
+
+fn spawn_controller_reader(mut reader: NoiseReader) -> mpsc::UnboundedReceiver<Result<Frame>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let frame = read_secure_frame_reader(&mut reader)
+                .await
+                .context("failed to read controller frame");
+            let should_stop = frame.is_err();
+            if sender.send(frame).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 async fn recv_tray_command(
@@ -377,8 +399,19 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
+async fn write_secure_frame_writer(writer: &mut NoiseWriter, frame: &Frame) -> Result<()> {
+    let payload = encode_frame(frame)?;
+    writer.write_packet(&payload).await?;
+    Ok(())
+}
+
 async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Frame> {
     let payload = session.read_packet().await?;
+    Ok(decode_frame(&payload)?)
+}
+
+async fn read_secure_frame_reader(reader: &mut NoiseReader) -> Result<Frame> {
+    let payload = reader.read_packet().await?;
     Ok(decode_frame(&payload)?)
 }
 

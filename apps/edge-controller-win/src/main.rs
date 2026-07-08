@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
 #[cfg(windows)]
 use edge_common::PeerPosition;
 use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
-use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session};
+use edge_crypto::{IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session};
 #[cfg(windows)]
 use edge_geometry::Size;
 #[cfg(windows)]
@@ -262,27 +262,30 @@ async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput)
 }
 
 async fn run_connected(
-    mut connection: ControllerConnection,
+    connection: ControllerConnection,
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
 ) -> Result<()> {
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
     let mut input_rx = start_live_input(config, screen_info)?;
+    let (reader, mut writer) = connection.session.split();
+    let mut receiver_rx = spawn_receiver_reader(reader);
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                write_secure_frame(&mut connection.session, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
                 tracing::info!("shutdown requested");
                 return Ok(());
             }
             event = recv_live_input(&mut input_rx) => {
                 if let Some(frame) = event {
-                    write_secure_frame(&mut connection.session, &frame).await?;
+                    write_secure_frame_writer(&mut writer, &frame).await?;
                 }
             }
-            frame = read_secure_frame(&mut connection.session) => {
-                match frame? {
+            frame = receiver_rx.recv() => {
+                let frame = frame.context("receiver frame reader ended")??;
+                match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
                     Frame::Clipboard(event) => tracing::info!(?event, "clipboard event"),
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
@@ -292,6 +295,24 @@ async fn run_connected(
             }
         }
     }
+}
+
+fn spawn_receiver_reader(
+    mut reader: NoiseReader,
+) -> tokio::sync::mpsc::UnboundedReceiver<Result<Frame>> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let frame = read_secure_frame_reader(&mut reader)
+                .await
+                .context("failed to read receiver frame");
+            let should_stop = frame.is_err();
+            if sender.send(frame).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 #[cfg(windows)]
@@ -396,8 +417,19 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
+async fn write_secure_frame_writer(writer: &mut NoiseWriter, frame: &Frame) -> Result<()> {
+    let payload = encode_frame(frame)?;
+    writer.write_packet(&payload).await?;
+    Ok(())
+}
+
 async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Frame> {
     let payload = session.read_packet().await?;
+    Ok(decode_frame(&payload)?)
+}
+
+async fn read_secure_frame_reader(reader: &mut NoiseReader) -> Result<Frame> {
+    let payload = reader.read_packet().await?;
     Ok(decode_frame(&payload)?)
 }
 

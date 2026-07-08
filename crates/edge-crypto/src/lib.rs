@@ -1,9 +1,16 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snow::{Builder, params::NoiseParams};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::Mutex,
+};
 
 const MAX_NOISE_PACKET_BYTES: u32 = 4 * 1024 * 1024 + 16;
 
@@ -212,6 +219,58 @@ where
 
     pub fn into_inner(self) -> S {
         self.io
+    }
+}
+
+impl NoiseSession<TcpStream> {
+    pub fn split(self) -> (NoiseReader, NoiseWriter) {
+        let (reader, writer) = self.io.into_split();
+        let transport = Arc::new(Mutex::new(self.transport));
+        (
+            NoiseReader {
+                io: reader,
+                transport: transport.clone(),
+            },
+            NoiseWriter {
+                io: writer,
+                transport,
+            },
+        )
+    }
+}
+
+pub struct NoiseReader {
+    io: OwnedReadHalf,
+    transport: Arc<Mutex<snow::TransportState>>,
+}
+
+impl NoiseReader {
+    pub async fn read_packet(&mut self) -> Result<Vec<u8>> {
+        let encrypted = read_packet(&mut self.io).await?;
+        let mut plaintext = vec![0; encrypted.len()];
+        let len = {
+            let mut transport = self.transport.lock().await;
+            transport.read_message(&encrypted, &mut plaintext)?
+        };
+        plaintext.truncate(len);
+        Ok(plaintext)
+    }
+}
+
+pub struct NoiseWriter {
+    io: OwnedWriteHalf,
+    transport: Arc<Mutex<snow::TransportState>>,
+}
+
+impl NoiseWriter {
+    pub async fn write_packet(&mut self, plaintext: &[u8]) -> Result<()> {
+        let mut encrypted = vec![0; plaintext.len() + 16];
+        let len = {
+            let mut transport = self.transport.lock().await;
+            transport.write_message(plaintext, &mut encrypted)?
+        };
+        encrypted.truncate(len);
+        write_packet(&mut self.io, &encrypted).await
     }
 }
 
