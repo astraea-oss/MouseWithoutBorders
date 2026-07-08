@@ -16,6 +16,8 @@ pub enum WindowsInputError {
     CaptureAlreadyRunning,
     #[error("Windows input capture error: {0}")]
     Capture(String),
+    #[error("Windows clipboard error: {0}")]
+    Clipboard(String),
 }
 
 pub type Result<T> = std::result::Result<T, WindowsInputError>;
@@ -81,6 +83,152 @@ pub fn run_tray(_status: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn read_clipboard_text(max_bytes: usize) -> Result<Option<String>> {
+    clipboard::read_text(max_bytes)
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_text(_max_bytes: usize) -> Result<Option<String>> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+pub fn write_clipboard_text(text: &str, max_bytes: usize) -> Result<()> {
+    clipboard::write_text(text, max_bytes)
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_text(_text: &str, _max_bytes: usize) -> Result<()> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+mod clipboard {
+    use std::{ptr::null_mut, slice};
+
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, GlobalFree},
+        System::{
+            DataExchange::{
+                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+            },
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
+        },
+    };
+
+    use crate::{Result, WindowsInputError};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    pub fn read_text(max_bytes: usize) -> Result<Option<String>> {
+        let _clipboard = OpenClipboardGuard::open()?;
+        let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
+        if handle.is_null() {
+            return Ok(None);
+        }
+
+        let ptr = unsafe { GlobalLock(handle) };
+        if ptr.is_null() {
+            return Err(last_error("GlobalLock"));
+        }
+        let _lock = GlobalLockGuard { handle };
+
+        let words = unsafe { slice::from_raw_parts(ptr.cast::<u16>(), GlobalSize(handle) / 2) };
+        let end = words
+            .iter()
+            .position(|word| *word == 0)
+            .unwrap_or(words.len());
+        let text = String::from_utf16_lossy(&words[..end]);
+        if text.len() > max_bytes {
+            return Err(WindowsInputError::Clipboard(format!(
+                "clipboard text exceeds configured max_bytes ({max_bytes})"
+            )));
+        }
+
+        Ok(Some(text))
+    }
+
+    pub fn write_text(text: &str, max_bytes: usize) -> Result<()> {
+        if text.len() > max_bytes {
+            return Err(WindowsInputError::Clipboard(format!(
+                "clipboard text exceeds configured max_bytes ({max_bytes})"
+            )));
+        }
+
+        let _clipboard = OpenClipboardGuard::open()?;
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(last_error("EmptyClipboard"));
+        }
+
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = wide.len() * std::mem::size_of::<u16>();
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
+        if handle.is_null() {
+            return Err(last_error("GlobalAlloc"));
+        }
+
+        let ptr = unsafe { GlobalLock(handle) };
+        if ptr.is_null() {
+            unsafe {
+                GlobalFree(handle);
+            }
+            return Err(last_error("GlobalLock"));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast::<u16>(), wide.len());
+            GlobalUnlock(handle);
+        }
+
+        if unsafe { SetClipboardData(CF_UNICODETEXT, handle) }.is_null() {
+            unsafe {
+                GlobalFree(handle);
+            }
+            return Err(last_error("SetClipboardData"));
+        }
+
+        Ok(())
+    }
+
+    struct OpenClipboardGuard;
+
+    impl OpenClipboardGuard {
+        fn open() -> Result<Self> {
+            if unsafe { OpenClipboard(null_mut()) } == 0 {
+                return Err(last_error("OpenClipboard"));
+            }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for OpenClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    struct GlobalLockGuard {
+        handle: *mut std::ffi::c_void,
+    }
+
+    impl Drop for GlobalLockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                GlobalUnlock(self.handle);
+            }
+        }
+    }
+
+    fn last_error(operation: &str) -> WindowsInputError {
+        WindowsInputError::Clipboard(format!("{operation} failed with Win32 error {}", unsafe {
+            GetLastError()
+        }))
+    }
+}
+
+#[cfg(windows)]
 mod capture {
     use std::{
         ptr::null_mut,
@@ -95,9 +243,9 @@ mod capture {
         UI::WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
             KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SetCursorPos, SetWindowsHookExW,
-            TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            ShowCursor, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     };
@@ -137,10 +285,13 @@ mod capture {
             remote_cursor: Point { x: 0.0, y: 0.0 },
             ctrl_down: false,
             alt_down: false,
+            cursor_hidden: false,
         };
 
         if let Some(existing) = STATE.get() {
-            *existing.lock().expect("capture state poisoned") = state;
+            let mut existing = existing.lock().expect("capture state poisoned");
+            existing.show_source_cursor();
+            *existing = state;
             tracing::info!("Windows input capture hooks reused");
             return Ok(receiver);
         }
@@ -323,7 +474,15 @@ mod capture {
             let extended = keyboard.flags & LLKHF_EXTENDED != 0;
             match map_key(scan_code, extended) {
                 Ok(evdev_code) => state.send_input(InputEvent::Key { evdev_code, down }),
-                Err(err) => tracing::debug!(%err, scan_code, extended, "ignoring unmapped key"),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        scan_code,
+                        extended,
+                        vk_code = keyboard.vkCode,
+                        "ignoring unmapped key"
+                    );
+                }
             }
         }
 
@@ -339,6 +498,7 @@ mod capture {
         remote_cursor: Point,
         ctrl_down: bool,
         alt_down: bool,
+        cursor_hidden: bool,
     }
 
     impl CaptureState {
@@ -362,6 +522,7 @@ mod capture {
             unsafe {
                 SetCursorPos(self.anchor.x, self.anchor.y);
             }
+            self.hide_source_cursor();
             tracing::info!(edge = ?self.config.edge, "entered remote control");
         }
 
@@ -393,6 +554,7 @@ mod capture {
             self.active = false;
             self.send_input(InputEvent::AllKeysUp);
             self.send_control(ControlEvent::ReleaseToLocal { reason });
+            self.show_source_cursor();
             let restore = self.local_restore();
             unsafe {
                 SetCursorPos(restore.x, restore.y);
@@ -406,6 +568,22 @@ mod capture {
                 VK_MENU | VK_LMENU | VK_RMENU => self.alt_down = down,
                 _ => {}
             }
+        }
+
+        fn hide_source_cursor(&mut self) {
+            if self.cursor_hidden {
+                return;
+            }
+            unsafe { while ShowCursor(0) >= 0 {} }
+            self.cursor_hidden = true;
+        }
+
+        fn show_source_cursor(&mut self) {
+            if !self.cursor_hidden {
+                return;
+            }
+            unsafe { while ShowCursor(1) < 0 {} }
+            self.cursor_hidden = false;
         }
 
         fn remote_start(&self, point: POINT) -> Point {

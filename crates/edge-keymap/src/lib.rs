@@ -54,6 +54,7 @@ pub fn windows_scancode_to_evdev(key: WindowsScanCode) -> Option<u16> {
         (0x2f, false) => 47,
         (0x30, false) => 48,
         (0x31, false) => 49,
+        (0x32, false) => 50,
         // Editing and whitespace.
         (0x01, false) => 1,
         (0x0e, false) => 14,
@@ -121,6 +122,26 @@ mod tests {
         assert_eq!(
             windows_scancode_to_evdev(WindowsScanCode::new(0x1e, false)),
             Some(30)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x2e, false)),
+            Some(46)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x32, false)),
+            Some(50)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x2b, false)),
+            Some(43)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x1d, false)),
+            Some(29)
+        );
+        assert_eq!(
+            windows_scancode_to_evdev(WindowsScanCode::new(0x0e, false)),
+            Some(14)
         );
         assert_eq!(
             windows_scancode_to_evdev(WindowsScanCode::new(0x1c, false)),
