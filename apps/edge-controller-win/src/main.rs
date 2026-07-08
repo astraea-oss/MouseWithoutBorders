@@ -41,6 +41,7 @@ enum TestInput {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    #[cfg(windows)]
     let run_tray = should_run_tray(&args);
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
     run_connected(connection).await
 }
 
+#[cfg(windows)]
 fn should_run_tray(args: &Args) -> bool {
     args.tray || (!args.dry_run && args.test_input.is_none() && args.test_clipboard_text.is_none())
 }
