@@ -394,6 +394,7 @@ dependencies = [
  "edge-keymap",
  "edge-protocol",
  "thiserror",
+ "tracing",
  "windows",
 ]
 
