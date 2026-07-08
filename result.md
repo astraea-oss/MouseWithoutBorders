@@ -1,19 +1,17 @@
 # Windows Test Result
 
 Date: 2026-07-08
-Windows commit tested: `23a22a0`
+Windows commit tested: `71b3180`
 
 ## Summary
 
-The Windows build, portable setup, and TCP reachability check now succeed. The
-end-to-end protocol tests reach the Linux receiver, but the receiver rejects the
-Windows controller because its pinned peer fingerprint does not match this
-portable Windows identity.
+The Windows build, portable setup, TCP reachability check, and controller
+protocol tests all succeeded against the Linux receiver.
 
 ## Passed
 
 - `git pull`: already up to date
-- `git rev-parse --short HEAD`: `23a22a0`
+- `git rev-parse --short HEAD`: `71b3180`
 - `cargo build -p edge-controller-win --release`: passed
 - Created/updated `portable-windows`
 - `portable-windows\edge-controller-win.exe --help`: passed
@@ -30,10 +28,9 @@ position = "left"
 backend = "auto"
 ```
 
-## Failed
+## Protocol Tests
 
-The controller protocol commands all reached the receiver, but failed during
-pairing:
+The controller protocol commands all completed successfully:
 
 ```powershell
 .\edge-controller-win.exe --dry-run
@@ -43,33 +40,17 @@ pairing:
 .\edge-controller-win.exe --test-clipboard-text "hello from Windows"
 ```
 
-Each command returned:
-
 ```text
-receiver error: pin_mismatch: peer key changed for Main PC:
-pinned 1770a1ad:8e6da14d:a9c40a9d:7afd7278
-got    f3c5eebe:41c1bfe1:97001a2b:e3578264
+--dry-run                         ExitCode: 0
+--test-input pointer              ExitCode: 0
+--test-input click                ExitCode: 0
+--test-input key                  ExitCode: 0
+--test-clipboard-text "hello..."  ExitCode: 0
 ```
 
 ## Interpretation
 
-Windows can reach `192.168.0.11:42420`, and the Linux receiver is accepting
-connections. The current blocker is not TCP reachability; it is the receiver's
-pinned controller identity.
-
-The Linux receiver has `"Main PC"` pinned to:
-
-```text
-1770a1ad:8e6da14d:a9c40a9d:7afd7278
-```
-
-The Windows `portable-windows\state\identity.toml` identity presented:
-
-```text
-f3c5eebe:41c1bfe1:97001a2b:e3578264
-```
-
-To continue testing, the Linux side needs to re-pair this Windows identity or
-clear/update its pinned peer entry for `"Main PC"`.
+Windows can reach `192.168.0.11:42420`, the Linux receiver accepts the encrypted
+controller session, and the Windows-side test commands complete successfully.
 
 No `edge-controller-win.exe` process was left running after the test.
