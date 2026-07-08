@@ -3,7 +3,12 @@
 #[cfg(windows)]
 use std::sync::mpsc::RecvTimeoutError;
 #[cfg(windows)]
-use std::{fs::OpenOptions, io::Write, path::Path, time::SystemTime};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::Path,
+    time::{Instant, SystemTime},
+};
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -21,6 +26,11 @@ use edge_protocol::{
     decode_frame, encode_frame,
 };
 use tokio::{net::TcpStream, sync::mpsc, time};
+
+#[cfg(windows)]
+const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
+#[cfg(windows)]
+const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]
@@ -517,27 +527,37 @@ fn start_live_input(
         remote_size,
     })
     .context("failed to start Windows live input capture")?;
-    let (sender, receiver) = mpsc::channel(512);
+    let (sender, receiver) = mpsc::channel(LIVE_INPUT_QUEUE_CAPACITY);
     std::thread::spawn(move || {
         let mut pending_motion = PendingMotion::default();
+        let mut last_motion_flush = Instant::now();
         loop {
-            match capture.recv_timeout(Duration::from_millis(4)) {
+            match capture.recv_timeout(LIVE_INPUT_FLUSH_INTERVAL) {
                 Ok(event) => {
                     let frame = captured_input_to_frame(event);
                     if pending_motion.coalesce(&frame) {
+                        if last_motion_flush.elapsed() >= LIVE_INPUT_FLUSH_INTERVAL {
+                            if !pending_motion.flush_lossy(&sender) {
+                                break;
+                            }
+                            last_motion_flush = Instant::now();
+                        }
                         continue;
                     }
-                    if !pending_motion.flush(&sender) || sender.blocking_send(frame).is_err() {
+                    if !pending_motion.flush_lossy(&sender) || sender.blocking_send(frame).is_err()
+                    {
                         break;
                     }
+                    last_motion_flush = Instant::now();
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if !pending_motion.flush(&sender) {
+                    if !pending_motion.flush_lossy(&sender) {
                         break;
                     }
+                    last_motion_flush = Instant::now();
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    let _ = pending_motion.flush(&sender);
+                    let _ = pending_motion.flush_lossy(&sender);
                     break;
                 }
             }
@@ -589,7 +609,7 @@ impl PendingMotion {
         }
     }
 
-    fn flush(&mut self, sender: &mpsc::Sender<Frame>) -> bool {
+    fn flush_lossy(&mut self, sender: &mpsc::Sender<Frame>) -> bool {
         if self.dx == 0.0 && self.dy == 0.0 {
             return true;
         }
@@ -599,7 +619,10 @@ impl PendingMotion {
         });
         self.dx = 0.0;
         self.dy = 0.0;
-        sender.blocking_send(frame).is_ok()
+        match sender.try_send(frame) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 }
 
