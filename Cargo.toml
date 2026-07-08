@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/edge-common",
+  "crates/edge-protocol",
+  "crates/edge-crypto",
+  "crates/edge-geometry",
+  "crates/edge-keymap",
+  "crates/edge-linux-input",
+  "crates/edge-windows-input",
+  "apps/edge-controller-win",
+  "apps/edge-receiver-linux",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/astraea-oss/MouseWithoutBorders"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+bytes = "1.10.1"
+clap = { version = "4.5.50", features = ["derive"] }
+hex = "0.4.3"
+rmp-serde = "1.3.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+snow = "0.9.6"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+toml = "0.9.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+

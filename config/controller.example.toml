@@ -1,0 +1,18 @@
+device_name = "Main PC"
+role = "controller"
+release_hotkey = "Ctrl+Alt+Pause"
+
+[peer.laptop]
+host = "192.168.0.11"
+port = 42420
+position = "left"
+pinned_fingerprint = ""
+
+[input]
+backend = "libei"
+
+[clipboard]
+enabled = true
+text_only = true
+max_bytes = 1048576
+

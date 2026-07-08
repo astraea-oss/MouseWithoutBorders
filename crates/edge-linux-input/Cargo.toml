@@ -1,0 +1,16 @@
+[package]
+name = "edge-linux-input"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+edge-common = { path = "../edge-common" }
+edge-protocol = { path = "../edge-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+

@@ -1,0 +1,3 @@
+/target/
+/.edge-kvm-state/
+*.log

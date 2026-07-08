@@ -1,0 +1,13 @@
+device_name = "Lua"
+role = "receiver"
+listen = "0.0.0.0:42420"
+monitor = "eDP-1"
+
+[input]
+backend = "libei"
+
+[clipboard]
+enabled = true
+text_only = true
+max_bytes = 1048576
+

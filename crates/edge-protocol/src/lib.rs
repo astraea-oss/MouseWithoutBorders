@@ -1,0 +1,170 @@
+use edge_common::Role;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_PORT: u16 = 42_420;
+pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProtocolError {
+    #[error("frame too large: {0} bytes")]
+    FrameTooLarge(u32),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("encode error: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("decode error: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+}
+
+pub type Result<T> = std::result::Result<T, ProtocolError>;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Frame {
+    Hello(Hello),
+    ScreenInfo(ScreenInfo),
+    Input(InputEvent),
+    Clipboard(ClipboardEvent),
+    Control(ControlEvent),
+    Heartbeat(Heartbeat),
+    Error(RemoteError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub protocol_version: u16,
+    pub device_name: String,
+    pub role: Role,
+    pub public_key_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreenInfo {
+    pub outputs: Vec<OutputInfo>,
+    pub primary_output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputInfo {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InputEvent {
+    PointerMotion { dx: f64, dy: f64 },
+    PointerButton { button: MouseButton, down: bool },
+    PointerWheel { x: f64, y: f64 },
+    Key { evdev_code: u16, down: bool },
+    AllKeysUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClipboardEvent {
+    TextOffer { sequence: u64, text: String },
+    TextRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ControlEvent {
+    EnterRemote { edge: Edge, normalized_y: f32 },
+    LeaveRemote { edge: Edge, normalized_y: f32 },
+    ReleaseToLocal { reason: ReleaseReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReleaseReason {
+    Hotkey,
+    PeerDisconnected,
+    HeartbeatTimeout,
+    BackendFailure,
+    UserRequest,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteError {
+    pub code: String,
+    pub message: String,
+}
+
+pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(frame).map_err(ProtocolError::from)
+}
+
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+    rmp_serde::from_slice(bytes).map_err(ProtocolError::from)
+}
+
+pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = encode_frame(frame)?;
+    let len = u32::try_from(payload.len()).map_err(|_| ProtocolError::FrameTooLarge(u32::MAX))?;
+    if len > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(len));
+    }
+    writer.write_u32(len).await?;
+    writer.write_all(&payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+pub async fn read_frame<R>(reader: &mut R) -> Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    let len = reader.read_u32().await?;
+    if len > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0; len as usize];
+    reader.read_exact(&mut payload).await?;
+    decode_frame(&payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messagepack_round_trip() {
+        let frame = Frame::Input(InputEvent::Key {
+            evdev_code: 30,
+            down: true,
+        });
+
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded = decode_frame(&encoded).unwrap();
+
+        assert_eq!(decoded, frame);
+    }
+}
