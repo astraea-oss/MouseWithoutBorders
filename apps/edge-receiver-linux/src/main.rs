@@ -29,7 +29,7 @@ use tokio::{
 
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
-const RETURN_EDGE_MARGIN: i32 = 1;
+const RETURN_EDGE_MARGIN: i32 = 12;
 
 mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
