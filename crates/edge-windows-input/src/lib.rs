@@ -43,6 +43,7 @@ pub enum CapturedInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureStatsSnapshot {
     pub active: bool,
+    pub suspended: bool,
     pub mouse_hook_events: u64,
     pub keyboard_hook_events: u64,
     pub input_events: u64,
@@ -52,6 +53,8 @@ pub struct CaptureStatsSnapshot {
     pub return_edge_hits: u64,
     pub game_guard_blocks: u64,
     pub game_guard_releases: u64,
+    pub suspend_toggles: u64,
+    pub suspend_blocks: u64,
     pub send_failures: u64,
     pub unmapped_keys: u64,
 }
@@ -324,6 +327,7 @@ mod capture {
     const VK_RMENU: u32 = 0xa5;
     const VK_PAUSE: u32 = 0x13;
     const VK_ESCAPE: u32 = 0x1b;
+    const VK_G: u32 = 0x47;
     const XBUTTON1: u16 = 0x0001;
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
@@ -350,6 +354,7 @@ mod capture {
     pub fn start(config: CaptureConfig) -> Result<mpsc::Receiver<CapturedInput>> {
         let (sender, receiver) = mpsc::channel();
         CAPTURE_STATS.active.store(false, Ordering::Relaxed);
+        CAPTURE_STATS.suspended.store(false, Ordering::Relaxed);
         let state = CaptureState {
             sender,
             config,
@@ -359,6 +364,7 @@ mod capture {
             remote_cursor: Point { x: 0.0, y: 0.0 },
             ctrl_down: false,
             alt_down: false,
+            capture_suspended: false,
             cursor_hidden: false,
             game_guard: GameGuard::default(),
         };
@@ -431,6 +437,24 @@ mod capture {
         };
         let mut state = state.lock().expect("capture state poisoned");
         let message = wparam as u32;
+
+        if state.capture_suspended {
+            if state.active {
+                tracing::info!("capture is suspended; releasing remote control");
+                state.release_to_local(ReleaseReason::UserRequest);
+            } else if message == WM_MOUSEMOVE && state.at_activation_edge(mouse.pt) {
+                CAPTURE_STATS.suspend_blocks.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("capture suspension blocked edge activation");
+            }
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
 
         if state.game_guard_blocks_capture() {
             if state.active {
@@ -562,6 +586,11 @@ mod capture {
             state.update_modifier(keyboard.vkCode, down);
         }
 
+        if down && state.ctrl_down && state.alt_down && keyboard.vkCode == VK_G {
+            state.toggle_capture_suspended();
+            return 1;
+        }
+
         if !state.active {
             return unsafe {
                 CallNextHookEx(
@@ -609,6 +638,7 @@ mod capture {
         remote_cursor: Point,
         ctrl_down: bool,
         alt_down: bool,
+        capture_suspended: bool,
         cursor_hidden: bool,
         game_guard: GameGuard,
     }
@@ -625,6 +655,23 @@ mod capture {
 
         fn game_guard_blocks_capture(&mut self) -> bool {
             self.game_guard.blocks_capture()
+        }
+
+        fn toggle_capture_suspended(&mut self) {
+            self.capture_suspended = !self.capture_suspended;
+            CAPTURE_STATS
+                .suspended
+                .store(self.capture_suspended, Ordering::Relaxed);
+            CAPTURE_STATS
+                .suspend_toggles
+                .fetch_add(1, Ordering::Relaxed);
+            if self.capture_suspended {
+                tracing::info!("Windows edge capture suspended");
+                self.release_to_local(ReleaseReason::UserRequest);
+                self.show_source_cursor();
+            } else {
+                tracing::info!("Windows edge capture resumed");
+            }
         }
 
         fn enter_remote(&mut self, point: POINT) {
@@ -774,6 +821,7 @@ mod capture {
 
     struct CaptureStats {
         active: AtomicBool,
+        suspended: AtomicBool,
         mouse_hook_events: AtomicU64,
         keyboard_hook_events: AtomicU64,
         input_events: AtomicU64,
@@ -783,6 +831,8 @@ mod capture {
         return_edge_hits: AtomicU64,
         game_guard_blocks: AtomicU64,
         game_guard_releases: AtomicU64,
+        suspend_toggles: AtomicU64,
+        suspend_blocks: AtomicU64,
         send_failures: AtomicU64,
         unmapped_keys: AtomicU64,
     }
@@ -791,6 +841,7 @@ mod capture {
         const fn new() -> Self {
             Self {
                 active: AtomicBool::new(false),
+                suspended: AtomicBool::new(false),
                 mouse_hook_events: AtomicU64::new(0),
                 keyboard_hook_events: AtomicU64::new(0),
                 input_events: AtomicU64::new(0),
@@ -800,6 +851,8 @@ mod capture {
                 return_edge_hits: AtomicU64::new(0),
                 game_guard_blocks: AtomicU64::new(0),
                 game_guard_releases: AtomicU64::new(0),
+                suspend_toggles: AtomicU64::new(0),
+                suspend_blocks: AtomicU64::new(0),
                 send_failures: AtomicU64::new(0),
                 unmapped_keys: AtomicU64::new(0),
             }
@@ -808,6 +861,7 @@ mod capture {
         fn snapshot(&self) -> CaptureStatsSnapshot {
             CaptureStatsSnapshot {
                 active: self.active.load(Ordering::Relaxed),
+                suspended: self.suspended.load(Ordering::Relaxed),
                 mouse_hook_events: self.mouse_hook_events.load(Ordering::Relaxed),
                 keyboard_hook_events: self.keyboard_hook_events.load(Ordering::Relaxed),
                 input_events: self.input_events.load(Ordering::Relaxed),
@@ -817,6 +871,8 @@ mod capture {
                 return_edge_hits: self.return_edge_hits.load(Ordering::Relaxed),
                 game_guard_blocks: self.game_guard_blocks.load(Ordering::Relaxed),
                 game_guard_releases: self.game_guard_releases.load(Ordering::Relaxed),
+                suspend_toggles: self.suspend_toggles.load(Ordering::Relaxed),
+                suspend_blocks: self.suspend_blocks.load(Ordering::Relaxed),
                 send_failures: self.send_failures.load(Ordering::Relaxed),
                 unmapped_keys: self.unmapped_keys.load(Ordering::Relaxed),
             }
