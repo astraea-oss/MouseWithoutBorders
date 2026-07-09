@@ -1,4 +1,10 @@
-use std::{future, path::PathBuf, time::Duration};
+use std::{
+    fs::OpenOptions,
+    future,
+    io::Write,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -50,6 +56,22 @@ enum TestInput {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    let receiver_log = default_state_dir().join("receiver.log");
+    install_receiver_panic_log(receiver_log.clone());
+    append_portable_log(&receiver_log, "receiver process starting");
+
+    let result = run_main(receiver_log.clone()).await;
+    match &result {
+        Ok(()) => append_portable_log(&receiver_log, "receiver process exited cleanly"),
+        Err(err) => append_portable_log(
+            &receiver_log,
+            format!("receiver process exited with error: {err:#}"),
+        ),
+    }
+    result
+}
+
+async fn run_main(receiver_log: PathBuf) -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
@@ -76,7 +98,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_receiver(config, args.pair, backend, !args.no_tray).await
+    run_receiver(config, args.pair, backend, !args.no_tray, receiver_log).await
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
@@ -145,6 +167,7 @@ async fn run_receiver(
     allow_pairing: bool,
     backend: ReceiverBackend,
     enable_tray: bool,
+    log_path: PathBuf,
 ) -> Result<()> {
     let state_dir = default_state_dir();
     let identity = IdentityKey::load_or_create(state_dir.join("identity.toml"))
@@ -172,6 +195,10 @@ async fn run_receiver(
             }
             Err(err) => {
                 tracing::warn!(%err, "failed to start tray status item");
+                append_portable_log(
+                    &log_path,
+                    format!("failed to start tray status item: {err:#}"),
+                );
                 (None, None)
             }
         }
@@ -185,12 +212,20 @@ async fn run_receiver(
         allow_pairing,
         "receiver listening"
     );
+    append_portable_log(
+        &log_path,
+        format!(
+            "receiver listening on {listen}; fingerprint={}; allow_pairing={allow_pairing}",
+            identity.fingerprint()
+        ),
+    );
 
     loop {
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
                 if matches!(command, Some(TrayCommand::Quit)) {
                     tracing::info!("quit requested from tray");
+                    append_portable_log(&log_path, "quit requested from tray");
                     break;
                 }
                 continue;
@@ -198,6 +233,7 @@ async fn run_receiver(
             incoming = listener.accept() => incoming?,
         };
         tracing::info!(%addr, "controller connected");
+        append_portable_log(&log_path, format!("controller connected: {addr}"));
 
         let (mut session, peer_fingerprint) = match accept_noise_session(stream, &identity).await {
             Ok(session) => session,
@@ -206,6 +242,7 @@ async fn run_receiver(
                     tray.error(format!("Noise handshake failed: {err}")).await;
                 }
                 tracing::warn!(%err, "Noise handshake failed");
+                append_portable_log(&log_path, format!("Noise handshake failed: {err:#}"));
                 continue;
             }
         };
@@ -221,6 +258,7 @@ async fn run_receiver(
                     tray.error(format!("failed to read Hello: {err}")).await;
                 }
                 tracing::warn!(%err, "failed to read Hello");
+                append_portable_log(&log_path, format!("failed to read Hello: {err:#}"));
                 continue;
             }
         };
@@ -233,6 +271,7 @@ async fn run_receiver(
             Ok(PinDecision::PinnedNewPeer { fingerprint }) => {
                 pins.save(state_dir.join("pins.toml")).await?;
                 tracing::info!(%fingerprint, "paired new controller");
+                append_portable_log(&log_path, format!("paired new controller: {fingerprint}"));
             }
             Ok(PinDecision::Accepted) => {}
             Err(err) => {
@@ -249,6 +288,7 @@ async fn run_receiver(
                     tray.error(err.to_string()).await;
                 }
                 tracing::warn!(%err, "rejected controller");
+                append_portable_log(&log_path, format!("rejected controller: {err:#}"));
                 continue;
             }
         }
@@ -287,6 +327,7 @@ async fn run_receiver(
         {
             Ok(ControllerSessionExit::QuitRequested) => {
                 tracing::info!("quit requested from tray");
+                append_portable_log(&log_path, "quit requested from tray");
                 break;
             }
             Err(err) => {
@@ -294,6 +335,7 @@ async fn run_receiver(
                     tray.disconnected(Some(err.to_string())).await;
                 }
                 tracing::warn!(%err, "controller session ended");
+                append_portable_log(&log_path, format!("controller session ended: {err:#}"));
             }
         }
         backend.all_keys_up().await.ok();
@@ -303,7 +345,24 @@ async fn run_receiver(
     if let Some(tray) = &tray {
         tray.shutdown().await;
     }
+    append_portable_log(&log_path, "receiver shutdown complete");
     Ok(())
+}
+
+fn install_receiver_panic_log(log_path: PathBuf) {
+    std::panic::set_hook(Box::new(move |panic_info| {
+        append_portable_log(&log_path, format!("receiver panic: {panic_info}"));
+    }));
+}
+
+fn append_portable_log(path: &Path, message: impl AsRef<str>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
+    }
 }
 
 enum ControllerSessionExit {
