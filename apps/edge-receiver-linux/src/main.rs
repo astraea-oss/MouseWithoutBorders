@@ -27,6 +27,8 @@ use tokio::{
     time,
 };
 
+const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
 
@@ -322,6 +324,7 @@ async fn run_receiver(
             &backend,
             tray.as_ref(),
             &mut tray_commands,
+            &log_path,
         )
         .await
         {
@@ -375,9 +378,12 @@ async fn handle_controller(
     backend: &ReceiverBackend,
     tray: Option<&ReceiverTrayHandle>,
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
+    log_path: &Path,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
+    let mut status_log = time::interval(STATUS_LOG_INTERVAL);
+    let mut stats = ReceiverInputStats::default();
     let (reader, mut writer) = session.split();
     let mut frame_rx = spawn_controller_reader(reader);
 
@@ -386,6 +392,10 @@ async fn handle_controller(
             _ = heartbeat.tick() => {
                 heartbeat_sequence += 1;
                 write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
+                stats.heartbeats = stats.heartbeats.saturating_add(1);
+            }
+            _ = status_log.tick() => {
+                stats.log(log_path, "receiver");
             }
             command = recv_tray_command(tray_commands) => {
                 if matches!(command, Some(TrayCommand::Quit)) {
@@ -396,24 +406,28 @@ async fn handle_controller(
                 let frame = frame.context("controller frame reader ended")??;
                 match frame {
                     Frame::Input(InputEvent::AllKeysUp) => {
+                        stats.all_keys_up = stats.all_keys_up.saturating_add(1);
                         backend.all_keys_up().await?;
                         if let Some(tray) = tray {
                             tray.input_event().await;
                         }
                     }
                     Frame::Input(event) => {
+                        stats.record_input(&event);
                         backend.inject(event).await?;
                         if let Some(tray) = tray {
                             tray.input_event().await;
                         }
                     }
                     Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) => {
+                        stats.clipboard = stats.clipboard.saturating_add(1);
                         write_clipboard_text(&config.clipboard, &text).await?;
                         if let Some(tray) = tray {
                             tray.clipboard_event().await;
                         }
                     }
                     Frame::Clipboard(ClipboardEvent::TextRequest) => {
+                        stats.clipboard = stats.clipboard.saturating_add(1);
                         if let Some(text) = read_clipboard_text(&config.clipboard).await? {
                             write_secure_frame_writer(
                                 &mut writer,
@@ -425,11 +439,65 @@ async fn handle_controller(
                         }
                     }
                     Frame::Heartbeat(_) => {}
-                    Frame::Control(control) => tracing::info!(?control, "control event"),
+                    Frame::Control(control) => {
+                        stats.control = stats.control.saturating_add(1);
+                        tracing::info!(?control, "control event");
+                    }
                     Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ReceiverInputStats {
+    motion: u64,
+    buttons: u64,
+    wheel: u64,
+    keys: u64,
+    all_keys_up: u64,
+    clipboard: u64,
+    control: u64,
+    heartbeats: u64,
+}
+
+impl ReceiverInputStats {
+    fn record_input(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::PointerMotion { .. } => {
+                self.motion = self.motion.saturating_add(1);
+            }
+            InputEvent::PointerButton { .. } => {
+                self.buttons = self.buttons.saturating_add(1);
+            }
+            InputEvent::PointerWheel { .. } => {
+                self.wheel = self.wheel.saturating_add(1);
+            }
+            InputEvent::Key { .. } => {
+                self.keys = self.keys.saturating_add(1);
+            }
+            InputEvent::AllKeysUp => {
+                self.all_keys_up = self.all_keys_up.saturating_add(1);
+            }
+        }
+    }
+
+    fn log(&self, path: &Path, side: &str) {
+        append_portable_log(
+            path,
+            format!(
+                "{side} status motion={} buttons={} wheel={} keys={} all_keys_up={} clipboard={} control={} heartbeats={}",
+                self.motion,
+                self.buttons,
+                self.wheel,
+                self.keys,
+                self.all_keys_up,
+                self.clipboard,
+                self.control,
+                self.heartbeats
+            ),
+        );
     }
 }
 

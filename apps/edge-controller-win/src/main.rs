@@ -2,14 +2,15 @@
 
 #[cfg(windows)]
 use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 #[cfg(windows)]
+use std::time::Instant;
 use std::{
     fs::OpenOptions,
     io::Write,
-    path::Path,
-    time::{Instant, SystemTime},
+    path::{Path, PathBuf},
+    time::SystemTime,
 };
-use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -31,6 +32,7 @@ use tokio::{net::TcpStream, sync::mpsc, time};
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
 #[cfg(windows)]
 const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
+const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]
@@ -61,13 +63,29 @@ enum TestInput {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    let controller_log = default_state_dir().join("controller.log");
+    install_controller_panic_log(controller_log.clone());
+    append_portable_log(&controller_log, "controller process starting");
+
+    let result = run_main(controller_log.clone()).await;
+    match &result {
+        Ok(()) => append_portable_log(&controller_log, "controller process exited cleanly"),
+        Err(err) => append_portable_log(
+            &controller_log,
+            format!("controller process exited with error: {err:#}"),
+        ),
+    }
+    #[cfg(windows)]
+    edge_windows_input::force_release_to_local();
+    result
+}
+
+async fn run_main(controller_log: PathBuf) -> Result<()> {
     let args = Args::parse();
     #[cfg(windows)]
     let run_tray = should_run_tray(&args);
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
-    #[cfg(windows)]
-    let startup_log = default_state_dir().join("controller.log");
 
     if config.role != Role::Controller {
         anyhow::bail!(
@@ -83,7 +101,7 @@ async fn main() -> Result<()> {
     #[cfg(windows)]
     {
         if run_tray {
-            let mut connection = connect_for_tray(&config, &identity, &startup_log).await;
+            let mut connection = connect_for_tray(&config, &identity, &controller_log).await;
 
             edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
             let status = connection
@@ -91,8 +109,8 @@ async fn main() -> Result<()> {
                 .map(|(connection, _)| connection.status())
                 .unwrap_or_else(|| "Disconnected".to_string());
             tracing::info!(%status, "starting tray loop");
-            append_portable_log(&startup_log, format!("starting tray loop: {status}"));
-            let tray_log = startup_log.clone();
+            append_portable_log(&controller_log, format!("starting tray loop: {status}"));
+            let tray_log = controller_log.clone();
             std::thread::spawn(move || {
                 if let Err(err) = edge_windows_input::run_tray(&status) {
                     tracing::warn!(%err, "Windows tray exited with error");
@@ -105,12 +123,14 @@ async fn main() -> Result<()> {
 
             loop {
                 if let Some((active_connection, screen_info)) = connection {
-                    match run_connected(active_connection, &config, screen_info).await {
+                    match run_connected(active_connection, &config, screen_info, &controller_log)
+                        .await
+                    {
                         Ok(()) => return Ok(()),
                         Err(err) => {
                             tracing::warn!(%err, "connected session ended; reconnecting");
                             append_portable_log(
-                                &startup_log,
+                                &controller_log,
                                 format!("connected session ended; reconnecting: {err:#}"),
                             );
                         }
@@ -118,7 +138,7 @@ async fn main() -> Result<()> {
                 }
 
                 time::sleep(Duration::from_secs(2)).await;
-                connection = connect_for_tray(&config, &identity, &startup_log).await;
+                connection = connect_for_tray(&config, &identity, &controller_log).await;
             }
         }
     }
@@ -147,7 +167,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_connected(connection, &config, screen_info).await
+    run_connected(connection, &config, screen_info, &controller_log).await
 }
 
 #[cfg(windows)]
@@ -181,7 +201,6 @@ async fn connect_for_tray(
     }
 }
 
-#[cfg(windows)]
 fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -190,6 +209,14 @@ fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
     }
+}
+
+fn install_controller_panic_log(log_path: PathBuf) {
+    std::panic::set_hook(Box::new(move |panic_info| {
+        append_portable_log(&log_path, format!("controller panic: {panic_info}"));
+        #[cfg(windows)]
+        edge_windows_input::force_release_to_local();
+    }));
 }
 
 struct ControllerConnection {
@@ -334,10 +361,29 @@ async fn run_connected(
     connection: ControllerConnection,
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
+    log_path: &Path,
+) -> Result<()> {
+    let result = run_connected_inner(connection, config, screen_info, log_path).await;
+    #[cfg(windows)]
+    edge_windows_input::force_release_to_local();
+    result
+}
+
+async fn run_connected_inner(
+    connection: ControllerConnection,
+    config: &AppConfig,
+    screen_info: Option<ScreenInfo>,
+    log_path: &Path,
 ) -> Result<()> {
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
+    append_portable_log(
+        log_path,
+        format!("connected session started: {}", connection.status()),
+    );
     let mut input_rx = start_live_input(config, screen_info)?;
     let mut live_clipboard = LiveClipboardState::default();
+    let mut stats = ControllerInputStats::default();
+    let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
     let (reader, mut writer) = connection.session.split();
     let mut receiver_rx = spawn_receiver_reader(reader);
@@ -347,20 +393,27 @@ async fn run_connected(
             _ = tokio::signal::ctrl_c() => {
                 write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
                 tracing::info!("shutdown requested");
+                append_portable_log(log_path, "shutdown requested");
                 return Ok(());
+            }
+            _ = status_log.tick() => {
+                stats.log(log_path, "controller");
             }
             event = recv_live_input(&mut input_rx) => {
                 if let Some(frame) = event {
                     if let Some(prefix) = live_clipboard.frame_before_input(&frame, config)? {
                         write_secure_frame_writer(&mut writer, &prefix).await?;
+                        stats.record_frame(&prefix);
                     }
                     write_secure_frame_writer(&mut writer, &frame).await?;
+                    stats.record_frame(&frame);
                     live_clipboard.after_input_sent(&frame, config, &clipboard_tx);
                 }
             }
             frame = clipboard_rx.recv() => {
                 if let Some(frame) = frame {
                     write_secure_frame_writer(&mut writer, &frame).await?;
+                    stats.record_frame(&frame);
                 }
             }
             frame = receiver_rx.recv() => {
@@ -374,6 +427,63 @@ async fn run_connected(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ControllerInputStats {
+    frames: u64,
+    motion: u64,
+    buttons: u64,
+    wheel: u64,
+    keys: u64,
+    clipboard: u64,
+    control: u64,
+}
+
+impl ControllerInputStats {
+    fn record_frame(&mut self, frame: &Frame) {
+        self.frames = self.frames.saturating_add(1);
+        match frame {
+            Frame::Input(InputEvent::PointerMotion { .. }) => {
+                self.motion = self.motion.saturating_add(1);
+            }
+            Frame::Input(InputEvent::PointerButton { .. }) => {
+                self.buttons = self.buttons.saturating_add(1);
+            }
+            Frame::Input(InputEvent::PointerWheel { .. }) => {
+                self.wheel = self.wheel.saturating_add(1);
+            }
+            Frame::Input(InputEvent::Key { .. }) => {
+                self.keys = self.keys.saturating_add(1);
+            }
+            Frame::Input(InputEvent::AllKeysUp) => {
+                self.keys = self.keys.saturating_add(1);
+            }
+            Frame::Clipboard(_) => {
+                self.clipboard = self.clipboard.saturating_add(1);
+            }
+            Frame::Control(_) => {
+                self.control = self.control.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn log(&self, path: &Path, side: &str) {
+        append_portable_log(
+            path,
+            format!(
+                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={}",
+                self.frames,
+                self.motion,
+                self.buttons,
+                self.wheel,
+                self.keys,
+                self.clipboard,
+                self.control
+            ),
+        );
     }
 }
 

@@ -83,6 +83,14 @@ pub fn run_tray(_status: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn force_release_to_local() {
+    capture::force_release_to_local()
+}
+
+#[cfg(not(windows))]
+pub fn force_release_to_local() {}
+
+#[cfg(windows)]
 pub fn read_clipboard_text(max_bytes: usize) -> Result<Option<String>> {
     clipboard::read_text(max_bytes)
 }
@@ -274,6 +282,15 @@ mod capture {
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
 
+    pub fn force_release_to_local() {
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        let mut state = state.lock().expect("capture state poisoned");
+        state.release_to_local(ReleaseReason::PeerDisconnected);
+        state.show_source_cursor();
+    }
+
     pub fn start(config: CaptureConfig) -> Result<mpsc::Receiver<CapturedInput>> {
         let (sender, receiver) = mpsc::channel();
         let state = CaptureState {
@@ -374,7 +391,10 @@ mod capture {
         }
 
         match message {
-            WM_MOUSEMOVE => state.remote_motion(mouse.pt),
+            WM_MOUSEMOVE => {
+                state.keep_source_cursor_hidden();
+                state.remote_motion(mouse.pt);
+            }
             WM_LBUTTONDOWN => state.send_input(InputEvent::PointerButton {
                 button: MouseButton::Left,
                 down: true,
@@ -470,6 +490,7 @@ mod capture {
         }
 
         if down || up {
+            state.keep_source_cursor_hidden();
             let scan_code = keyboard.scanCode as u16;
             let extended = keyboard.flags & LLKHF_EXTENDED != 0;
             match map_key(scan_code, extended) {
@@ -576,6 +597,12 @@ mod capture {
             }
             unsafe { while ShowCursor(0) >= 0 {} }
             self.cursor_hidden = true;
+        }
+
+        fn keep_source_cursor_hidden(&mut self) {
+            if !self.cursor_hidden {
+                self.hide_source_cursor();
+            }
         }
 
         fn show_source_cursor(&mut self) {
