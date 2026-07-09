@@ -23,6 +23,7 @@ use edge_protocol::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    signal::unix::{SignalKind, signal},
     sync::mpsc,
     time,
 };
@@ -64,7 +65,22 @@ async fn main() -> Result<()> {
     install_receiver_panic_log(receiver_log.clone());
     append_portable_log(&receiver_log, "receiver process starting");
 
-    let result = run_main(receiver_log.clone()).await;
+    let result = tokio::select! {
+        result = run_main(receiver_log.clone()) => result,
+        signal = shutdown_signal() => {
+            match signal {
+                Ok(signal) => {
+                    tracing::info!(signal, "receiver shutdown signal received");
+                    append_portable_log(
+                        &receiver_log,
+                        format!("receiver shutdown signal received: {signal}"),
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(err).context("failed to install receiver shutdown signal handler"),
+            }
+        }
+    };
     match &result {
         Ok(()) => append_portable_log(&receiver_log, "receiver process exited cleanly"),
         Err(err) => append_portable_log(
@@ -73,6 +89,18 @@ async fn main() -> Result<()> {
         ),
     }
     result
+}
+
+async fn shutdown_signal() -> Result<&'static str> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+
+    tokio::select! {
+        _ = interrupt.recv() => Ok("SIGINT"),
+        _ = terminate.recv() => Ok("SIGTERM"),
+        _ = hangup.recv() => Ok("SIGHUP"),
+    }
 }
 
 async fn run_main(receiver_log: PathBuf) -> Result<()> {
