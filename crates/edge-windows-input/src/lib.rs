@@ -50,6 +50,8 @@ pub struct CaptureStatsSnapshot {
     pub enter_events: u64,
     pub release_events: u64,
     pub return_edge_hits: u64,
+    pub game_guard_blocks: u64,
+    pub game_guard_releases: u64,
     pub send_failures: u64,
     pub unmapped_keys: u64,
 }
@@ -278,21 +280,26 @@ mod capture {
             mpsc,
         },
         thread,
+        time::{Duration, Instant},
     };
 
     use edge_protocol::Edge;
     use windows_sys::Win32::{
-        Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Graphics::Gdi::{
+            GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CallNextHookEx, CreateCursor, DestroyCursor, DispatchMessageW, GetMessageW,
-            GetSystemMetrics, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG,
-            MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO,
-            OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP,
-            OCR_WAIT, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
-            SystemParametersInfoW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            CallNextHookEx, CreateCursor, DestroyCursor, DispatchMessageW, GetClipCursor,
+            GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK,
+            KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS,
+            OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW,
+            OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, SPI_SETCURSORS, SetCursorPos,
+            SetSystemCursor, SetWindowsHookExW, ShowCursor, SystemParametersInfoW,
+            TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     };
@@ -321,6 +328,8 @@ mod capture {
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
     const REMOTE_ENTRY_PADDING: f64 = 32.0;
+    const GAME_GUARD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+    const FULLSCREEN_TOLERANCE_PX: i32 = 2;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
@@ -351,6 +360,7 @@ mod capture {
             ctrl_down: false,
             alt_down: false,
             cursor_hidden: false,
+            game_guard: GameGuard::default(),
         };
 
         if let Some(existing) = STATE.get() {
@@ -421,6 +431,31 @@ mod capture {
         };
         let mut state = state.lock().expect("capture state poisoned");
         let message = wparam as u32;
+
+        if state.game_guard_blocks_capture() {
+            if state.active {
+                CAPTURE_STATS
+                    .game_guard_releases
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    "foreground fullscreen/captured app detected; releasing remote control"
+                );
+                state.release_to_local(ReleaseReason::UserRequest);
+            } else if message == WM_MOUSEMOVE && state.at_activation_edge(mouse.pt) {
+                CAPTURE_STATS
+                    .game_guard_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("foreground fullscreen/captured app blocked edge activation");
+            }
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
 
         if !state.active {
             if message == WM_MOUSEMOVE && state.at_activation_edge(mouse.pt) {
@@ -575,6 +610,7 @@ mod capture {
         ctrl_down: bool,
         alt_down: bool,
         cursor_hidden: bool,
+        game_guard: GameGuard,
     }
 
     impl CaptureState {
@@ -585,6 +621,10 @@ mod capture {
                 Edge::Top => point.y <= self.local_bounds.top,
                 Edge::Bottom => point.y >= self.local_bounds.bottom(),
             }
+        }
+
+        fn game_guard_blocks_capture(&mut self) -> bool {
+            self.game_guard.blocks_capture()
         }
 
         fn enter_remote(&mut self, point: POINT) {
@@ -741,6 +781,8 @@ mod capture {
         enter_events: AtomicU64,
         release_events: AtomicU64,
         return_edge_hits: AtomicU64,
+        game_guard_blocks: AtomicU64,
+        game_guard_releases: AtomicU64,
         send_failures: AtomicU64,
         unmapped_keys: AtomicU64,
     }
@@ -756,6 +798,8 @@ mod capture {
                 enter_events: AtomicU64::new(0),
                 release_events: AtomicU64::new(0),
                 return_edge_hits: AtomicU64::new(0),
+                game_guard_blocks: AtomicU64::new(0),
+                game_guard_releases: AtomicU64::new(0),
                 send_failures: AtomicU64::new(0),
                 unmapped_keys: AtomicU64::new(0),
             }
@@ -771,9 +815,37 @@ mod capture {
                 enter_events: self.enter_events.load(Ordering::Relaxed),
                 release_events: self.release_events.load(Ordering::Relaxed),
                 return_edge_hits: self.return_edge_hits.load(Ordering::Relaxed),
+                game_guard_blocks: self.game_guard_blocks.load(Ordering::Relaxed),
+                game_guard_releases: self.game_guard_releases.load(Ordering::Relaxed),
                 send_failures: self.send_failures.load(Ordering::Relaxed),
                 unmapped_keys: self.unmapped_keys.load(Ordering::Relaxed),
             }
+        }
+    }
+
+    struct GameGuard {
+        last_check: Instant,
+        blocks_capture: bool,
+    }
+
+    impl Default for GameGuard {
+        fn default() -> Self {
+            Self {
+                last_check: Instant::now() - GAME_GUARD_CHECK_INTERVAL,
+                blocks_capture: false,
+            }
+        }
+    }
+
+    impl GameGuard {
+        fn blocks_capture(&mut self) -> bool {
+            if self.last_check.elapsed() < GAME_GUARD_CHECK_INTERVAL {
+                return self.blocks_capture;
+            }
+
+            self.last_check = Instant::now();
+            self.blocks_capture = foreground_is_fullscreen() || cursor_is_confined();
+            self.blocks_capture
         }
     }
 
@@ -879,6 +951,62 @@ mod capture {
     fn remote_entry_padding(extent: u32) -> f64 {
         let max = f64::from(extent.saturating_sub(1));
         clamp(REMOTE_ENTRY_PADDING, 1.0, max)
+    }
+
+    fn foreground_is_fullscreen() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return false;
+            }
+
+            let mut window = RECT::default();
+            if GetWindowRect(hwnd, &mut window) == 0 {
+                return false;
+            }
+
+            let monitor: HMONITOR = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                return false;
+            }
+
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                rcMonitor: RECT::default(),
+                rcWork: RECT::default(),
+                dwFlags: 0,
+            };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return false;
+            }
+
+            rect_covers(&window, &info.rcMonitor, FULLSCREEN_TOLERANCE_PX)
+        }
+    }
+
+    fn cursor_is_confined() -> bool {
+        unsafe {
+            let mut clip = RECT::default();
+            if GetClipCursor(&mut clip) == 0 {
+                return false;
+            }
+
+            let desktop = RECT {
+                left: GetSystemMetrics(SM_XVIRTUALSCREEN),
+                top: GetSystemMetrics(SM_YVIRTUALSCREEN),
+                right: GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                bottom: GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            };
+
+            !rect_covers(&clip, &desktop, FULLSCREEN_TOLERANCE_PX)
+        }
+    }
+
+    fn rect_covers(rect: &RECT, bounds: &RECT, tolerance: i32) -> bool {
+        rect.left <= bounds.left + tolerance
+            && rect.top <= bounds.top + tolerance
+            && rect.right >= bounds.right - tolerance
+            && rect.bottom >= bounds.bottom - tolerance
     }
 
     fn high_word_signed(value: u32) -> i16 {

@@ -481,7 +481,7 @@ impl ControllerInputStats {
         append_portable_log(
             path,
             format!(
-                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} hook_mouse={} hook_keyboard={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_send_failures={} capture_unmapped_keys={}",
+                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} hook_mouse={} hook_keyboard={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_game_guard_blocks={} capture_game_guard_releases={} capture_send_failures={} capture_unmapped_keys={}",
                 self.frames,
                 self.motion,
                 self.buttons,
@@ -497,6 +497,8 @@ impl ControllerInputStats {
                 capture.enter_events,
                 capture.release_events,
                 capture.return_edge_hits,
+                capture.game_guard_blocks,
+                capture.game_guard_releases,
                 capture.send_failures,
                 capture.unmapped_keys
             ),
