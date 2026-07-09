@@ -249,10 +249,13 @@ mod capture {
         Foundation::{LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SetCursorPos, SetWindowsHookExW,
-            ShowCursor, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            CallNextHookEx, CreateCursor, DestroyCursor, DispatchMessageW, GetMessageW,
+            GetSystemMetrics, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG,
+            MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO,
+            OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP,
+            OCR_WAIT, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
+            SystemParametersInfoW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
             WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
@@ -596,6 +599,7 @@ mod capture {
                 return;
             }
             unsafe { while ShowCursor(0) >= 0 {} }
+            hide_system_cursors();
             self.cursor_hidden = true;
         }
 
@@ -609,6 +613,7 @@ mod capture {
             if !self.cursor_hidden {
                 return;
             }
+            restore_system_cursors();
             unsafe { while ShowCursor(1) < 0 {} }
             self.cursor_hidden = false;
         }
@@ -784,6 +789,63 @@ mod capture {
             XBUTTON2 => Some(MouseButton::Forward),
             _ => None,
         }
+    }
+
+    fn hide_system_cursors() {
+        const CURSOR_IDS: &[u32] = &[
+            OCR_NORMAL,
+            OCR_IBEAM,
+            OCR_WAIT,
+            OCR_CROSS,
+            OCR_UP,
+            OCR_SIZEALL,
+            OCR_SIZENESW,
+            OCR_SIZENS,
+            OCR_SIZENWSE,
+            OCR_SIZEWE,
+            OCR_NO,
+            OCR_HAND,
+            OCR_APPSTARTING,
+            OCR_HELP,
+        ];
+
+        for cursor_id in CURSOR_IDS {
+            let Some(cursor) = create_blank_cursor() else {
+                tracing::warn!("failed to create blank cursor for remote capture");
+                return;
+            };
+            if unsafe { SetSystemCursor(cursor, *cursor_id) } == 0 {
+                unsafe {
+                    DestroyCursor(cursor);
+                }
+                tracing::warn!(cursor_id, "failed to replace system cursor");
+                restore_system_cursors();
+                return;
+            }
+        }
+    }
+
+    fn restore_system_cursors() {
+        unsafe {
+            SystemParametersInfoW(SPI_SETCURSORS, 0, null_mut(), 0);
+        }
+    }
+
+    fn create_blank_cursor() -> Option<*mut std::ffi::c_void> {
+        let and_plane = [0xff_u8; 128];
+        let xor_plane = [0_u8; 128];
+        let cursor = unsafe {
+            CreateCursor(
+                null_mut(),
+                0,
+                0,
+                32,
+                32,
+                and_plane.as_ptr().cast(),
+                xor_plane.as_ptr().cast(),
+            )
+        };
+        (!cursor.is_null()).then_some(cursor)
     }
 }
 
