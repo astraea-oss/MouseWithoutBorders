@@ -308,11 +308,11 @@ mod capture {
     const VK_LMENU: u32 = 0xa4;
     const VK_RMENU: u32 = 0xa5;
     const VK_PAUSE: u32 = 0x13;
+    const VK_ESCAPE: u32 = 0x1b;
     const XBUTTON1: u16 = 0x0001;
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
     const REMOTE_ENTRY_PADDING: f64 = 32.0;
-    const RETURN_EDGE_RELEASE_PUSH: f64 = 420.0;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
@@ -340,8 +340,6 @@ mod capture {
             active: false,
             anchor: POINT { x: 0, y: 0 },
             remote_cursor: Point { x: 0.0, y: 0.0 },
-            return_edge_latched: false,
-            return_edge_push: 0.0,
             ctrl_down: false,
             alt_down: false,
             cursor_hidden: false,
@@ -532,7 +530,7 @@ mod capture {
             };
         }
 
-        if down && keyboard.vkCode == VK_PAUSE && state.ctrl_down && state.alt_down {
+        if down && state.ctrl_down && state.alt_down && is_release_hotkey(keyboard.vkCode) {
             state.release_to_local(ReleaseReason::Hotkey);
             return 1;
         }
@@ -566,8 +564,6 @@ mod capture {
         active: bool,
         anchor: POINT,
         remote_cursor: Point,
-        return_edge_latched: bool,
-        return_edge_push: f64,
         ctrl_down: bool,
         alt_down: bool,
         cursor_hidden: bool,
@@ -589,8 +585,6 @@ mod capture {
             CAPTURE_STATS.enter_events.fetch_add(1, Ordering::Relaxed);
             self.anchor = self.local_bounds.anchor_for(self.config.edge, point);
             self.remote_cursor = self.remote_start(point);
-            self.return_edge_latched = false;
-            self.return_edge_push = 0.0;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
                 normalized_y: self.normalized_perpendicular(point),
@@ -615,9 +609,7 @@ mod capture {
 
             self.remote_cursor =
                 apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
-            let at_return_edge = self.exits_remote();
-            if at_return_edge && !self.return_edge_latched {
-                self.return_edge_latched = true;
+            if self.exits_remote() {
                 CAPTURE_STATS
                     .return_edge_hits
                     .fetch_add(1, Ordering::Relaxed);
@@ -625,25 +617,10 @@ mod capture {
                     edge = ?self.config.edge,
                     remote_x = self.remote_cursor.x,
                     remote_y = self.remote_cursor.y,
-                    "remote cursor reached return edge; staying in remote control"
+                    "remote cursor reached return edge; releasing to local"
                 );
-            }
-            if at_return_edge {
-                self.return_edge_push += self.return_edge_push_delta(dx, dy);
-                if self.return_edge_push >= RETURN_EDGE_RELEASE_PUSH {
-                    tracing::info!(
-                        edge = ?self.config.edge,
-                        remote_x = self.remote_cursor.x,
-                        remote_y = self.remote_cursor.y,
-                        return_edge_push = self.return_edge_push,
-                        "remote cursor pushed through return edge; releasing to local"
-                    );
-                    self.release_to_local(ReleaseReason::UserRequest);
-                    return;
-                }
-            } else {
-                self.return_edge_latched = false;
-                self.return_edge_push = 0.0;
+                self.release_to_local(ReleaseReason::UserRequest);
+                return;
             }
 
             self.send_input(InputEvent::PointerMotion { dx, dy });
@@ -730,15 +707,6 @@ mod capture {
                 Edge::Right => self.remote_cursor.x <= 0.0,
                 Edge::Top => self.remote_cursor.y >= f64::from(remote.height.saturating_sub(1)),
                 Edge::Bottom => self.remote_cursor.y <= 0.0,
-            }
-        }
-
-        fn return_edge_push_delta(&self, dx: f64, dy: f64) -> f64 {
-            match self.config.edge {
-                Edge::Left => dx.max(0.0),
-                Edge::Right => (-dx).max(0.0),
-                Edge::Top => dy.max(0.0),
-                Edge::Bottom => (-dy).max(0.0),
             }
         }
 
@@ -938,6 +906,10 @@ mod capture {
             XBUTTON2 => Some(MouseButton::Forward),
             _ => None,
         }
+    }
+
+    fn is_release_hotkey(vk_code: u32) -> bool {
+        vk_code == VK_PAUSE || vk_code == VK_ESCAPE
     }
 
     fn hide_system_cursors() {
