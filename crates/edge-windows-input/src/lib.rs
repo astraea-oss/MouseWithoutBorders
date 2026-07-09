@@ -49,6 +49,7 @@ pub struct CaptureStatsSnapshot {
     pub control_events: u64,
     pub enter_events: u64,
     pub release_events: u64,
+    pub return_edge_hits: u64,
     pub send_failures: u64,
     pub unmapped_keys: u64,
 }
@@ -311,6 +312,7 @@ mod capture {
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
     const REMOTE_ENTRY_PADDING: f64 = 32.0;
+    const AUTO_RELEASE_ON_REMOTE_EDGE: bool = false;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
@@ -338,6 +340,7 @@ mod capture {
             active: false,
             anchor: POINT { x: 0, y: 0 },
             remote_cursor: Point { x: 0.0, y: 0.0 },
+            return_edge_latched: false,
             ctrl_down: false,
             alt_down: false,
             cursor_hidden: false,
@@ -562,6 +565,7 @@ mod capture {
         active: bool,
         anchor: POINT,
         remote_cursor: Point,
+        return_edge_latched: bool,
         ctrl_down: bool,
         alt_down: bool,
         cursor_hidden: bool,
@@ -583,6 +587,7 @@ mod capture {
             CAPTURE_STATS.enter_events.fetch_add(1, Ordering::Relaxed);
             self.anchor = self.local_bounds.anchor_for(self.config.edge, point);
             self.remote_cursor = self.remote_start(point);
+            self.return_edge_latched = false;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
                 normalized_y: self.normalized_perpendicular(point),
@@ -607,9 +612,24 @@ mod capture {
 
             self.remote_cursor =
                 apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
-            if self.exits_remote() {
+            let at_return_edge = self.exits_remote();
+            if AUTO_RELEASE_ON_REMOTE_EDGE && at_return_edge {
                 self.release_to_local(ReleaseReason::UserRequest);
                 return;
+            }
+            if at_return_edge && !self.return_edge_latched {
+                self.return_edge_latched = true;
+                CAPTURE_STATS
+                    .return_edge_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    edge = ?self.config.edge,
+                    remote_x = self.remote_cursor.x,
+                    remote_y = self.remote_cursor.y,
+                    "remote cursor reached return edge; staying in remote control"
+                );
+            } else if !at_return_edge {
+                self.return_edge_latched = false;
             }
 
             self.send_input(InputEvent::PointerMotion { dx, dy });
@@ -744,6 +764,7 @@ mod capture {
         control_events: AtomicU64,
         enter_events: AtomicU64,
         release_events: AtomicU64,
+        return_edge_hits: AtomicU64,
         send_failures: AtomicU64,
         unmapped_keys: AtomicU64,
     }
@@ -758,6 +779,7 @@ mod capture {
                 control_events: AtomicU64::new(0),
                 enter_events: AtomicU64::new(0),
                 release_events: AtomicU64::new(0),
+                return_edge_hits: AtomicU64::new(0),
                 send_failures: AtomicU64::new(0),
                 unmapped_keys: AtomicU64::new(0),
             }
@@ -772,6 +794,7 @@ mod capture {
                 control_events: self.control_events.load(Ordering::Relaxed),
                 enter_events: self.enter_events.load(Ordering::Relaxed),
                 release_events: self.release_events.load(Ordering::Relaxed),
+                return_edge_hits: self.return_edge_hits.load(Ordering::Relaxed),
                 send_failures: self.send_failures.load(Ordering::Relaxed),
                 unmapped_keys: self.unmapped_keys.load(Ordering::Relaxed),
             }
