@@ -312,7 +312,7 @@ mod capture {
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
     const REMOTE_ENTRY_PADDING: f64 = 32.0;
-    const AUTO_RELEASE_ON_REMOTE_EDGE: bool = false;
+    const RETURN_EDGE_RELEASE_PUSH: f64 = 420.0;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
@@ -341,6 +341,7 @@ mod capture {
             anchor: POINT { x: 0, y: 0 },
             remote_cursor: Point { x: 0.0, y: 0.0 },
             return_edge_latched: false,
+            return_edge_push: 0.0,
             ctrl_down: false,
             alt_down: false,
             cursor_hidden: false,
@@ -566,6 +567,7 @@ mod capture {
         anchor: POINT,
         remote_cursor: Point,
         return_edge_latched: bool,
+        return_edge_push: f64,
         ctrl_down: bool,
         alt_down: bool,
         cursor_hidden: bool,
@@ -588,6 +590,7 @@ mod capture {
             self.anchor = self.local_bounds.anchor_for(self.config.edge, point);
             self.remote_cursor = self.remote_start(point);
             self.return_edge_latched = false;
+            self.return_edge_push = 0.0;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
                 normalized_y: self.normalized_perpendicular(point),
@@ -613,10 +616,6 @@ mod capture {
             self.remote_cursor =
                 apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
             let at_return_edge = self.exits_remote();
-            if AUTO_RELEASE_ON_REMOTE_EDGE && at_return_edge {
-                self.release_to_local(ReleaseReason::UserRequest);
-                return;
-            }
             if at_return_edge && !self.return_edge_latched {
                 self.return_edge_latched = true;
                 CAPTURE_STATS
@@ -628,8 +627,23 @@ mod capture {
                     remote_y = self.remote_cursor.y,
                     "remote cursor reached return edge; staying in remote control"
                 );
-            } else if !at_return_edge {
+            }
+            if at_return_edge {
+                self.return_edge_push += self.return_edge_push_delta(dx, dy);
+                if self.return_edge_push >= RETURN_EDGE_RELEASE_PUSH {
+                    tracing::info!(
+                        edge = ?self.config.edge,
+                        remote_x = self.remote_cursor.x,
+                        remote_y = self.remote_cursor.y,
+                        return_edge_push = self.return_edge_push,
+                        "remote cursor pushed through return edge; releasing to local"
+                    );
+                    self.release_to_local(ReleaseReason::UserRequest);
+                    return;
+                }
+            } else {
                 self.return_edge_latched = false;
+                self.return_edge_push = 0.0;
             }
 
             self.send_input(InputEvent::PointerMotion { dx, dy });
@@ -716,6 +730,15 @@ mod capture {
                 Edge::Right => self.remote_cursor.x <= 0.0,
                 Edge::Top => self.remote_cursor.y >= f64::from(remote.height.saturating_sub(1)),
                 Edge::Bottom => self.remote_cursor.y <= 0.0,
+            }
+        }
+
+        fn return_edge_push_delta(&self, dx: f64, dy: f64) -> f64 {
+            match self.config.edge {
+                Edge::Left => dx.max(0.0),
+                Edge::Right => (-dx).max(0.0),
+                Edge::Top => dy.max(0.0),
+                Edge::Bottom => (-dy).max(0.0),
             }
         }
 
