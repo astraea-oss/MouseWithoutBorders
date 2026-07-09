@@ -55,6 +55,7 @@ pub struct CaptureStatsSnapshot {
     pub game_guard_releases: u64,
     pub suspend_toggles: u64,
     pub suspend_blocks: u64,
+    pub suspend_auto_resumes: u64,
     pub send_failures: u64,
     pub unmapped_keys: u64,
 }
@@ -365,6 +366,7 @@ mod capture {
             ctrl_down: false,
             alt_down: false,
             capture_suspended: false,
+            suspend_foreground: None,
             cursor_hidden: false,
             game_guard: GameGuard::default(),
         };
@@ -438,6 +440,7 @@ mod capture {
         let mut state = state.lock().expect("capture state poisoned");
         let message = wparam as u32;
 
+        state.refresh_capture_suspension();
         if state.capture_suspended {
             if state.active {
                 tracing::info!("capture is suspended; releasing remote control");
@@ -582,6 +585,7 @@ mod capture {
         let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let up = message == WM_KEYUP || message == WM_SYSKEYUP;
 
+        state.refresh_capture_suspension();
         if down || up {
             state.update_modifier(keyboard.vkCode, down);
         }
@@ -639,6 +643,7 @@ mod capture {
         ctrl_down: bool,
         alt_down: bool,
         capture_suspended: bool,
+        suspend_foreground: Option<isize>,
         cursor_hidden: bool,
         game_guard: GameGuard,
     }
@@ -659,6 +664,10 @@ mod capture {
 
         fn toggle_capture_suspended(&mut self) {
             self.capture_suspended = !self.capture_suspended;
+            self.suspend_foreground = self
+                .capture_suspended
+                .then(foreground_window_id)
+                .filter(|id| *id != 0);
             CAPTURE_STATS
                 .suspended
                 .store(self.capture_suspended, Ordering::Relaxed);
@@ -666,12 +675,40 @@ mod capture {
                 .suspend_toggles
                 .fetch_add(1, Ordering::Relaxed);
             if self.capture_suspended {
-                tracing::info!("Windows edge capture suspended");
+                tracing::info!(
+                    foreground = ?self.suspend_foreground,
+                    "Windows edge capture suspended"
+                );
                 self.release_to_local(ReleaseReason::UserRequest);
                 self.show_source_cursor();
             } else {
                 tracing::info!("Windows edge capture resumed");
             }
+        }
+
+        fn refresh_capture_suspension(&mut self) {
+            if !self.capture_suspended {
+                return;
+            }
+            let Some(suspended_foreground) = self.suspend_foreground else {
+                return;
+            };
+            let current_foreground = foreground_window_id();
+            if current_foreground == 0 || current_foreground == suspended_foreground {
+                return;
+            }
+
+            self.capture_suspended = false;
+            self.suspend_foreground = None;
+            CAPTURE_STATS.suspended.store(false, Ordering::Relaxed);
+            CAPTURE_STATS
+                .suspend_auto_resumes
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                suspended_foreground,
+                current_foreground,
+                "Windows edge capture auto-resumed after foreground changed"
+            );
         }
 
         fn enter_remote(&mut self, point: POINT) {
@@ -833,6 +870,7 @@ mod capture {
         game_guard_releases: AtomicU64,
         suspend_toggles: AtomicU64,
         suspend_blocks: AtomicU64,
+        suspend_auto_resumes: AtomicU64,
         send_failures: AtomicU64,
         unmapped_keys: AtomicU64,
     }
@@ -853,6 +891,7 @@ mod capture {
                 game_guard_releases: AtomicU64::new(0),
                 suspend_toggles: AtomicU64::new(0),
                 suspend_blocks: AtomicU64::new(0),
+                suspend_auto_resumes: AtomicU64::new(0),
                 send_failures: AtomicU64::new(0),
                 unmapped_keys: AtomicU64::new(0),
             }
@@ -873,6 +912,7 @@ mod capture {
                 game_guard_releases: self.game_guard_releases.load(Ordering::Relaxed),
                 suspend_toggles: self.suspend_toggles.load(Ordering::Relaxed),
                 suspend_blocks: self.suspend_blocks.load(Ordering::Relaxed),
+                suspend_auto_resumes: self.suspend_auto_resumes.load(Ordering::Relaxed),
                 send_failures: self.send_failures.load(Ordering::Relaxed),
                 unmapped_keys: self.unmapped_keys.load(Ordering::Relaxed),
             }
@@ -1038,6 +1078,10 @@ mod capture {
 
             rect_covers(&window, &info.rcMonitor, FULLSCREEN_TOLERANCE_PX)
         }
+    }
+
+    fn foreground_window_id() -> isize {
+        unsafe { GetForegroundWindow() as isize }
     }
 
     fn cursor_is_confined() -> bool {
