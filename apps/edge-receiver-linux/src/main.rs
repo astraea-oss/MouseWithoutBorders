@@ -227,10 +227,19 @@ async fn run_receiver(
     loop {
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
-                if matches!(command, Some(TrayCommand::Quit)) {
-                    tracing::info!("quit requested from tray");
-                    append_portable_log(&log_path, "quit requested from tray");
-                    break;
+                match command {
+                    TrayCommandEvent::Command(TrayCommand::Quit) => {
+                        tracing::info!("quit requested from tray");
+                        append_portable_log(&log_path, "quit requested from tray");
+                        break;
+                    }
+                    TrayCommandEvent::Closed => {
+                        tracing::warn!("tray command channel closed; continuing without tray commands");
+                        append_portable_log(
+                            &log_path,
+                            "tray command channel closed; continuing without tray commands",
+                        );
+                    }
                 }
                 continue;
             }
@@ -411,8 +420,17 @@ async fn handle_controller(
                 stats.log(log_path, "receiver");
             }
             command = recv_tray_command(tray_commands) => {
-                if matches!(command, Some(TrayCommand::Quit)) {
-                    return Ok(ControllerSessionExit::QuitRequested);
+                match command {
+                    TrayCommandEvent::Command(TrayCommand::Quit) => {
+                        return Ok(ControllerSessionExit::QuitRequested);
+                    }
+                    TrayCommandEvent::Closed => {
+                        tracing::warn!("tray command channel closed; continuing session without tray commands");
+                        append_portable_log(
+                            log_path,
+                            "tray command channel closed; continuing session without tray commands",
+                        );
+                    }
                 }
             }
             frame = frame_rx.recv() => {
@@ -623,12 +641,24 @@ fn spawn_controller_reader(mut reader: NoiseReader) -> mpsc::UnboundedReceiver<R
     receiver
 }
 
+enum TrayCommandEvent {
+    Command(TrayCommand),
+    Closed,
+}
+
 async fn recv_tray_command(
     receiver: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
-) -> Option<TrayCommand> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => future::pending().await,
+) -> TrayCommandEvent {
+    let Some(command_rx) = receiver.as_mut() else {
+        return future::pending().await;
+    };
+
+    match command_rx.recv().await {
+        Some(command) => TrayCommandEvent::Command(command),
+        None => {
+            *receiver = None;
+            TrayCommandEvent::Closed
+        }
     }
 }
 
