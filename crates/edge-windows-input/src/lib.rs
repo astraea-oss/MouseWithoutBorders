@@ -40,6 +40,19 @@ pub enum CapturedInput {
     Control(ControlEvent),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureStatsSnapshot {
+    pub active: bool,
+    pub mouse_hook_events: u64,
+    pub keyboard_hook_events: u64,
+    pub input_events: u64,
+    pub control_events: u64,
+    pub enter_events: u64,
+    pub release_events: u64,
+    pub send_failures: u64,
+    pub unmapped_keys: u64,
+}
+
 pub fn map_key(scan_code: u16, extended: bool) -> Result<u16> {
     windows_scancode_to_evdev(WindowsScanCode {
         scan_code,
@@ -89,6 +102,16 @@ pub fn force_release_to_local() {
 
 #[cfg(not(windows))]
 pub fn force_release_to_local() {}
+
+#[cfg(windows)]
+pub fn capture_stats() -> CaptureStatsSnapshot {
+    capture::stats_snapshot()
+}
+
+#[cfg(not(windows))]
+pub fn capture_stats() -> CaptureStatsSnapshot {
+    CaptureStatsSnapshot::default()
+}
 
 #[cfg(windows)]
 pub fn read_clipboard_text(max_bytes: usize) -> Result<Option<String>> {
@@ -240,7 +263,11 @@ mod clipboard {
 mod capture {
     use std::{
         ptr::null_mut,
-        sync::{Mutex, OnceLock, mpsc},
+        sync::{
+            Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
+        },
         thread,
     };
 
@@ -262,7 +289,8 @@ mod capture {
     };
 
     use crate::{
-        CaptureConfig, CapturedInput, ControlEvent, InputEvent, Result, WindowsInputError, map_key,
+        CaptureConfig, CaptureStatsSnapshot, CapturedInput, ControlEvent, InputEvent, Result,
+        WindowsInputError, map_key,
     };
     use edge_geometry::{Point, apply_remote_motion, clamp};
     use edge_protocol::{MouseButton, ReleaseReason};
@@ -282,8 +310,10 @@ mod capture {
     const XBUTTON1: u16 = 0x0001;
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
+    const REMOTE_ENTRY_PADDING: f64 = 32.0;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
+    static CAPTURE_STATS: CaptureStats = CaptureStats::new();
 
     pub fn force_release_to_local() {
         let Some(state) = STATE.get() else {
@@ -294,8 +324,13 @@ mod capture {
         state.show_source_cursor();
     }
 
+    pub fn stats_snapshot() -> CaptureStatsSnapshot {
+        CAPTURE_STATS.snapshot()
+    }
+
     pub fn start(config: CaptureConfig) -> Result<mpsc::Receiver<CapturedInput>> {
         let (sender, receiver) = mpsc::channel();
+        CAPTURE_STATS.active.store(false, Ordering::Relaxed);
         let state = CaptureState {
             sender,
             config,
@@ -361,6 +396,9 @@ mod capture {
         }
 
         let mouse = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        CAPTURE_STATS
+            .mouse_hook_events
+            .fetch_add(1, Ordering::Relaxed);
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -457,6 +495,9 @@ mod capture {
         }
 
         let keyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        CAPTURE_STATS
+            .keyboard_hook_events
+            .fetch_add(1, Ordering::Relaxed);
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -499,6 +540,7 @@ mod capture {
             match map_key(scan_code, extended) {
                 Ok(evdev_code) => state.send_input(InputEvent::Key { evdev_code, down }),
                 Err(err) => {
+                    CAPTURE_STATS.unmapped_keys.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         %err,
                         scan_code,
@@ -537,6 +579,8 @@ mod capture {
 
         fn enter_remote(&mut self, point: POINT) {
             self.active = true;
+            CAPTURE_STATS.active.store(true, Ordering::Relaxed);
+            CAPTURE_STATS.enter_events.fetch_add(1, Ordering::Relaxed);
             self.anchor = self.local_bounds.anchor_for(self.config.edge, point);
             self.remote_cursor = self.remote_start(point);
             self.send_control(ControlEvent::EnterRemote {
@@ -576,6 +620,8 @@ mod capture {
                 return;
             }
             self.active = false;
+            CAPTURE_STATS.active.store(false, Ordering::Relaxed);
+            CAPTURE_STATS.release_events.fetch_add(1, Ordering::Relaxed);
             self.send_input(InputEvent::AllKeysUp);
             self.send_control(ControlEvent::ReleaseToLocal { reason });
             self.show_source_cursor();
@@ -621,22 +667,24 @@ mod capture {
         fn remote_start(&self, point: POINT) -> Point {
             let normalized = f64::from(self.normalized_perpendicular(point));
             let remote = self.config.remote_size;
+            let x_padding = remote_entry_padding(remote.width);
+            let y_padding = remote_entry_padding(remote.height);
             match self.config.edge {
                 Edge::Left => Point {
-                    x: f64::from(remote.width.saturating_sub(2)),
+                    x: f64::from(remote.width.saturating_sub(1)) - x_padding,
                     y: normalized * f64::from(remote.height.saturating_sub(1)),
                 },
                 Edge::Right => Point {
-                    x: 1.0,
+                    x: x_padding,
                     y: normalized * f64::from(remote.height.saturating_sub(1)),
                 },
                 Edge::Top => Point {
                     x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: f64::from(remote.height.saturating_sub(2)),
+                    y: f64::from(remote.height.saturating_sub(1)) - y_padding,
                 },
                 Edge::Bottom => Point {
                     x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: 1.0,
+                    y: y_padding,
                 },
             }
         }
@@ -672,11 +720,61 @@ mod capture {
         }
 
         fn send_input(&self, event: InputEvent) {
-            let _ = self.sender.send(CapturedInput::Input(event));
+            if self.sender.send(CapturedInput::Input(event)).is_ok() {
+                CAPTURE_STATS.input_events.fetch_add(1, Ordering::Relaxed);
+            } else {
+                CAPTURE_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         fn send_control(&self, event: ControlEvent) {
-            let _ = self.sender.send(CapturedInput::Control(event));
+            if self.sender.send(CapturedInput::Control(event)).is_ok() {
+                CAPTURE_STATS.control_events.fetch_add(1, Ordering::Relaxed);
+            } else {
+                CAPTURE_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    struct CaptureStats {
+        active: AtomicBool,
+        mouse_hook_events: AtomicU64,
+        keyboard_hook_events: AtomicU64,
+        input_events: AtomicU64,
+        control_events: AtomicU64,
+        enter_events: AtomicU64,
+        release_events: AtomicU64,
+        send_failures: AtomicU64,
+        unmapped_keys: AtomicU64,
+    }
+
+    impl CaptureStats {
+        const fn new() -> Self {
+            Self {
+                active: AtomicBool::new(false),
+                mouse_hook_events: AtomicU64::new(0),
+                keyboard_hook_events: AtomicU64::new(0),
+                input_events: AtomicU64::new(0),
+                control_events: AtomicU64::new(0),
+                enter_events: AtomicU64::new(0),
+                release_events: AtomicU64::new(0),
+                send_failures: AtomicU64::new(0),
+                unmapped_keys: AtomicU64::new(0),
+            }
+        }
+
+        fn snapshot(&self) -> CaptureStatsSnapshot {
+            CaptureStatsSnapshot {
+                active: self.active.load(Ordering::Relaxed),
+                mouse_hook_events: self.mouse_hook_events.load(Ordering::Relaxed),
+                keyboard_hook_events: self.keyboard_hook_events.load(Ordering::Relaxed),
+                input_events: self.input_events.load(Ordering::Relaxed),
+                control_events: self.control_events.load(Ordering::Relaxed),
+                enter_events: self.enter_events.load(Ordering::Relaxed),
+                release_events: self.release_events.load(Ordering::Relaxed),
+                send_failures: self.send_failures.load(Ordering::Relaxed),
+                unmapped_keys: self.unmapped_keys.load(Ordering::Relaxed),
+            }
         }
     }
 
@@ -777,6 +875,11 @@ mod capture {
         }
         let max = f64::from(extent - 1);
         (clamp(pos, 0.0, max) / max) as f32
+    }
+
+    fn remote_entry_padding(extent: u32) -> f64 {
+        let max = f64::from(extent.saturating_sub(1));
+        clamp(REMOTE_ENTRY_PADDING, 1.0, max)
     }
 
     fn high_word_signed(value: u32) -> i16 {

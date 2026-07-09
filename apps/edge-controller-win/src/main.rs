@@ -471,17 +471,27 @@ impl ControllerInputStats {
     }
 
     fn log(&self, path: &Path, side: &str) {
+        let capture = edge_windows_input::capture_stats();
         append_portable_log(
             path,
             format!(
-                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={}",
+                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} hook_mouse={} hook_keyboard={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_send_failures={} capture_unmapped_keys={}",
                 self.frames,
                 self.motion,
                 self.buttons,
                 self.wheel,
                 self.keys,
                 self.clipboard,
-                self.control
+                self.control,
+                capture.active,
+                capture.mouse_hook_events,
+                capture.keyboard_hook_events,
+                capture.input_events,
+                capture.control_events,
+                capture.enter_events,
+                capture.release_events,
+                capture.send_failures,
+                capture.unmapped_keys
             ),
         );
     }
