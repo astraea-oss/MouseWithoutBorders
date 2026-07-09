@@ -742,6 +742,36 @@ pub async fn hyprland_screen_info(primary: &str) -> Result<ScreenInfo> {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct HyprCursorPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub async fn hyprland_cursor_position() -> Result<HyprCursorPosition> {
+    let output = Command::new("hyprctl").arg("cursorpos").output().await?;
+    if !output.status.success() {
+        return Err(LinuxInputError::CommandFailed {
+            program: "hyprctl cursorpos".to_string(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_hypr_cursor_position(text.trim()).ok_or_else(|| LinuxInputError::CommandFailed {
+        program: "hyprctl cursorpos".to_string(),
+        message: format!("unexpected output: {text:?}"),
+    })
+}
+
+fn parse_hypr_cursor_position(text: &str) -> Option<HyprCursorPosition> {
+    let (x, y) = text.split_once(',')?;
+    Some(HyprCursorPosition {
+        x: x.trim().parse().ok()?,
+        y: y.trim().parse().ok()?,
+    })
+}
+
 pub async fn read_clipboard_text(config: &ClipboardConfig) -> Result<Option<String>> {
     if !config.enabled {
         return Ok(None);

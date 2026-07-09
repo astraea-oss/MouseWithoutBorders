@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
-use edge_protocol::{ControlEvent, Edge, InputEvent};
+use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WindowsInputError {
@@ -98,11 +98,19 @@ pub fn run_tray(_status: &str) -> Result<()> {
 
 #[cfg(windows)]
 pub fn force_release_to_local() {
-    capture::force_release_to_local()
+    release_to_local(ReleaseReason::PeerDisconnected)
 }
 
 #[cfg(not(windows))]
 pub fn force_release_to_local() {}
+
+#[cfg(windows)]
+pub fn release_to_local(reason: ReleaseReason) {
+    capture::release_to_local(reason)
+}
+
+#[cfg(not(windows))]
+pub fn release_to_local(_reason: ReleaseReason) {}
 
 #[cfg(windows)]
 pub fn capture_stats() -> CaptureStatsSnapshot {
@@ -317,12 +325,12 @@ mod capture {
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
 
-    pub fn force_release_to_local() {
+    pub fn release_to_local(reason: ReleaseReason) {
         let Some(state) = STATE.get() else {
             return;
         };
         let mut state = state.lock().expect("capture state poisoned");
-        state.release_to_local(ReleaseReason::PeerDisconnected);
+        state.release_to_local(reason);
         state.show_source_cursor();
     }
 
@@ -609,19 +617,6 @@ mod capture {
 
             self.remote_cursor =
                 apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
-            if self.exits_remote() {
-                CAPTURE_STATS
-                    .return_edge_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    edge = ?self.config.edge,
-                    remote_x = self.remote_cursor.x,
-                    remote_y = self.remote_cursor.y,
-                    "remote cursor reached return edge; releasing to local"
-                );
-                self.release_to_local(ReleaseReason::UserRequest);
-                return;
-            }
 
             self.send_input(InputEvent::PointerMotion { dx, dy });
         }
@@ -697,16 +692,6 @@ mod capture {
                     x: normalized * f64::from(remote.width.saturating_sub(1)),
                     y: y_padding,
                 },
-            }
-        }
-
-        fn exits_remote(&self) -> bool {
-            let remote = self.config.remote_size;
-            match self.config.edge {
-                Edge::Left => self.remote_cursor.x >= f64::from(remote.width.saturating_sub(1)),
-                Edge::Right => self.remote_cursor.x <= 0.0,
-                Edge::Top => self.remote_cursor.y >= f64::from(remote.height.saturating_sub(1)),
-                Edge::Bottom => self.remote_cursor.y <= 0.0,
             }
         }
 

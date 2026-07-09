@@ -3,7 +3,7 @@ use std::{
     future,
     io::Write,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -14,12 +14,12 @@ use edge_crypto::{
     accept_noise_session,
 };
 use edge_linux_input::{
-    HyprlandVirtualInputBackend, LibeiBackend, hyprland_screen_info, read_clipboard_text,
-    write_clipboard_text,
+    HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend, hyprland_cursor_position,
+    hyprland_screen_info, read_clipboard_text, write_clipboard_text,
 };
 use edge_protocol::{
-    ClipboardEvent, Frame, Heartbeat, Hello, InputEvent, PROTOCOL_VERSION, RemoteError,
-    decode_frame, encode_frame,
+    ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo,
+    PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -28,6 +28,8 @@ use tokio::{
 };
 
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const RETURN_EDGE_MARGIN: i32 = 1;
 
 mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
@@ -311,12 +313,20 @@ async fn run_receiver(
         )
         .await?;
 
-        if let Some(monitor) = config.monitor.as_deref() {
+        let screen_info = if let Some(monitor) = config.monitor.as_deref() {
             match hyprland_screen_info(monitor).await {
-                Ok(info) => write_secure_frame(&mut session, &Frame::ScreenInfo(info)).await?,
-                Err(err) => tracing::warn!(%err, "failed to query Hyprland monitor geometry"),
+                Ok(info) => {
+                    write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
+                    Some(info)
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "failed to query Hyprland monitor geometry");
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
 
         match handle_controller(
             session,
@@ -325,6 +335,7 @@ async fn run_receiver(
             tray.as_ref(),
             &mut tray_commands,
             &log_path,
+            screen_info,
         )
         .await
         {
@@ -379,6 +390,7 @@ async fn handle_controller(
     tray: Option<&ReceiverTrayHandle>,
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
     log_path: &Path,
+    screen_info: Option<ScreenInfo>,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
@@ -386,6 +398,7 @@ async fn handle_controller(
     let mut stats = ReceiverInputStats::default();
     let (reader, mut writer) = session.split();
     let mut frame_rx = spawn_controller_reader(reader);
+    let mut return_watcher = RemoteReturnWatcher::new(screen_info);
 
     loop {
         tokio::select! {
@@ -414,7 +427,24 @@ async fn handle_controller(
                     }
                     Frame::Input(event) => {
                         stats.record_input(&event);
+                        let is_motion = matches!(event, InputEvent::PointerMotion { .. });
                         backend.inject(event).await?;
+                        if is_motion {
+                            match return_watcher.release_if_at_edge().await {
+                                Ok(Some(control)) => {
+                                    stats.return_releases = stats.return_releases.saturating_add(1);
+                                    tracing::info!(?control, "real cursor reached return edge");
+                                    append_portable_log(
+                                        log_path,
+                                        format!("real cursor reached return edge: {control:?}"),
+                                    );
+                                    backend.all_keys_up().await.ok();
+                                    write_secure_frame_writer(&mut writer, &Frame::Control(control)).await?;
+                                }
+                                Ok(None) => {}
+                                Err(err) => tracing::warn!(%err, "failed to check Hyprland cursor position"),
+                            }
+                        }
                         if let Some(tray) = tray {
                             tray.input_event().await;
                         }
@@ -441,6 +471,7 @@ async fn handle_controller(
                     Frame::Heartbeat(_) => {}
                     Frame::Control(control) => {
                         stats.control = stats.control.saturating_add(1);
+                        return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
                     }
                     Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
@@ -459,6 +490,7 @@ struct ReceiverInputStats {
     all_keys_up: u64,
     clipboard: u64,
     control: u64,
+    return_releases: u64,
     heartbeats: u64,
 }
 
@@ -487,7 +519,7 @@ impl ReceiverInputStats {
         append_portable_log(
             path,
             format!(
-                "{side} status motion={} buttons={} wheel={} keys={} all_keys_up={} clipboard={} control={} heartbeats={}",
+                "{side} status motion={} buttons={} wheel={} keys={} all_keys_up={} clipboard={} control={} return_releases={} heartbeats={}",
                 self.motion,
                 self.buttons,
                 self.wheel,
@@ -495,9 +527,83 @@ impl ReceiverInputStats {
                 self.all_keys_up,
                 self.clipboard,
                 self.control,
+                self.return_releases,
                 self.heartbeats
             ),
         );
+    }
+}
+
+struct RemoteReturnWatcher {
+    output: Option<OutputInfo>,
+    edge: Option<Edge>,
+    last_poll: Instant,
+}
+
+impl RemoteReturnWatcher {
+    fn new(screen_info: Option<ScreenInfo>) -> Self {
+        let output = screen_info.and_then(|info| {
+            info.outputs
+                .iter()
+                .find(|output| output.name == info.primary_output)
+                .cloned()
+                .or_else(|| info.outputs.first().cloned())
+        });
+
+        Self {
+            output,
+            edge: None,
+            last_poll: Instant::now() - RETURN_EDGE_POLL_INTERVAL,
+        }
+    }
+
+    fn record_control(&mut self, control: &ControlEvent) {
+        match control {
+            ControlEvent::EnterRemote { edge, .. } => {
+                self.edge = Some(*edge);
+                self.last_poll = Instant::now() - RETURN_EDGE_POLL_INTERVAL;
+            }
+            ControlEvent::ReleaseToLocal { .. } | ControlEvent::LeaveRemote { .. } => {
+                self.edge = None;
+            }
+        }
+    }
+
+    async fn release_if_at_edge(&mut self) -> Result<Option<ControlEvent>> {
+        let Some(edge) = self.edge else {
+            return Ok(None);
+        };
+        let Some(output) = &self.output else {
+            return Ok(None);
+        };
+        if self.last_poll.elapsed() < RETURN_EDGE_POLL_INTERVAL {
+            return Ok(None);
+        }
+        self.last_poll = Instant::now();
+
+        let cursor = hyprland_cursor_position().await?;
+        if !real_cursor_at_return_edge(cursor, output, edge) {
+            return Ok(None);
+        }
+
+        self.edge = None;
+        Ok(Some(ControlEvent::ReleaseToLocal {
+            reason: ReleaseReason::UserRequest,
+        }))
+    }
+}
+
+fn real_cursor_at_return_edge(cursor: HyprCursorPosition, output: &OutputInfo, edge: Edge) -> bool {
+    let left = output.x;
+    let top = output.y;
+    let right = output.x + output.width.saturating_sub(1) as i32;
+    let bottom = output.y + output.height.saturating_sub(1) as i32;
+
+    match edge {
+        Edge::Left => cursor.x >= right - RETURN_EDGE_MARGIN,
+        Edge::Right => cursor.x <= left + RETURN_EDGE_MARGIN,
+        Edge::Top => cursor.y >= bottom - RETURN_EDGE_MARGIN,
+        Edge::Bottom => cursor.y <= top + RETURN_EDGE_MARGIN,
     }
 }
 

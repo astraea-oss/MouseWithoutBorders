@@ -23,8 +23,8 @@ use edge_geometry::Size;
 #[cfg(windows)]
 use edge_protocol::Edge;
 use edge_protocol::{
-    ClipboardEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION, ScreenInfo,
-    decode_frame, encode_frame,
+    ClipboardEvent, ControlEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION,
+    ScreenInfo, decode_frame, encode_frame,
 };
 use tokio::{net::TcpStream, sync::mpsc, time};
 
@@ -422,6 +422,12 @@ async fn run_connected_inner(
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
                     Frame::Clipboard(event) => handle_remote_clipboard_event(event, config, &mut writer).await?,
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
+                    Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
+                        tracing::info!(?reason, "receiver requested local release");
+                        append_portable_log(log_path, format!("receiver requested local release: {reason:?}"));
+                        edge_windows_input::release_to_local(reason);
+                    }
+                    Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
                     other => tracing::debug!(?other, "receiver frame"),
                 }
