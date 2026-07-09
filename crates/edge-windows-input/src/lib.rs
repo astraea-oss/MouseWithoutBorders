@@ -301,9 +301,9 @@ mod capture {
             OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW,
             OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, SPI_SETCURSORS, SetCursorPos,
             SetSystemCursor, SetWindowsHookExW, ShowCursor, SystemParametersInfoW,
-            TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     };
@@ -337,6 +337,7 @@ mod capture {
     const FULLSCREEN_TOLERANCE_PX: i32 = 2;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
+    static MOUSE_HOOK: Mutex<isize> = Mutex::new(0);
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
 
     pub fn release_to_local(reason: ReleaseReason) {
@@ -375,6 +376,7 @@ mod capture {
             let mut existing = existing.lock().expect("capture state poisoned");
             existing.show_source_cursor();
             *existing = state;
+            install_mouse_hook_if_needed();
             tracing::info!("Windows input capture hooks reused");
             return Ok(receiver);
         }
@@ -394,10 +396,10 @@ mod capture {
     fn run_hook_thread() {
         unsafe {
             let instance = GetModuleHandleW(null_mut());
-            let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0);
+            let mouse_hook = install_mouse_hook(instance);
             let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0);
 
-            if mouse_hook.is_null() || keyboard_hook.is_null() {
+            if mouse_hook == 0 || keyboard_hook.is_null() {
                 tracing::error!("failed to install low-level Windows input hooks");
                 return;
             }
@@ -408,6 +410,47 @@ mod capture {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+        }
+    }
+
+    unsafe fn install_mouse_hook(instance: *mut std::ffi::c_void) -> isize {
+        let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0) };
+        let hook_id = hook as isize;
+        if hook_id != 0 {
+            *MOUSE_HOOK.lock().expect("mouse hook state poisoned") = hook_id;
+        }
+        hook_id
+    }
+
+    fn install_mouse_hook_if_needed() {
+        let mut hook_id = MOUSE_HOOK.lock().expect("mouse hook state poisoned");
+        if *hook_id != 0 {
+            return;
+        }
+
+        unsafe {
+            let instance = GetModuleHandleW(null_mut());
+            let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0);
+            if hook.is_null() {
+                tracing::warn!("failed to reinstall low-level Windows mouse hook");
+                return;
+            }
+            *hook_id = hook as isize;
+            tracing::info!("Windows mouse hook reinstalled");
+        }
+    }
+
+    fn uninstall_mouse_hook() {
+        let mut mouse_hook = MOUSE_HOOK.lock().expect("mouse hook state poisoned");
+        let hook = std::mem::take(&mut *mouse_hook);
+        if hook == 0 {
+            return;
+        }
+
+        if unsafe { UnhookWindowsHookEx(hook as HHOOK) } == 0 {
+            tracing::warn!("failed to uninstall low-level Windows mouse hook");
+        } else {
+            tracing::info!("Windows mouse hook uninstalled");
         }
     }
 
@@ -681,7 +724,9 @@ mod capture {
                 );
                 self.release_to_local(ReleaseReason::UserRequest);
                 self.show_source_cursor();
+                uninstall_mouse_hook();
             } else {
+                install_mouse_hook_if_needed();
                 tracing::info!("Windows edge capture resumed");
             }
         }
@@ -701,6 +746,7 @@ mod capture {
             self.capture_suspended = false;
             self.suspend_foreground = None;
             CAPTURE_STATS.suspended.store(false, Ordering::Relaxed);
+            install_mouse_hook_if_needed();
             CAPTURE_STATS
                 .suspend_auto_resumes
                 .fetch_add(1, Ordering::Relaxed);
