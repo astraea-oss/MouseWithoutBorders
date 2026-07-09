@@ -44,6 +44,7 @@ pub enum CapturedInput {
 pub struct CaptureStatsSnapshot {
     pub active: bool,
     pub suspended: bool,
+    pub mouse_hook_installed: bool,
     pub mouse_hook_events: u64,
     pub keyboard_hook_events: u64,
     pub input_events: u64,
@@ -452,6 +453,10 @@ mod capture {
         } else {
             tracing::info!("Windows mouse hook uninstalled");
         }
+    }
+
+    fn mouse_hook_installed() -> bool {
+        *MOUSE_HOOK.lock().expect("mouse hook state poisoned") != 0
     }
 
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -947,6 +952,7 @@ mod capture {
             CaptureStatsSnapshot {
                 active: self.active.load(Ordering::Relaxed),
                 suspended: self.suspended.load(Ordering::Relaxed),
+                mouse_hook_installed: mouse_hook_installed(),
                 mouse_hook_events: self.mouse_hook_events.load(Ordering::Relaxed),
                 keyboard_hook_events: self.keyboard_hook_events.load(Ordering::Relaxed),
                 input_events: self.input_events.load(Ordering::Relaxed),
