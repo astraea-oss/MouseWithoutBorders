@@ -162,18 +162,17 @@ impl ksni::Tray for ReceiverTray {
     }
 
     fn icon_name(&self) -> String {
-        if self.last_error.is_some() {
-            "dialog-warning".to_string()
-        } else if self.connected_peer.is_some() {
-            "network-transmit-receive".to_string()
-        } else {
-            "input-mouse".to_string()
-        }
+        "input-mouse".to_string()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        mouse_icons(self.icon_color())
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             icon_name: self.icon_name(),
+            icon_pixmap: self.icon_pixmap(),
             title: "edge-kvm receiver".to_string(),
             description: self.description(),
             ..Default::default()
@@ -227,6 +226,16 @@ impl ksni::Tray for ReceiverTray {
 }
 
 impl ReceiverTray {
+    fn icon_color(&self) -> IconColor {
+        if self.connected_peer.is_some() {
+            IconColor::Connected
+        } else if self.last_error.is_some() || self.state == "Listening" {
+            IconColor::Disconnected
+        } else {
+            IconColor::Connecting
+        }
+    }
+
     fn description(&self) -> String {
         let mut lines = vec![
             format!("Status: {}", self.state),
@@ -244,6 +253,77 @@ impl ReceiverTray {
         }
         lines.join("\n")
     }
+}
+
+#[derive(Clone, Copy)]
+enum IconColor {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+fn mouse_icons(color: IconColor) -> Vec<ksni::Icon> {
+    [22, 32]
+        .into_iter()
+        .map(|size| mouse_icon(size, color))
+        .collect()
+}
+
+fn mouse_icon(size: i32, color: IconColor) -> ksni::Icon {
+    let fill = match color {
+        IconColor::Connecting => [0x9c, 0xa3, 0xaf],
+        IconColor::Connected => [0x22, 0xc5, 0x5e],
+        IconColor::Disconnected => [0xef, 0x44, 0x44],
+    };
+    let outline = [0x11, 0x18, 0x27];
+    let highlight = [0xff, 0xff, 0xff];
+    let mut data = vec![0; (size * size * 4) as usize];
+
+    for y in 0..size {
+        for x in 0..size {
+            let nx = (f64::from(x) + 0.5) / f64::from(size);
+            let ny = (f64::from(y) + 0.5) / f64::from(size);
+            let idx = ((y * size + x) * 4) as usize;
+
+            let body = ellipse(nx, ny, 0.5, 0.56, 0.30, 0.39);
+            let top = ellipse(nx, ny, 0.5, 0.30, 0.24, 0.20);
+            let silhouette = body || top;
+            if !silhouette {
+                continue;
+            }
+
+            let border = !ellipse(nx, ny, 0.5, 0.56, 0.25, 0.34)
+                || (top && !ellipse(nx, ny, 0.5, 0.30, 0.19, 0.15));
+            let split = ny < 0.43 && (nx - 0.5).abs() < 0.018;
+            let wheel = ellipse(nx, ny, 0.5, 0.34, 0.035, 0.075);
+            let upper_highlight = ellipse(nx, ny, 0.41, 0.28, 0.055, 0.035);
+
+            let (alpha, rgb) = if border || split {
+                (0xee, outline)
+            } else if wheel || upper_highlight {
+                (0xd8, highlight)
+            } else {
+                (0xff, fill)
+            };
+
+            data[idx] = alpha;
+            data[idx + 1] = rgb[0];
+            data[idx + 2] = rgb[1];
+            data[idx + 3] = rgb[2];
+        }
+    }
+
+    ksni::Icon {
+        width: size,
+        height: size,
+        data,
+    }
+}
+
+fn ellipse(x: f64, y: f64, cx: f64, cy: f64, rx: f64, ry: f64) -> bool {
+    let dx = (x - cx) / rx;
+    let dy = (y - cy) / ry;
+    dx * dx + dy * dy <= 1.0
 }
 
 fn disabled_item(label: String) -> ksni::MenuItem<ReceiverTray> {
