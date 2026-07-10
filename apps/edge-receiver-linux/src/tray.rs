@@ -162,7 +162,7 @@ impl ksni::Tray for ReceiverTray {
     }
 
     fn icon_name(&self) -> String {
-        "input-mouse".to_string()
+        String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
