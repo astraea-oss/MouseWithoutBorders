@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug)]
 pub enum TrayCommand {
+    OpenSettings,
     Quit,
 }
 
@@ -209,6 +210,17 @@ impl ksni::Tray for ReceiverTray {
         }
 
         items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "Settings...".to_string(),
+                icon_name: "preferences-system".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::OpenSettings);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(
             StandardItem {
                 label: "Quit receiver".to_string(),

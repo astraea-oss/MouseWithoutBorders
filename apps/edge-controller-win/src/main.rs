@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 #[cfg(windows)]
 use edge_common::PeerPosition;
-use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
+use edge_common::{
+    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
+};
 use edge_crypto::{IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session};
 #[cfg(windows)]
 use edge_geometry::Size;
@@ -26,6 +28,7 @@ use edge_protocol::{
     ClipboardEvent, ControlEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION,
     ScreenInfo, decode_frame, encode_frame,
 };
+use edge_ui::{PairingUiState, SettingsUiInput};
 use tokio::{net::TcpStream, sync::mpsc, time};
 
 #[cfg(windows)]
@@ -102,6 +105,13 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     {
         if run_tray {
             let mut connection = connect_for_tray(&config, &identity, &controller_log).await;
+            let (tray_command_tx, mut tray_command_rx) = mpsc::unbounded_channel();
+            let (win_tray_tx, win_tray_rx) = std_mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok(command) = win_tray_rx.recv() {
+                    let _ = tray_command_tx.send(command);
+                }
+            });
 
             edge_windows_input::install_hooks().context("failed to install Windows hooks")?;
             let status = connection
@@ -112,7 +122,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             append_portable_log(&controller_log, format!("starting tray loop: {status}"));
             let tray_log = controller_log.clone();
             std::thread::spawn(move || {
-                if let Err(err) = edge_windows_input::run_tray(&status) {
+                if let Err(err) = edge_windows_input::run_tray(&status, win_tray_tx) {
                     tracing::warn!(%err, "Windows tray exited with error");
                     append_portable_log(
                         &tray_log,
@@ -122,10 +132,26 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             });
 
             loop {
+                if handle_pending_windows_tray_commands(
+                    &mut tray_command_rx,
+                    &config_path,
+                    &config,
+                    &controller_log,
+                )? {
+                    return Ok(());
+                }
+
                 if let Some((active_connection, screen_info)) = connection {
                     update_windows_tray_status(&active_connection.status(), &controller_log);
-                    match run_connected(active_connection, &config, screen_info, &controller_log)
-                        .await
+                    match run_connected(
+                        active_connection,
+                        &config,
+                        screen_info,
+                        &controller_log,
+                        &config_path,
+                        Some(&mut tray_command_rx),
+                    )
+                    .await
                     {
                         Ok(()) => return Ok(()),
                         Err(err) => {
@@ -174,7 +200,15 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    run_connected(connection, &config, screen_info, &controller_log).await
+    run_connected(
+        connection,
+        &config,
+        screen_info,
+        &controller_log,
+        &config_path,
+        None,
+    )
+    .await
 }
 
 #[cfg(windows)]
@@ -227,6 +261,56 @@ fn update_windows_tray_status(status: &str, log_path: &Path) {
             format!("failed to update Windows tray status to {status}: {err}"),
         );
     }
+}
+
+#[cfg(windows)]
+fn handle_pending_windows_tray_commands(
+    commands: &mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>,
+    config_path: &Path,
+    config: &AppConfig,
+    log_path: &Path,
+) -> Result<bool> {
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            edge_windows_input::WindowsTrayCommand::OpenSettings => {
+                let config = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
+                    tracing::warn!(%err, "failed to reload config for settings UI");
+                    config.clone()
+                });
+                append_portable_log(log_path, "opening settings window");
+                edge_ui::spawn_settings_window(SettingsUiInput {
+                    role: Role::Controller,
+                    config_path: config_path.to_path_buf(),
+                    local_ip: detect_primary_local_ip(),
+                    pairing: controller_pairing_state(&config),
+                    config,
+                });
+            }
+            edge_windows_input::WindowsTrayCommand::ReleaseControl => {
+                edge_windows_input::release_to_local(edge_protocol::ReleaseReason::UserRequest);
+            }
+            edge_windows_input::WindowsTrayCommand::Quit => {
+                append_portable_log(log_path, "quit requested from tray");
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn controller_pairing_state(config: &AppConfig) -> PairingUiState {
+    if let Some(peer) = &config.peer.laptop
+        && !peer.pinned_fingerprint.trim().is_empty()
+    {
+        return PairingUiState::Paired {
+            peer_name: "laptop".to_string(),
+            peer_fingerprint: peer.pinned_fingerprint.clone(),
+        };
+    }
+
+    PairingUiState::Idle
 }
 
 fn install_controller_panic_log(log_path: PathBuf) {
@@ -380,8 +464,18 @@ async fn run_connected(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
     log_path: &Path,
+    config_path: &Path,
+    tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
 ) -> Result<()> {
-    let result = run_connected_inner(connection, config, screen_info, log_path).await;
+    let result = run_connected_inner(
+        connection,
+        config,
+        screen_info,
+        log_path,
+        config_path,
+        tray_commands,
+    )
+    .await;
     #[cfg(windows)]
     edge_windows_input::force_release_to_local();
     result
@@ -392,6 +486,8 @@ async fn run_connected_inner(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
     log_path: &Path,
+    config_path: &Path,
+    mut tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
 ) -> Result<()> {
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
     append_portable_log(
@@ -405,6 +501,7 @@ async fn run_connected_inner(
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
     let (reader, mut writer) = connection.session.split();
     let mut receiver_rx = spawn_receiver_reader(reader);
+    let mut tray_command_poll = time::interval(Duration::from_millis(200));
 
     loop {
         tokio::select! {
@@ -413,10 +510,18 @@ async fn run_connected_inner(
                 tracing::info!("shutdown requested");
                 append_portable_log(log_path, "shutdown requested");
                 return Ok(());
-            }
+            },
             _ = status_log.tick() => {
                 stats.log(log_path, "controller");
-            }
+            },
+            _ = tray_command_poll.tick(), if tray_commands.is_some() => {
+                if let Some(commands) = tray_commands.as_deref_mut() {
+                    if handle_pending_windows_tray_commands(commands, config_path, config, log_path)? {
+                        write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                        return Ok(());
+                    }
+                }
+            },
             event = recv_live_input(&mut input_rx) => {
                 if let Some(frame) = event {
                     if let Some(prefix) = live_clipboard.frame_before_input(&frame, config)? {
@@ -427,13 +532,13 @@ async fn run_connected_inner(
                     stats.record_frame(&frame);
                     live_clipboard.after_input_sent(&frame, config, &clipboard_tx);
                 }
-            }
+            },
             frame = clipboard_rx.recv() => {
                 if let Some(frame) = frame {
                     write_secure_frame_writer(&mut writer, &frame).await?;
                     stats.record_frame(&frame);
                 }
-            }
+            },
             frame = receiver_rx.recv() => {
                 let frame = frame.context("receiver frame reader ended")??;
                 match frame {
@@ -449,7 +554,7 @@ async fn run_connected_inner(
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
                     other => tracing::debug!(?other, "receiver frame"),
                 }
-            }
+            },
         }
     }
 }
