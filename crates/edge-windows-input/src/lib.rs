@@ -1237,7 +1237,15 @@ mod capture {
 
 #[cfg(windows)]
 mod tray {
-    use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::OnceLock};
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        ptr::null_mut,
+        sync::{
+            OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use windows_sys::Win32::{
         Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -1248,12 +1256,13 @@ mod tray {
                 NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-                DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-                IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage,
-                RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-                TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
-                WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
+                DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING,
+                MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN,
+                TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+                WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
+                WS_OVERLAPPEDWINDOW,
             },
         },
     };
@@ -1266,6 +1275,7 @@ mod tray {
     const ID_QUIT: usize = 1002;
 
     static TRAY_STATUS: OnceLock<Vec<u16>> = OnceLock::new();
+    static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
     pub fn run(status: &str) -> Result<()> {
         unsafe {
@@ -1365,19 +1375,25 @@ mod tray {
         let mut data = notify_icon_data(hwnd);
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = WM_TRAY_ICON;
-        data.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+        let icon = create_mouse_icon(icon_color(status)).ok_or_else(|| {
+            WindowsInputError::Tray("failed to create edge-kvm tray icon".to_string())
+        })?;
+        data.hIcon = icon;
         copy_wide("edge-kvm", status, &mut data.szTip);
 
         if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
             let error = unsafe { GetLastError() };
+            destroy_icon(icon);
             return Err(WindowsInputError::Tray(format!(
                 "Shell_NotifyIconW(NIM_ADD) failed with Win32 error {error}"
             )));
         }
+        store_tray_icon(icon);
 
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         if unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) } == 0 {
             let error = unsafe { GetLastError() };
+            remove_tray_icon(hwnd);
             return Err(WindowsInputError::Tray(format!(
                 "Shell_NotifyIconW(NIM_SETVERSION) failed with Win32 error {error}"
             )));
@@ -1389,6 +1405,10 @@ mod tray {
         let data = notify_icon_data(hwnd);
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &data);
+        }
+        let icon = TRAY_ICON_HANDLE.swap(0, Ordering::Relaxed);
+        if icon != 0 {
+            destroy_icon(icon as _);
         }
     }
 
@@ -1451,5 +1471,102 @@ mod tray {
 
     fn to_wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[derive(Clone, Copy)]
+    enum IconColor {
+        Connecting,
+        Connected,
+        Disconnected,
+    }
+
+    fn icon_color(status: &str) -> IconColor {
+        if status.starts_with("Connected") {
+            IconColor::Connected
+        } else if status.starts_with("Disconnected") {
+            IconColor::Disconnected
+        } else {
+            IconColor::Connecting
+        }
+    }
+
+    fn create_mouse_icon(color: IconColor) -> Option<*mut c_void> {
+        const SIZE: i32 = 32;
+        let mut xor_plane = vec![0_u8; (SIZE * SIZE * 4) as usize];
+        let and_plane = vec![0_u8; ((SIZE * SIZE + 7) / 8) as usize];
+        let fill = match color {
+            IconColor::Connecting => [0x9c, 0xa3, 0xaf],
+            IconColor::Connected => [0x22, 0xc5, 0x5e],
+            IconColor::Disconnected => [0xef, 0x44, 0x44],
+        };
+        let outline = [0x11, 0x18, 0x27];
+        let highlight = [0xff, 0xff, 0xff];
+
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let nx = (f64::from(x) + 0.5) / f64::from(SIZE);
+                let ny = (f64::from(y) + 0.5) / f64::from(SIZE);
+                let out_y = SIZE - 1 - y;
+                let idx = ((out_y * SIZE + x) * 4) as usize;
+
+                let body = ellipse(nx, ny, 0.5, 0.56, 0.30, 0.39);
+                let top = ellipse(nx, ny, 0.5, 0.30, 0.24, 0.20);
+                let silhouette = body || top;
+                if !silhouette {
+                    continue;
+                }
+
+                let border = !ellipse(nx, ny, 0.5, 0.56, 0.25, 0.34)
+                    || (top && !ellipse(nx, ny, 0.5, 0.30, 0.19, 0.15));
+                let split = ny < 0.43 && (nx - 0.5).abs() < 0.018;
+                let wheel = ellipse(nx, ny, 0.5, 0.34, 0.035, 0.075);
+                let upper_highlight = ellipse(nx, ny, 0.41, 0.28, 0.055, 0.035);
+
+                let (alpha, rgb) = if border || split {
+                    (0xee, outline)
+                } else if wheel || upper_highlight {
+                    (0xd8, highlight)
+                } else {
+                    (0xff, fill)
+                };
+
+                xor_plane[idx] = rgb[2];
+                xor_plane[idx + 1] = rgb[1];
+                xor_plane[idx + 2] = rgb[0];
+                xor_plane[idx + 3] = alpha;
+            }
+        }
+
+        let icon = unsafe {
+            CreateIcon(
+                null_mut(),
+                SIZE,
+                SIZE,
+                1,
+                32,
+                and_plane.as_ptr(),
+                xor_plane.as_ptr(),
+            )
+        };
+        (!icon.is_null()).then_some(icon)
+    }
+
+    fn store_tray_icon(icon: *mut c_void) {
+        let old_icon = TRAY_ICON_HANDLE.swap(icon as usize, Ordering::Relaxed);
+        if old_icon != 0 {
+            destroy_icon(old_icon as _);
+        }
+    }
+
+    fn destroy_icon(icon: *mut c_void) {
+        unsafe {
+            DestroyIcon(icon);
+        }
+    }
+
+    fn ellipse(x: f64, y: f64, cx: f64, cy: f64, rx: f64, ry: f64) -> bool {
+        let dx = (x - cx) / rx;
+        let dy = (y - cy) / ry;
+        dx * dx + dy * dy <= 1.0
     }
 }
