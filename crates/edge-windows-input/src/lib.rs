@@ -1559,8 +1559,7 @@ mod tray {
             for x in 0..SIZE {
                 let nx = (f64::from(x) + 0.5) / f64::from(SIZE);
                 let ny = (f64::from(y) + 0.5) / f64::from(SIZE);
-                let out_y = SIZE - 1 - y;
-                let idx = ((out_y * SIZE + x) * 4) as usize;
+                let idx = ((y * SIZE + x) * 4) as usize;
 
                 let body = ellipse(nx, ny, 0.5, 0.56, 0.30, 0.39);
                 let top = ellipse(nx, ny, 0.5, 0.30, 0.24, 0.20);
