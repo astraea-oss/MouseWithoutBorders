@@ -104,6 +104,16 @@ pub fn run_tray(_status: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn update_tray_status(status: &str) -> Result<()> {
+    tray::update_status(status)
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_status(_status: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
 pub fn force_release_to_local() {
     release_to_local(ReleaseReason::PeerDisconnected)
 }
@@ -1242,7 +1252,7 @@ mod tray {
         mem::size_of,
         ptr::null_mut,
         sync::{
-            OnceLock,
+            Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -1252,8 +1262,8 @@ mod tray {
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
-                NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
-                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+                NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
@@ -1274,12 +1284,13 @@ mod tray {
     const ID_RELEASE: usize = 1001;
     const ID_QUIT: usize = 1002;
 
-    static TRAY_STATUS: OnceLock<Vec<u16>> = OnceLock::new();
+    static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
     pub fn run(status: &str) -> Result<()> {
         unsafe {
-            let _ = TRAY_STATUS.set(to_wide(status));
+            set_tray_status(status);
 
             let instance = GetModuleHandleW(null_mut());
             if instance.is_null() {
@@ -1332,6 +1343,15 @@ mod tray {
 
             Ok(())
         }
+    }
+
+    pub fn update_status(status: &str) -> Result<()> {
+        set_tray_status(status);
+        let hwnd = TRAY_HWND.load(Ordering::Relaxed);
+        if hwnd == 0 {
+            return Ok(());
+        }
+        modify_tray_icon(hwnd as _, status)
     }
 
     unsafe extern "system" fn window_proc(
@@ -1389,6 +1409,7 @@ mod tray {
             )));
         }
         store_tray_icon(icon);
+        TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
 
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         if unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) } == 0 {
@@ -1406,10 +1427,31 @@ mod tray {
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &data);
         }
+        TRAY_HWND.store(0, Ordering::Relaxed);
         let icon = TRAY_ICON_HANDLE.swap(0, Ordering::Relaxed);
         if icon != 0 {
             destroy_icon(icon as _);
         }
+    }
+
+    fn modify_tray_icon(hwnd: HWND, status: &str) -> Result<()> {
+        let icon = create_mouse_icon(icon_color(status)).ok_or_else(|| {
+            WindowsInputError::Tray("failed to create edge-kvm tray icon".to_string())
+        })?;
+        let mut data = notify_icon_data(hwnd);
+        data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        data.hIcon = icon;
+        copy_wide("edge-kvm", status, &mut data.szTip);
+
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
+            let error = unsafe { GetLastError() };
+            destroy_icon(icon);
+            return Err(WindowsInputError::Tray(format!(
+                "Shell_NotifyIconW(NIM_MODIFY) failed with Win32 error {error}"
+            )));
+        }
+        store_tray_icon(icon);
+        Ok(())
     }
 
     fn show_menu(hwnd: HWND) {
@@ -1418,15 +1460,12 @@ mod tray {
             return;
         }
 
-        let status = TRAY_STATUS
-            .get()
-            .map(|value| value.as_ptr())
-            .unwrap_or_else(|| to_wide("edge-kvm").leak().as_ptr());
+        let status = current_tray_status();
         let release = to_wide("Release control");
         let quit = to_wide("Quit");
 
         unsafe {
-            AppendMenuW(menu, MF_STRING, 0, status);
+            AppendMenuW(menu, MF_STRING, 0, status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
@@ -1446,6 +1485,20 @@ mod tray {
             }
 
             DestroyMenu(menu);
+        }
+    }
+
+    fn set_tray_status(status: &str) {
+        let mut tray_status = TRAY_STATUS.lock().expect("tray status poisoned");
+        *tray_status = to_wide(status);
+    }
+
+    fn current_tray_status() -> Vec<u16> {
+        let tray_status = TRAY_STATUS.lock().expect("tray status poisoned");
+        if tray_status.is_empty() {
+            to_wide("edge-kvm")
+        } else {
+            tray_status.clone()
         }
     }
 

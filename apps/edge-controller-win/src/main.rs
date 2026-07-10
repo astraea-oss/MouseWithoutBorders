@@ -123,6 +123,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
 
             loop {
                 if let Some((active_connection, screen_info)) = connection {
+                    update_windows_tray_status(&active_connection.status(), &controller_log);
                     match run_connected(active_connection, &config, screen_info, &controller_log)
                         .await
                     {
@@ -133,12 +134,18 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                                 &controller_log,
                                 format!("connected session ended; reconnecting: {err:#}"),
                             );
+                            update_windows_tray_status("Disconnected", &controller_log);
                         }
                     }
                 }
 
                 time::sleep(Duration::from_secs(2)).await;
                 connection = connect_for_tray(&config, &identity, &controller_log).await;
+                let status = connection
+                    .as_ref()
+                    .map(|(connection, _)| connection.status())
+                    .unwrap_or_else(|| "Disconnected".to_string());
+                update_windows_tray_status(&status, &controller_log);
             }
         }
     }
@@ -208,6 +215,17 @@ fn append_portable_log(path: &Path, message: impl AsRef<str>) {
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
+    }
+}
+
+#[cfg(windows)]
+fn update_windows_tray_status(status: &str, log_path: &Path) {
+    if let Err(err) = edge_windows_input::update_tray_status(status) {
+        tracing::warn!(%err, status, "failed to update Windows tray status");
+        append_portable_log(
+            log_path,
+            format!("failed to update Windows tray status to {status}: {err}"),
+        );
     }
 }
 
