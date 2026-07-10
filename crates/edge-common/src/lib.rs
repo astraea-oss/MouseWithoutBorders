@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +27,20 @@ pub enum CommonError {
 }
 
 pub type Result<T> = std::result::Result<T, CommonError>;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigValidationError {
+    #[error("device name must not be empty")]
+    EmptyDeviceName,
+    #[error("port must be between 1 and 65535")]
+    InvalidPort,
+    #[error("host must not be empty")]
+    EmptyHost,
+    #[error("listen address must include a port")]
+    MissingListenPort,
+    #[error("listen port is invalid")]
+    InvalidListenPort,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -153,6 +170,18 @@ impl AppConfig {
         })
     }
 
+    pub fn load_blocking(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|source| CommonError::ReadConfig {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| CommonError::ParseConfig {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     pub async fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -170,6 +199,21 @@ impl AppConfig {
                 path: path.to_path_buf(),
                 source,
             })
+    }
+
+    pub fn save_blocking(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| CommonError::WriteConfig {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let text = toml::to_string_pretty(self).map_err(CommonError::EncodeConfig)?;
+        std::fs::write(path, text).map_err(|source| CommonError::WriteConfig {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -203,6 +247,69 @@ pub fn portable_app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn detect_primary_local_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
+    socket.connect(SocketAddr::from(([1, 1, 1, 1], 80))).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+pub fn parse_listen_port(listen: &str) -> std::result::Result<u16, ConfigValidationError> {
+    let (_, port) = split_host_port(listen).ok_or(ConfigValidationError::MissingListenPort)?;
+    port.parse()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or(ConfigValidationError::InvalidListenPort)
+}
+
+pub fn update_listen_port(listen: Option<&str>, port: u16) -> String {
+    let host = listen
+        .and_then(split_host_port)
+        .map(|(host, _)| host)
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or("0.0.0.0");
+
+    if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+pub fn validate_device_name(name: &str) -> std::result::Result<(), ConfigValidationError> {
+    if name.trim().is_empty() {
+        Err(ConfigValidationError::EmptyDeviceName)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_port(port: u16) -> std::result::Result<(), ConfigValidationError> {
+    if port == 0 {
+        Err(ConfigValidationError::InvalidPort)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_host(host: &str) -> std::result::Result<(), ConfigValidationError> {
+    if host.trim().is_empty() {
+        Err(ConfigValidationError::EmptyHost)
+    } else {
+        Ok(())
+    }
+}
+
+fn split_host_port(value: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        Some((host, port))
+    } else {
+        value.rsplit_once(':')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +326,37 @@ mod tests {
         assert_eq!(actual.role, Role::Receiver);
         assert_eq!(actual.listen.as_deref(), Some("0.0.0.0:42420"));
         assert_eq!(actual.clipboard.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn update_listen_port_preserves_host() {
+        assert_eq!(
+            update_listen_port(Some("127.0.0.1:42420"), 42421),
+            "127.0.0.1:42421"
+        );
+        assert_eq!(update_listen_port(None, 42420), "0.0.0.0:42420");
+    }
+
+    #[test]
+    fn parse_listen_port_rejects_missing_or_zero_port() {
+        assert_eq!(parse_listen_port("0.0.0.0:42420").unwrap(), 42420);
+        assert_eq!(
+            parse_listen_port("0.0.0.0"),
+            Err(ConfigValidationError::MissingListenPort)
+        );
+        assert_eq!(
+            parse_listen_port("0.0.0.0:0"),
+            Err(ConfigValidationError::InvalidListenPort)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_empty_name_and_host() {
+        assert_eq!(
+            validate_device_name("  "),
+            Err(ConfigValidationError::EmptyDeviceName)
+        );
+        assert_eq!(validate_host(""), Err(ConfigValidationError::EmptyHost));
+        assert_eq!(validate_port(0), Err(ConfigValidationError::InvalidPort));
     }
 }

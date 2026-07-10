@@ -13,6 +13,7 @@ edge-crypto = { path = "../../crates/edge-crypto" }
 edge-geometry = { path = "../../crates/edge-geometry" }
 edge-keymap = { path = "../../crates/edge-keymap" }
 edge-protocol = { path = "../../crates/edge-protocol" }
+edge-ui = { path = "../../crates/edge-ui" }
 edge-windows-input = { path = "../../crates/edge-windows-input" }
 tokio.workspace = true
 tracing.workspace = true

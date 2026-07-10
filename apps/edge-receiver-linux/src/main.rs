@@ -8,7 +8,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
+use edge_common::{
+    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
+};
 use edge_crypto::{
     IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinDecision, PinStore,
     accept_noise_session,
@@ -21,6 +23,7 @@ use edge_protocol::{
     ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo,
     PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
 };
+use edge_ui::{PairingUiState, SettingsUiInput};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::unix::{SignalKind, signal},
@@ -130,7 +133,15 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    run_receiver(config, args.pair, backend, !args.no_tray, receiver_log).await
+    run_receiver(
+        config,
+        config_path,
+        args.pair,
+        backend,
+        !args.no_tray,
+        receiver_log,
+    )
+    .await
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
@@ -196,6 +207,7 @@ async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()
 
 async fn run_receiver(
     config: AppConfig,
+    config_path: PathBuf,
     allow_pairing: bool,
     backend: ReceiverBackend,
     enable_tray: bool,
@@ -256,6 +268,9 @@ async fn run_receiver(
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
                 match command {
+                    TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                        open_receiver_settings(&config_path, &config, &log_path);
+                    }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         tracing::info!("quit requested from tray");
                         append_portable_log(&log_path, "quit requested from tray");
@@ -368,6 +383,7 @@ async fn run_receiver(
         match handle_controller(
             session,
             &config,
+            &config_path,
             &backend,
             tray.as_ref(),
             &mut tray_commands,
@@ -416,6 +432,21 @@ fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     }
 }
 
+fn open_receiver_settings(config_path: &Path, config: &AppConfig, log_path: &Path) {
+    let config = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
+        tracing::warn!(%err, "failed to reload config for settings UI");
+        config.clone()
+    });
+    append_portable_log(log_path, "opening settings window");
+    edge_ui::spawn_settings_window(SettingsUiInput {
+        role: Role::Receiver,
+        config_path: config_path.to_path_buf(),
+        config,
+        local_ip: detect_primary_local_ip(),
+        pairing: PairingUiState::Idle,
+    });
+}
+
 enum ControllerSessionExit {
     QuitRequested,
 }
@@ -423,6 +454,7 @@ enum ControllerSessionExit {
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
     config: &AppConfig,
+    config_path: &Path,
     backend: &ReceiverBackend,
     tray: Option<&ReceiverTrayHandle>,
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
@@ -449,6 +481,9 @@ async fn handle_controller(
             }
             command = recv_tray_command(tray_commands) => {
                 match command {
+                    TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                        open_receiver_settings(config_path, config, log_path);
+                    }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         return Ok(ControllerSessionExit::QuitRequested);
                     }
