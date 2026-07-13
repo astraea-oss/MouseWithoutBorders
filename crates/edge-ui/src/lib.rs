@@ -1,4 +1,6 @@
 use std::{
+    fs::OpenOptions,
+    io::Write,
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
@@ -7,11 +9,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, PeerConfig, PeerPosition, Role, parse_listen_port, update_listen_port,
-    validate_device_name, validate_host, validate_port,
+    AppConfig, GameCompatibilityMode, PeerConfig, PeerPosition, Role, parse_listen_port,
+    update_listen_port, validate_device_name, validate_host, validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
+static SETTINGS_CONTEXT: OnceLock<Mutex<Option<eframe::egui::Context>>> = OnceLock::new();
 
 pub struct SettingsUiInput {
     pub role: Role,
@@ -23,7 +26,7 @@ pub struct SettingsUiInput {
 
 #[derive(Debug, Clone)]
 pub enum SettingsUiResult {
-    Saved(AppConfig),
+    Saved(Box<AppConfig>),
     Cancelled,
 }
 
@@ -52,13 +55,52 @@ pub fn spawn_settings_window(input: SettingsUiInput) {
     {
         let mut open = guard.lock().expect("settings window guard poisoned");
         if *open {
+            if let Some(context) = SETTINGS_CONTEXT
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .ok()
+                .and_then(|context| context.clone())
+            {
+                context.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
+                context.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+            }
             return;
         }
         *open = true;
     }
 
     std::thread::spawn(move || {
-        let _ = run_settings_window(input);
+        let error_log = input
+            .config_path
+            .parent()
+            .map(|parent| parent.join("state").join("settings.log"));
+        let window_result = std::panic::catch_unwind(|| run_settings_window(input));
+        let error = match window_result {
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => Some(format!("{err:#}")),
+            Err(panic) => Some(format!(
+                "settings window panicked: {}",
+                panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic")
+            )),
+        };
+        if let Some(error) = error {
+            tracing::error!(%error, "settings window exited with an error");
+            if let Some(path) = error_log {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "{error}");
+                }
+            }
+        }
+        if let Ok(mut context) = SETTINGS_CONTEXT.get_or_init(|| Mutex::new(None)).lock() {
+            *context = None;
+        }
         if let Ok(mut open) = SETTINGS_WINDOW_OPEN
             .get_or_init(|| Mutex::new(false))
             .lock()
@@ -71,17 +113,37 @@ pub fn spawn_settings_window(input: SettingsUiInput) {
 pub fn run_settings_window(input: SettingsUiInput) -> Result<SettingsUiResult> {
     let result = Arc::new(Mutex::new(SettingsUiResult::Cancelled));
     let app_result = Arc::clone(&result);
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         persist_window: false,
         persistence_path: None,
         ..Default::default()
     };
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        }));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
+
+        options.event_loop_builder = Some(Box::new(|builder| {
+            EventLoopBuilderExtWayland::with_any_thread(builder, true);
+            EventLoopBuilderExtX11::with_any_thread(builder, true);
+        }));
+    }
 
     eframe::run_native(
         "edge-kvm Settings",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            if let Ok(mut context) = SETTINGS_CONTEXT.get_or_init(|| Mutex::new(None)).lock() {
+                *context = Some(cc.egui_ctx.clone());
+            }
             Ok(Box::new(SettingsApp::new(input, app_result)))
         }),
     )
@@ -104,6 +166,7 @@ struct SettingsApp {
     peer_host: String,
     port: String,
     position: PeerPosition,
+    game_compatibility: GameCompatibilityMode,
     save_message: Option<String>,
     error_message: Option<String>,
     result: Arc<Mutex<SettingsUiResult>>,
@@ -139,6 +202,7 @@ impl SettingsApp {
                 .as_ref()
                 .map(|peer| peer.position)
                 .unwrap_or(PeerPosition::Left),
+            game_compatibility: input.config.input.game_compatibility,
             original: input.config,
             save_message: None,
             error_message: None,
@@ -156,7 +220,7 @@ impl SettingsApp {
                     self.original = config.clone();
                     self.save_message = Some("Saved. Restart required.".to_string());
                     if let Ok(mut result) = self.result.lock() {
-                        *result = SettingsUiResult::Saved(config);
+                        *result = SettingsUiResult::Saved(Box::new(config));
                     }
                 }
                 Err(err) => self.error_message = Some(err.to_string()),
@@ -176,6 +240,7 @@ impl SettingsApp {
 
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
+        config.input.game_compatibility = self.game_compatibility;
 
         match self.role {
             Role::Controller => {
@@ -203,6 +268,14 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         use eframe::egui::{self, Align, Layout};
 
+        if ui.ctx().input(|input| input.viewport().close_requested()) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        }
+
         ui.heading("edge-kvm Settings");
         ui.add_space(8.0);
 
@@ -213,6 +286,33 @@ impl eframe::App for SettingsApp {
             .show(ui, |ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut self.device_name);
+                ui.end_row();
+
+                ui.label("Game compatibility");
+                if self.role == Role::Controller {
+                    egui::ComboBox::from_id_salt("game_compatibility")
+                        .selected_text(game_compatibility_label(self.game_compatibility))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.game_compatibility,
+                                GameCompatibilityMode::AlwaysEnabled,
+                                "Always enabled",
+                            );
+                            ui.selectable_value(
+                                &mut self.game_compatibility,
+                                GameCompatibilityMode::Borderless,
+                                "Borderless games",
+                            );
+                            ui.selectable_value(
+                                &mut self.game_compatibility,
+                                GameCompatibilityMode::Compatible,
+                                "Safe / compatible",
+                            );
+                        });
+                } else {
+                    let mut text = "Set on controller".to_string();
+                    ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
+                }
                 ui.end_row();
 
                 ui.label("Local IP");
@@ -275,6 +375,14 @@ fn position_label(position: PeerPosition) -> &'static str {
         PeerPosition::Right => "Right",
         PeerPosition::Top => "Top",
         PeerPosition::Bottom => "Bottom",
+    }
+}
+
+fn game_compatibility_label(mode: GameCompatibilityMode) -> &'static str {
+    match mode {
+        GameCompatibilityMode::AlwaysEnabled => "Always enabled",
+        GameCompatibilityMode::Borderless => "Borderless games",
+        GameCompatibilityMode::Compatible => "Safe / compatible",
     }
 }
 

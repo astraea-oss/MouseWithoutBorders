@@ -94,12 +94,24 @@ pub struct PeerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     pub backend: String,
+    #[serde(default)]
+    pub game_compatibility: GameCompatibilityMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GameCompatibilityMode {
+    Compatible,
+    Borderless,
+    #[default]
+    AlwaysEnabled,
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
             backend: "auto".to_string(),
+            game_compatibility: GameCompatibilityMode::default(),
         }
     }
 }
@@ -326,6 +338,15 @@ mod tests {
         assert_eq!(actual.role, Role::Receiver);
         assert_eq!(actual.listen.as_deref(), Some("0.0.0.0:42420"));
         assert_eq!(actual.clipboard.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn legacy_input_config_defaults_to_always_enabled_for_games() {
+        let input: InputConfig = toml::from_str("backend = \"auto\"").unwrap();
+        assert_eq!(
+            input.game_compatibility,
+            GameCompatibilityMode::AlwaysEnabled
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ pinned_fingerprint = ""
 
 [input]
 backend = "auto"
+game_compatibility = "always-enabled"
 
 [clipboard]
 enabled = true

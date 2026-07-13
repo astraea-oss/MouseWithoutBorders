@@ -82,6 +82,12 @@ state\
 
 Edit `controller.toml` in that same folder and set `[peer.laptop].host` to the Linux laptop IP. Nothing is written to `%APPDATA%` unless you explicitly set `EDGE_KVM_CONFIG` or `EDGE_KVM_STATE_DIR` there yourself.
 
+The tray icon opens Settings with a left-click and shows its menu with a
+right-click. `input.game_compatibility` controls edge switching while a game is
+focused: `always-enabled` (default), `borderless`, or `compatible`. Active
+remote mouse movement uses Windows Raw Input so games cannot distort the
+forwarded relative motion.
+
 On non-Windows hosts, use `--dry-run` to validate config and the initial protocol hello.
 
 ## End-to-end test

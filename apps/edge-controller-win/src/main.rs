@@ -3,7 +3,6 @@
 #[cfg(windows)]
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::time::Duration;
-#[cfg(windows)]
 use std::time::Instant;
 use std::{
     fs::OpenOptions,
@@ -36,6 +35,7 @@ const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
 #[cfg(windows)]
 const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]
@@ -502,6 +502,8 @@ async fn run_connected_inner(
     let (reader, mut writer) = connection.session.split();
     let mut receiver_rx = spawn_receiver_reader(reader);
     let mut tray_command_poll = time::interval(Duration::from_millis(200));
+    let mut connection_watchdog = time::interval(Duration::from_secs(1));
+    let mut last_receiver_activity = Instant::now();
 
     loop {
         tokio::select! {
@@ -514,12 +516,20 @@ async fn run_connected_inner(
             _ = status_log.tick() => {
                 stats.log(log_path, "controller");
             },
+            _ = connection_watchdog.tick() => {
+                if last_receiver_activity.elapsed() > RECEIVER_STALL_TIMEOUT {
+                    anyhow::bail!(
+                        "receiver stopped responding for {:?}; reconnecting",
+                        last_receiver_activity.elapsed()
+                    );
+                }
+            },
             _ = tray_command_poll.tick(), if tray_commands.is_some() => {
-                if let Some(commands) = tray_commands.as_deref_mut() {
-                    if handle_pending_windows_tray_commands(commands, config_path, config, log_path)? {
-                        write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
-                        return Ok(());
-                    }
+                if let Some(commands) = tray_commands.as_deref_mut()
+                    && handle_pending_windows_tray_commands(commands, config_path, config, log_path)?
+                {
+                    write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                    return Ok(());
                 }
             },
             event = recv_live_input(&mut input_rx) => {
@@ -541,14 +551,19 @@ async fn run_connected_inner(
             },
             frame = receiver_rx.recv() => {
                 let frame = frame.context("receiver frame reader ended")??;
+                last_receiver_activity = Instant::now();
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
                     Frame::Clipboard(event) => handle_remote_clipboard_event(event, config, &mut writer).await?,
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
                     Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
-                        tracing::info!(?reason, "receiver requested local release");
-                        append_portable_log(log_path, format!("receiver requested local release: {reason:?}"));
-                        edge_windows_input::release_to_local(reason);
+                        if edge_windows_input::handle_receiver_release(reason) {
+                            tracing::info!(?reason, "accepted receiver-requested local release");
+                            append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
+                        } else {
+                            tracing::warn!(?reason, "ignored stale or implausible receiver release");
+                            append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
+                        }
                     }
                     Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
@@ -604,7 +619,7 @@ impl ControllerInputStats {
         append_portable_log(
             path,
             format!(
-                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} capture_suspended={} capture_mouse_hook_installed={} hook_mouse={} hook_keyboard={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_game_guard_blocks={} capture_game_guard_releases={} capture_suspend_toggles={} capture_suspend_blocks={} capture_suspend_auto_resumes={} capture_send_failures={} capture_unmapped_keys={}",
+                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} capture_suspended={} capture_mouse_hook_installed={} hook_mouse={} hook_keyboard={} raw_mouse={} raw_keyboard={} raw_input_repairs={} mouse_hook_repairs={} keyboard_hook_repairs={} input_pipeline_restarts={} callback_contention_drops={} input_supervisor_checks={} system_last_input_tick={} raw_worker_thread_id={} hook_worker_thread_id={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_game_guard_blocks={} capture_game_guard_releases={} capture_suspend_toggles={} capture_suspend_blocks={} capture_suspend_auto_resumes={} capture_send_failures={} capture_unmapped_keys={}",
                 self.frames,
                 self.motion,
                 self.buttons,
@@ -617,6 +632,17 @@ impl ControllerInputStats {
                 capture.mouse_hook_installed,
                 capture.mouse_hook_events,
                 capture.keyboard_hook_events,
+                capture.raw_mouse_events,
+                capture.raw_keyboard_events,
+                capture.raw_input_repairs,
+                capture.mouse_hook_repairs,
+                capture.keyboard_hook_repairs,
+                capture.input_pipeline_restarts,
+                capture.callback_contention_drops,
+                capture.input_supervisor_checks,
+                capture.system_last_input_tick,
+                capture.raw_worker_thread_id,
+                capture.hook_worker_thread_id,
                 capture.input_events,
                 capture.control_events,
                 capture.enter_events,
@@ -675,17 +701,15 @@ impl LiveClipboardState {
                     down: true
                 })
             ) && self.ctrl_down
-            {
-                if let Some(text) =
+                && let Some(text) =
                     edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
                         .context("failed to read Windows clipboard")?
-                {
-                    self.sequence = self.sequence.saturating_add(1);
-                    return Ok(Some(Frame::Clipboard(ClipboardEvent::TextOffer {
-                        sequence: self.sequence,
-                        text,
-                    })));
-                }
+            {
+                self.sequence = self.sequence.saturating_add(1);
+                return Ok(Some(Frame::Clipboard(ClipboardEvent::TextOffer {
+                    sequence: self.sequence,
+                    text,
+                })));
             }
         }
 
@@ -790,6 +814,7 @@ fn start_live_input(
     let capture = edge_windows_input::start_capture(edge_windows_input::CaptureConfig {
         edge: peer_position_to_edge(peer.position),
         remote_size,
+        game_compatibility: config.input.game_compatibility,
     })
     .context("failed to start Windows live input capture")?;
     let (sender, receiver) = mpsc::channel(LIVE_INPUT_QUEUE_CAPACITY);

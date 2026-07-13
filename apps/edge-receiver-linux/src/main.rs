@@ -34,6 +34,8 @@ use tokio::{
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const RETURN_EDGE_MARGIN: i32 = 12;
+const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
+const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 
 mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
@@ -619,6 +621,8 @@ struct RemoteReturnWatcher {
     output: Option<OutputInfo>,
     edge: Option<Edge>,
     last_poll: Instant,
+    entered_at: Option<Instant>,
+    consecutive_edge_polls: u8,
 }
 
 impl RemoteReturnWatcher {
@@ -635,6 +639,8 @@ impl RemoteReturnWatcher {
             output,
             edge: None,
             last_poll: Instant::now() - RETURN_EDGE_POLL_INTERVAL,
+            entered_at: None,
+            consecutive_edge_polls: 0,
         }
     }
 
@@ -643,9 +649,13 @@ impl RemoteReturnWatcher {
             ControlEvent::EnterRemote { edge, .. } => {
                 self.edge = Some(*edge);
                 self.last_poll = Instant::now() - RETURN_EDGE_POLL_INTERVAL;
+                self.entered_at = Some(Instant::now());
+                self.consecutive_edge_polls = 0;
             }
             ControlEvent::ReleaseToLocal { .. } | ControlEvent::LeaveRemote { .. } => {
                 self.edge = None;
+                self.entered_at = None;
+                self.consecutive_edge_polls = 0;
             }
         }
     }
@@ -657,6 +667,12 @@ impl RemoteReturnWatcher {
         let Some(output) = &self.output else {
             return Ok(None);
         };
+        if self
+            .entered_at
+            .is_some_and(|entered_at| entered_at.elapsed() < RETURN_EDGE_ENTRY_GRACE)
+        {
+            return Ok(None);
+        }
         if self.last_poll.elapsed() < RETURN_EDGE_POLL_INTERVAL {
             return Ok(None);
         }
@@ -664,10 +680,18 @@ impl RemoteReturnWatcher {
 
         let cursor = hyprland_cursor_position().await?;
         if !real_cursor_at_return_edge(cursor, output, edge) {
+            self.consecutive_edge_polls = 0;
+            return Ok(None);
+        }
+
+        self.consecutive_edge_polls = self.consecutive_edge_polls.saturating_add(1);
+        if self.consecutive_edge_polls < RETURN_EDGE_CONFIRMATIONS {
             return Ok(None);
         }
 
         self.edge = None;
+        self.entered_at = None;
+        self.consecutive_edge_polls = 0;
         Ok(Some(ControlEvent::ReleaseToLocal {
             reason: ReleaseReason::UserRequest,
         }))

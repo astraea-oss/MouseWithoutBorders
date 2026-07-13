@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 
+use edge_common::GameCompatibilityMode;
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
 use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
@@ -32,6 +33,7 @@ pub enum ControlState {
 pub struct CaptureConfig {
     pub edge: Edge,
     pub remote_size: Size,
+    pub game_compatibility: GameCompatibilityMode,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,17 @@ pub struct CaptureStatsSnapshot {
     pub mouse_hook_installed: bool,
     pub mouse_hook_events: u64,
     pub keyboard_hook_events: u64,
+    pub raw_mouse_events: u64,
+    pub raw_keyboard_events: u64,
+    pub raw_input_repairs: u64,
+    pub mouse_hook_repairs: u64,
+    pub keyboard_hook_repairs: u64,
+    pub input_pipeline_restarts: u64,
+    pub callback_contention_drops: u64,
+    pub input_supervisor_checks: u64,
+    pub system_last_input_tick: u32,
+    pub raw_worker_thread_id: u32,
+    pub hook_worker_thread_id: u32,
     pub input_events: u64,
     pub control_events: u64,
     pub enter_events: u64,
@@ -122,7 +135,7 @@ pub fn update_tray_status(_status: &str) -> Result<()> {
 
 #[cfg(windows)]
 pub fn force_release_to_local() {
-    release_to_local(ReleaseReason::PeerDisconnected)
+    capture::disable()
 }
 
 #[cfg(not(windows))]
@@ -131,6 +144,16 @@ pub fn force_release_to_local() {}
 #[cfg(windows)]
 pub fn release_to_local(reason: ReleaseReason) {
     capture::release_to_local(reason)
+}
+
+#[cfg(windows)]
+pub fn handle_receiver_release(reason: ReleaseReason) -> bool {
+    capture::handle_receiver_release(reason)
+}
+
+#[cfg(not(windows))]
+pub fn handle_receiver_release(_reason: ReleaseReason) -> bool {
+    false
 }
 
 #[cfg(not(windows))]
@@ -298,31 +321,42 @@ mod capture {
         ptr::null_mut,
         sync::{
             Mutex, OnceLock,
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
             mpsc,
         },
         thread,
         time::{Duration, Instant},
     };
 
+    use edge_common::GameCompatibilityMode;
     use edge_protocol::Edge;
     use windows_sys::Win32::{
-        Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
             GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
         },
-        System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::{
-            CallNextHookEx, CreateCursor, DestroyCursor, DispatchMessageW, GetClipCursor,
-            GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS,
-            OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW,
-            OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, SPI_SETCURSORS, SetCursorPos,
-            SetSystemCursor, SetWindowsHookExW, ShowCursor, SystemParametersInfoW,
-            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-            WM_XBUTTONDOWN, WM_XBUTTONUP,
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        UI::{
+            Input::{
+                GetRawInputData,
+                KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+                MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
+                RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
+            },
+            WindowsAndMessaging::{
+                CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyCursor,
+                DispatchMessageW, GetClipCursor, GetForegroundWindow, GetMessageW,
+                GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLMHF_INJECTED,
+                MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM,
+                OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE,
+                OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, RegisterClassW, SPI_SETCURSORS,
+                SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
+                SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+                WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+                WM_XBUTTONUP, WNDCLASSW, WS_POPUP,
+            },
         },
     };
 
@@ -330,7 +364,7 @@ mod capture {
         CaptureConfig, CaptureStatsSnapshot, CapturedInput, ControlEvent, InputEvent, Result,
         WindowsInputError, map_key,
     };
-    use edge_geometry::{Point, apply_remote_motion, clamp};
+    use edge_geometry::{Point, Size, apply_remote_motion, clamp};
     use edge_protocol::{MouseButton, ReleaseReason};
 
     const SM_XVIRTUALSCREEN: i32 = 76;
@@ -351,12 +385,60 @@ mod capture {
     const XBUTTON2: u16 = 0x0002;
     const WHEEL_DELTA: f64 = 120.0;
     const REMOTE_ENTRY_PADDING: f64 = 32.0;
+    const REMOTE_RETURN_MARGIN: f64 = 12.0;
     const GAME_GUARD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+    const RELEASE_REENTRY_COOLDOWN: Duration = Duration::from_millis(750);
+    const INPUT_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+    const INPUT_STALL_CONFIRMATIONS: u8 = 2;
+    const INPUT_RESTART_COOLDOWN: Duration = Duration::from_secs(8);
     const FULLSCREEN_TOLERANCE_PX: i32 = 2;
 
     static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
     static MOUSE_HOOK: Mutex<isize> = Mutex::new(0);
+    static KEYBOARD_HOOK: Mutex<isize> = Mutex::new(0);
+    static RAW_MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static RAW_KEYBOARD_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static RAW_WORKER_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static RAW_WORKER_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static HOOK_WORKER_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static INPUT_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
     static CAPTURE_STATS: CaptureStats = CaptureStats::new();
+
+    #[derive(Clone, Copy)]
+    struct InputSupervisorSnapshot {
+        raw_mouse: u64,
+        raw_keyboard: u64,
+        hook_mouse: u64,
+        hook_keyboard: u64,
+        system_last_input: Option<u32>,
+    }
+
+    impl InputSupervisorSnapshot {
+        fn current() -> Self {
+            Self {
+                raw_mouse: RAW_MOUSE_EVENTS.load(Ordering::Relaxed),
+                raw_keyboard: RAW_KEYBOARD_EVENTS.load(Ordering::Relaxed),
+                hook_mouse: CAPTURE_STATS.mouse_hook_events.load(Ordering::Relaxed),
+                hook_keyboard: CAPTURE_STATS.keyboard_hook_events.load(Ordering::Relaxed),
+                system_last_input: system_last_input_tick(),
+            }
+        }
+
+        fn raw_advanced(self, previous: Self) -> bool {
+            self.raw_mouse > previous.raw_mouse || self.raw_keyboard > previous.raw_keyboard
+        }
+
+        fn hooks_advanced(self, previous: Self) -> bool {
+            self.hook_mouse > previous.hook_mouse || self.hook_keyboard > previous.hook_keyboard
+        }
+
+        fn system_input_advanced(self, previous: Self) -> bool {
+            matches!(
+                (self.system_last_input, previous.system_last_input),
+                (Some(current), Some(old)) if current != old
+            )
+        }
+    }
 
     pub fn release_to_local(reason: ReleaseReason) {
         let Some(state) = STATE.get() else {
@@ -367,6 +449,38 @@ mod capture {
         state.show_source_cursor();
     }
 
+    pub fn handle_receiver_release(reason: ReleaseReason) -> bool {
+        let Some(state) = STATE.get() else {
+            return false;
+        };
+        let mut state = state.lock().expect("capture state poisoned");
+        if !state.active {
+            return false;
+        }
+        if reason == ReleaseReason::UserRequest && !state.remote_at_return_edge() {
+            tracing::warn!(
+                edge = ?state.config.edge,
+                x = state.remote_cursor.x,
+                y = state.remote_cursor.y,
+                "ignored implausible receiver release away from the return edge"
+            );
+            return false;
+        }
+        state.release_to_local(reason);
+        true
+    }
+
+    pub fn disable() {
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        let mut state = state.lock().expect("capture state poisoned");
+        state.enabled = false;
+        state.release_to_local(ReleaseReason::PeerDisconnected);
+        state.show_source_cursor();
+        tracing::info!("Windows edge capture disabled until the next connection");
+    }
+
     pub fn stats_snapshot() -> CaptureStatsSnapshot {
         CAPTURE_STATS.snapshot()
     }
@@ -375,11 +489,14 @@ mod capture {
         let (sender, receiver) = mpsc::channel();
         CAPTURE_STATS.active.store(false, Ordering::Relaxed);
         CAPTURE_STATS.suspended.store(false, Ordering::Relaxed);
+        let local_bounds = LocalBounds::query();
         let state = CaptureState {
             sender,
             config,
-            local_bounds: LocalBounds::query(),
+            virtual_local_cursor: local_bounds.center(),
+            local_bounds,
             active: false,
+            enabled: true,
             anchor: POINT { x: 0, y: 0 },
             remote_cursor: Point { x: 0.0, y: 0.0 },
             ctrl_down: false,
@@ -388,14 +505,19 @@ mod capture {
             suspend_foreground: None,
             cursor_hidden: false,
             game_guard: GameGuard::default(),
+            raw_absolute_position: None,
+            last_raw_input: None,
+            activation_blocked_until: Instant::now(),
         };
 
         if let Some(existing) = STATE.get() {
-            let mut existing = existing.lock().expect("capture state poisoned");
-            existing.show_source_cursor();
-            *existing = state;
-            install_mouse_hook_if_needed();
-            tracing::info!("Windows input capture hooks reused");
+            {
+                let mut existing = existing.lock().expect("capture state poisoned");
+                existing.show_source_cursor();
+                *existing = state;
+            }
+            restart_input_workers("connection restarted")?;
+            tracing::info!("Windows input workers refreshed for the new connection");
             return Ok(receiver);
         }
 
@@ -403,21 +525,70 @@ mod capture {
             .set(Mutex::new(state))
             .map_err(|_| WindowsInputError::CaptureAlreadyRunning)?;
 
-        thread::Builder::new()
-            .name("edge-kvm-input-hooks".to_string())
-            .spawn(run_hook_thread)
-            .map_err(|err| WindowsInputError::Capture(err.to_string()))?;
+        spawn_raw_input_worker()?;
+        spawn_hook_worker()?;
+        start_input_supervisor()?;
 
         Ok(receiver)
     }
 
+    fn spawn_raw_input_worker() -> Result<()> {
+        let old_thread = RAW_WORKER_THREAD_ID.swap(0, Ordering::AcqRel);
+        if old_thread != 0 {
+            unsafe { PostThreadMessageW(old_thread, WM_QUIT, 0, 0) };
+        }
+
+        let generation = RAW_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        thread::Builder::new()
+            .name(format!("edge-kvm-raw-input-{generation}"))
+            .spawn(move || run_raw_input_thread(generation))
+            .map_err(|err| WindowsInputError::Capture(err.to_string()))?;
+        Ok(())
+    }
+
+    fn run_raw_input_thread(generation: u64) {
+        RAW_WORKER_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        unsafe {
+            let instance = GetModuleHandleW(null_mut());
+            if !install_raw_input_window(instance, generation) {
+                return;
+            }
+
+            tracing::info!(generation, "Windows Raw Input worker started");
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    fn spawn_hook_worker() -> Result<()> {
+        stop_hook_worker();
+        thread::Builder::new()
+            .name("edge-kvm-input-hooks".to_string())
+            .spawn(run_hook_thread)
+            .map_err(|err| WindowsInputError::Capture(err.to_string()))?;
+        Ok(())
+    }
+
+    fn stop_hook_worker() {
+        let old_thread = HOOK_WORKER_THREAD_ID.swap(0, Ordering::AcqRel);
+        if old_thread != 0 {
+            unsafe { PostThreadMessageW(old_thread, WM_QUIT, 0, 0) };
+        }
+        uninstall_mouse_hook();
+        uninstall_keyboard_hook();
+    }
+
     fn run_hook_thread() {
+        HOOK_WORKER_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
         unsafe {
             let instance = GetModuleHandleW(null_mut());
             let mouse_hook = install_mouse_hook(instance);
-            let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0);
+            let keyboard_hook = install_keyboard_hook(instance);
 
-            if mouse_hook == 0 || keyboard_hook.is_null() {
+            if mouse_hook == 0 || keyboard_hook == 0 {
                 tracing::error!("failed to install low-level Windows input hooks");
                 return;
             }
@@ -431,11 +602,340 @@ mod capture {
         }
     }
 
+    unsafe fn install_raw_input_window(instance: *mut std::ffi::c_void, generation: u64) -> bool {
+        let class_name: Vec<u16> = format!("EdgeKvmRawInputWindow{generation}\0")
+            .encode_utf16()
+            .collect();
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(raw_input_window_proc),
+            hInstance: instance,
+            lpszClassName: class_name.as_ptr(),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&window_class) } == 0 {
+            tracing::warn!(
+                error = unsafe { GetLastError() },
+                generation,
+                "failed to register Windows Raw Input window class"
+            );
+            return false;
+        }
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                class_name.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                instance,
+                null_mut(),
+            )
+        };
+        if hwnd.is_null() {
+            tracing::warn!(
+                error = unsafe { GetLastError() },
+                generation,
+                "failed to create Windows Raw Input window"
+            );
+            return false;
+        }
+
+        if !register_raw_input_devices(hwnd) {
+            return false;
+        }
+
+        tracing::info!(generation, "Windows Raw Input registration enabled");
+        true
+    }
+
+    fn register_raw_input_devices(hwnd: HWND) -> bool {
+        let devices = [
+            RAWINPUTDEVICE {
+                usUsagePage: 0x01,
+                usUsage: 0x02,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: 0x01,
+                usUsage: 0x06,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+        ];
+        let registered = unsafe {
+            RegisterRawInputDevices(
+                devices.as_ptr(),
+                devices.len() as u32,
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            )
+        };
+        if registered == 0 {
+            tracing::warn!(
+                error = unsafe { GetLastError() },
+                "failed to register Windows Raw Input devices"
+            );
+            return false;
+        }
+        true
+    }
+
+    unsafe extern "system" fn raw_input_window_proc(
+        hwnd: HWND,
+        message: u32,
+        _wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == WM_INPUT {
+            handle_raw_mouse_input(lparam);
+        }
+        unsafe { DefWindowProcW(hwnd, message, _wparam, lparam) }
+    }
+
+    fn handle_raw_mouse_input(lparam: LPARAM) {
+        let mut input = RAWINPUT::default();
+        let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+        let read = unsafe {
+            GetRawInputData(
+                lparam as _,
+                RID_INPUT,
+                (&mut input as *mut RAWINPUT).cast(),
+                &mut size,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            )
+        };
+        if read == u32::MAX {
+            return;
+        }
+
+        if input.header.dwType == RIM_TYPEKEYBOARD {
+            RAW_KEYBOARD_EVENTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if input.header.dwType != RIM_TYPEMOUSE {
+            return;
+        }
+        RAW_MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
+
+        let mouse = unsafe { input.data.mouse };
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        let Ok(mut state) = state.try_lock() else {
+            CAPTURE_STATS
+                .callback_contention_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        state.last_raw_input = Some(Instant::now());
+        if !state.enabled {
+            return;
+        }
+        if state.active {
+            state.raw_remote_motion(
+                mouse.lLastX,
+                mouse.lLastY,
+                mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0,
+            );
+        } else {
+            state.raw_local_motion(
+                mouse.lLastX,
+                mouse.lLastY,
+                mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0,
+            );
+        }
+    }
+
+    fn start_input_supervisor() -> Result<()> {
+        if INPUT_SUPERVISOR_STARTED.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        thread::Builder::new()
+            .name("edge-kvm-input-supervisor".to_string())
+            .spawn(run_input_supervisor)
+            .map_err(|err| WindowsInputError::Capture(err.to_string()))?;
+        Ok(())
+    }
+
+    fn run_input_supervisor() {
+        let mut previous = InputSupervisorSnapshot::current();
+        let mut fully_stalled_ticks = 0_u8;
+        let mut hook_stalled_ticks = 0_u8;
+        let mut raw_stalled_ticks = 0_u8;
+        let mut last_restart = Instant::now() - INPUT_RESTART_COOLDOWN;
+
+        loop {
+            thread::sleep(INPUT_SUPERVISOR_INTERVAL);
+            CAPTURE_STATS
+                .input_supervisor_checks
+                .fetch_add(1, Ordering::Relaxed);
+            let current = InputSupervisorSnapshot::current();
+            let (enabled, suspended) = capture_enabled_and_suspended();
+            if !enabled {
+                previous = current;
+                fully_stalled_ticks = 0;
+                hook_stalled_ticks = 0;
+                raw_stalled_ticks = 0;
+                continue;
+            }
+
+            let hook_stalled = hook_needs_repair(
+                current.raw_mouse,
+                previous.raw_mouse,
+                current.hook_mouse,
+                previous.hook_mouse,
+                !suspended,
+            ) || hook_needs_repair(
+                current.raw_keyboard,
+                previous.raw_keyboard,
+                current.hook_keyboard,
+                previous.hook_keyboard,
+                true,
+            );
+
+            if full_pipeline_stalled(current, previous) {
+                fully_stalled_ticks = fully_stalled_ticks.saturating_add(1);
+            } else {
+                fully_stalled_ticks = 0;
+            }
+            if hook_stalled {
+                hook_stalled_ticks = hook_stalled_ticks.saturating_add(1);
+            } else {
+                hook_stalled_ticks = 0;
+            }
+            if raw_input_stalled(current, previous) {
+                raw_stalled_ticks = raw_stalled_ticks.saturating_add(1);
+            } else {
+                raw_stalled_ticks = 0;
+            }
+
+            let cooldown_complete = last_restart.elapsed() >= INPUT_RESTART_COOLDOWN;
+            if cooldown_complete && fully_stalled_ticks >= INPUT_STALL_CONFIRMATIONS {
+                tracing::warn!(
+                    system_last_input = ?current.system_last_input,
+                    "Windows reports input but the capture pipeline is stalled; replacing all input workers"
+                );
+                if restart_input_workers("system input advanced without capture events").is_ok() {
+                    CAPTURE_STATS
+                        .input_pipeline_restarts
+                        .fetch_add(1, Ordering::Relaxed);
+                    last_restart = Instant::now();
+                }
+                fully_stalled_ticks = 0;
+                hook_stalled_ticks = 0;
+                raw_stalled_ticks = 0;
+            } else if cooldown_complete && hook_stalled_ticks >= INPUT_STALL_CONFIRMATIONS {
+                tracing::warn!("Raw Input outpaced low-level hooks; replacing the hook worker");
+                if restart_hook_worker().is_ok() {
+                    last_restart = Instant::now();
+                }
+                hook_stalled_ticks = 0;
+            } else if cooldown_complete && raw_stalled_ticks >= INPUT_STALL_CONFIRMATIONS {
+                tracing::warn!(
+                    "low-level hooks outpaced Raw Input; replacing the Raw Input worker"
+                );
+                if restart_raw_input_worker().is_ok() {
+                    last_restart = Instant::now();
+                }
+                raw_stalled_ticks = 0;
+            }
+
+            previous = current;
+        }
+    }
+
+    fn capture_enabled_and_suspended() -> (bool, bool) {
+        STATE
+            .get()
+            .and_then(|state| {
+                state
+                    .try_lock()
+                    .ok()
+                    .map(|state| (state.enabled, state.capture_suspended))
+            })
+            .unwrap_or((false, false))
+    }
+
+    fn restart_input_workers(reason: &str) -> Result<()> {
+        tracing::warn!(reason, "restarting the independent Windows input workers");
+        restart_raw_input_worker()?;
+        restart_hook_worker()?;
+        Ok(())
+    }
+
+    fn restart_raw_input_worker() -> Result<()> {
+        spawn_raw_input_worker()?;
+        CAPTURE_STATS
+            .raw_input_repairs
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn restart_hook_worker() -> Result<()> {
+        spawn_hook_worker()?;
+        CAPTURE_STATS
+            .mouse_hook_repairs
+            .fetch_add(1, Ordering::Relaxed);
+        CAPTURE_STATS
+            .keyboard_hook_repairs
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn system_last_input_tick() -> Option<u32> {
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        (unsafe { GetLastInputInfo(&mut info) } != 0).then_some(info.dwTime)
+    }
+
+    fn hook_needs_repair(
+        raw_events: u64,
+        previous_raw_events: u64,
+        hook_events: u64,
+        previous_hook_events: u64,
+        enabled: bool,
+    ) -> bool {
+        enabled && raw_events > previous_raw_events && hook_events == previous_hook_events
+    }
+
+    fn full_pipeline_stalled(
+        current: InputSupervisorSnapshot,
+        previous: InputSupervisorSnapshot,
+    ) -> bool {
+        current.system_input_advanced(previous)
+            && !current.raw_advanced(previous)
+            && !current.hooks_advanced(previous)
+    }
+
+    fn raw_input_stalled(
+        current: InputSupervisorSnapshot,
+        previous: InputSupervisorSnapshot,
+    ) -> bool {
+        current.hooks_advanced(previous) && !current.raw_advanced(previous)
+    }
+
     unsafe fn install_mouse_hook(instance: *mut std::ffi::c_void) -> isize {
         let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0) };
         let hook_id = hook as isize;
         if hook_id != 0 {
             *MOUSE_HOOK.lock().expect("mouse hook state poisoned") = hook_id;
+        }
+        hook_id
+    }
+
+    unsafe fn install_keyboard_hook(instance: *mut std::ffi::c_void) -> isize {
+        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0) };
+        let hook_id = hook as isize;
+        if hook_id != 0 {
+            *KEYBOARD_HOOK.lock().expect("keyboard hook state poisoned") = hook_id;
         }
         hook_id
     }
@@ -472,6 +972,18 @@ mod capture {
         }
     }
 
+    fn uninstall_keyboard_hook() {
+        let mut keyboard_hook = KEYBOARD_HOOK.lock().expect("keyboard hook state poisoned");
+        let hook = std::mem::take(&mut *keyboard_hook);
+        if hook != 0 {
+            if unsafe { UnhookWindowsHookEx(hook as HHOOK) } == 0 {
+                tracing::warn!("failed to uninstall low-level Windows keyboard hook");
+            } else {
+                tracing::info!("Windows keyboard hook uninstalled");
+            }
+        }
+    }
+
     fn mouse_hook_installed() -> bool {
         *MOUSE_HOOK.lock().expect("mouse hook state poisoned") != 0
     }
@@ -502,8 +1014,34 @@ mod capture {
                 )
             };
         };
-        let mut state = state.lock().expect("capture state poisoned");
+        let Ok(mut state) = state.try_lock() else {
+            CAPTURE_STATS
+                .callback_contention_drops
+                .fetch_add(1, Ordering::Relaxed);
+            if CAPTURE_STATS.active.load(Ordering::Relaxed) {
+                return 1;
+            }
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        };
         let message = wparam as u32;
+
+        if !state.enabled {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
 
         state.refresh_capture_suspension();
         if state.capture_suspended {
@@ -550,7 +1088,16 @@ mod capture {
         }
 
         if !state.active {
-            if message == WM_MOUSEMOVE && state.at_activation_edge(mouse.pt) {
+            if message == WM_MOUSEMOVE && !state.virtual_edge_required() {
+                state.virtual_local_cursor = Point {
+                    x: f64::from(mouse.pt.x),
+                    y: f64::from(mouse.pt.y),
+                };
+            }
+            if message == WM_MOUSEMOVE
+                && state.activation_allowed()
+                && state.at_activation_edge(mouse.pt)
+            {
                 state.enter_remote(mouse.pt);
                 return 1;
             }
@@ -571,7 +1118,9 @@ mod capture {
         match message {
             WM_MOUSEMOVE => {
                 state.keep_source_cursor_hidden();
-                state.remote_motion(mouse.pt);
+                if !state.raw_input_is_recent() {
+                    state.remote_motion(mouse.pt);
+                }
             }
             WM_LBUTTONDOWN => state.send_input(InputEvent::PointerButton {
                 button: MouseButton::Left,
@@ -645,10 +1194,36 @@ mod capture {
                 )
             };
         };
-        let mut state = state.lock().expect("capture state poisoned");
+        let Ok(mut state) = state.try_lock() else {
+            CAPTURE_STATS
+                .callback_contention_drops
+                .fetch_add(1, Ordering::Relaxed);
+            if CAPTURE_STATS.active.load(Ordering::Relaxed) {
+                return 1;
+            }
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        };
         let message = wparam as u32;
         let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let up = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+        if !state.enabled {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
 
         state.refresh_capture_suspension();
         if down || up {
@@ -703,14 +1278,19 @@ mod capture {
         config: CaptureConfig,
         local_bounds: LocalBounds,
         active: bool,
+        enabled: bool,
         anchor: POINT,
         remote_cursor: Point,
+        virtual_local_cursor: Point,
         ctrl_down: bool,
         alt_down: bool,
         capture_suspended: bool,
         suspend_foreground: Option<isize>,
         cursor_hidden: bool,
         game_guard: GameGuard,
+        raw_absolute_position: Option<(i32, i32)>,
+        last_raw_input: Option<Instant>,
+        activation_blocked_until: Instant,
     }
 
     impl CaptureState {
@@ -724,7 +1304,17 @@ mod capture {
         }
 
         fn game_guard_blocks_capture(&mut self) -> bool {
-            self.game_guard.blocks_capture()
+            self.game_guard
+                .blocks_capture(self.config.game_compatibility)
+        }
+
+        fn virtual_edge_required(&mut self) -> bool {
+            self.game_guard
+                .virtual_edge_required(self.config.game_compatibility)
+        }
+
+        fn activation_allowed(&self) -> bool {
+            Instant::now() >= self.activation_blocked_until
         }
 
         fn toggle_capture_suspended(&mut self) {
@@ -785,6 +1375,7 @@ mod capture {
             CAPTURE_STATS.enter_events.fetch_add(1, Ordering::Relaxed);
             self.anchor = self.local_bounds.anchor_for(self.config.edge, point);
             self.remote_cursor = self.remote_start(point);
+            self.raw_absolute_position = None;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
                 normalized_y: self.normalized_perpendicular(point),
@@ -811,6 +1402,94 @@ mod capture {
                 apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
 
             self.send_input(InputEvent::PointerMotion { dx, dy });
+            self.release_if_remote_return_edge();
+        }
+
+        fn raw_remote_motion(&mut self, x: i32, y: i32, absolute: bool) {
+            let (dx, dy) = if absolute {
+                let previous = self.raw_absolute_position.replace((x, y));
+                let Some((previous_x, previous_y)) = previous else {
+                    return;
+                };
+                (x - previous_x, y - previous_y)
+            } else {
+                self.raw_absolute_position = None;
+                (x, y)
+            };
+            if dx == 0 && dy == 0 {
+                return;
+            }
+
+            let dx = f64::from(dx);
+            let dy = f64::from(dy);
+            self.remote_cursor =
+                apply_remote_motion(self.remote_cursor, dx, dy, self.config.remote_size);
+            self.send_input(InputEvent::PointerMotion { dx, dy });
+            self.release_if_remote_return_edge();
+        }
+
+        fn remote_at_return_edge(&self) -> bool {
+            remote_cursor_at_return_edge(
+                self.config.edge,
+                self.remote_cursor,
+                self.config.remote_size,
+            )
+        }
+
+        fn release_if_remote_return_edge(&mut self) {
+            if !self.remote_at_return_edge() {
+                return;
+            }
+            CAPTURE_STATS
+                .return_edge_hits
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(edge = ?self.config.edge, "controller-tracked cursor reached remote return edge");
+            self.release_to_local(ReleaseReason::UserRequest);
+        }
+
+        fn raw_local_motion(&mut self, x: i32, y: i32, absolute: bool) {
+            if !self.virtual_edge_required() {
+                self.raw_absolute_position = None;
+                return;
+            }
+
+            let (dx, dy) = if absolute {
+                let previous = self.raw_absolute_position.replace((x, y));
+                let Some((previous_x, previous_y)) = previous else {
+                    return;
+                };
+                (x - previous_x, y - previous_y)
+            } else {
+                self.raw_absolute_position = None;
+                (x, y)
+            };
+            if dx == 0 && dy == 0 {
+                return;
+            }
+
+            self.virtual_local_cursor.x = clamp(
+                self.virtual_local_cursor.x + f64::from(dx),
+                f64::from(self.local_bounds.left),
+                f64::from(self.local_bounds.right()),
+            );
+            self.virtual_local_cursor.y = clamp(
+                self.virtual_local_cursor.y + f64::from(dy),
+                f64::from(self.local_bounds.top),
+                f64::from(self.local_bounds.bottom()),
+            );
+            let point = POINT {
+                x: self.virtual_local_cursor.x.round() as i32,
+                y: self.virtual_local_cursor.y.round() as i32,
+            };
+            if self.activation_allowed() && self.at_activation_edge(point) {
+                tracing::info!(edge = ?self.config.edge, "game-mode virtual cursor reached activation edge");
+                self.enter_remote(point);
+            }
+        }
+
+        fn raw_input_is_recent(&self) -> bool {
+            self.last_raw_input
+                .is_some_and(|last_input| last_input.elapsed() < Duration::from_millis(250))
         }
 
         fn release_to_local(&mut self, reason: ReleaseReason) {
@@ -818,12 +1497,22 @@ mod capture {
                 return;
             }
             self.active = false;
+            self.raw_absolute_position = None;
+            self.activation_blocked_until = Instant::now() + RELEASE_REENTRY_COOLDOWN;
             CAPTURE_STATS.active.store(false, Ordering::Relaxed);
             CAPTURE_STATS.release_events.fetch_add(1, Ordering::Relaxed);
             self.send_input(InputEvent::AllKeysUp);
             self.send_control(ControlEvent::ReleaseToLocal { reason });
             self.show_source_cursor();
             let restore = self.local_restore();
+            self.virtual_local_cursor = if self.virtual_edge_required() {
+                self.local_bounds.center()
+            } else {
+                Point {
+                    x: f64::from(restore.x),
+                    y: f64::from(restore.y),
+                }
+            };
             unsafe {
                 SetCursorPos(restore.x, restore.y);
             }
@@ -924,11 +1613,30 @@ mod capture {
         }
     }
 
+    fn remote_cursor_at_return_edge(edge: Edge, cursor: Point, remote: Size) -> bool {
+        match edge {
+            Edge::Left => {
+                cursor.x >= f64::from(remote.width.saturating_sub(1)) - REMOTE_RETURN_MARGIN
+            }
+            Edge::Right => cursor.x <= REMOTE_RETURN_MARGIN,
+            Edge::Top => {
+                cursor.y >= f64::from(remote.height.saturating_sub(1)) - REMOTE_RETURN_MARGIN
+            }
+            Edge::Bottom => cursor.y <= REMOTE_RETURN_MARGIN,
+        }
+    }
+
     struct CaptureStats {
         active: AtomicBool,
         suspended: AtomicBool,
         mouse_hook_events: AtomicU64,
         keyboard_hook_events: AtomicU64,
+        raw_input_repairs: AtomicU64,
+        mouse_hook_repairs: AtomicU64,
+        keyboard_hook_repairs: AtomicU64,
+        input_pipeline_restarts: AtomicU64,
+        callback_contention_drops: AtomicU64,
+        input_supervisor_checks: AtomicU64,
         input_events: AtomicU64,
         control_events: AtomicU64,
         enter_events: AtomicU64,
@@ -950,6 +1658,12 @@ mod capture {
                 suspended: AtomicBool::new(false),
                 mouse_hook_events: AtomicU64::new(0),
                 keyboard_hook_events: AtomicU64::new(0),
+                raw_input_repairs: AtomicU64::new(0),
+                mouse_hook_repairs: AtomicU64::new(0),
+                keyboard_hook_repairs: AtomicU64::new(0),
+                input_pipeline_restarts: AtomicU64::new(0),
+                callback_contention_drops: AtomicU64::new(0),
+                input_supervisor_checks: AtomicU64::new(0),
                 input_events: AtomicU64::new(0),
                 control_events: AtomicU64::new(0),
                 enter_events: AtomicU64::new(0),
@@ -972,6 +1686,17 @@ mod capture {
                 mouse_hook_installed: mouse_hook_installed(),
                 mouse_hook_events: self.mouse_hook_events.load(Ordering::Relaxed),
                 keyboard_hook_events: self.keyboard_hook_events.load(Ordering::Relaxed),
+                raw_mouse_events: RAW_MOUSE_EVENTS.load(Ordering::Relaxed),
+                raw_keyboard_events: RAW_KEYBOARD_EVENTS.load(Ordering::Relaxed),
+                raw_input_repairs: self.raw_input_repairs.load(Ordering::Relaxed),
+                mouse_hook_repairs: self.mouse_hook_repairs.load(Ordering::Relaxed),
+                keyboard_hook_repairs: self.keyboard_hook_repairs.load(Ordering::Relaxed),
+                input_pipeline_restarts: self.input_pipeline_restarts.load(Ordering::Relaxed),
+                callback_contention_drops: self.callback_contention_drops.load(Ordering::Relaxed),
+                input_supervisor_checks: self.input_supervisor_checks.load(Ordering::Relaxed),
+                system_last_input_tick: system_last_input_tick().unwrap_or_default(),
+                raw_worker_thread_id: RAW_WORKER_THREAD_ID.load(Ordering::Relaxed),
+                hook_worker_thread_id: HOOK_WORKER_THREAD_ID.load(Ordering::Relaxed),
                 input_events: self.input_events.load(Ordering::Relaxed),
                 control_events: self.control_events.load(Ordering::Relaxed),
                 enter_events: self.enter_events.load(Ordering::Relaxed),
@@ -991,6 +1716,8 @@ mod capture {
     struct GameGuard {
         last_check: Instant,
         blocks_capture: bool,
+        fullscreen: bool,
+        cursor_confined: bool,
     }
 
     impl Default for GameGuard {
@@ -998,19 +1725,153 @@ mod capture {
             Self {
                 last_check: Instant::now() - GAME_GUARD_CHECK_INTERVAL,
                 blocks_capture: false,
+                fullscreen: false,
+                cursor_confined: false,
             }
         }
     }
 
     impl GameGuard {
-        fn blocks_capture(&mut self) -> bool {
+        fn blocks_capture(&mut self, mode: GameCompatibilityMode) -> bool {
+            self.refresh(mode);
+            self.blocks_capture
+        }
+
+        fn virtual_edge_required(&mut self, mode: GameCompatibilityMode) -> bool {
+            self.refresh(mode);
+            mode != GameCompatibilityMode::Compatible && (self.fullscreen || self.cursor_confined)
+        }
+
+        fn refresh(&mut self, mode: GameCompatibilityMode) {
             if self.last_check.elapsed() < GAME_GUARD_CHECK_INTERVAL {
-                return self.blocks_capture;
+                return;
             }
 
             self.last_check = Instant::now();
-            self.blocks_capture = foreground_is_fullscreen() || cursor_is_confined();
-            self.blocks_capture
+            self.fullscreen = foreground_is_fullscreen();
+            self.cursor_confined = cursor_is_confined();
+            self.blocks_capture =
+                game_guard_should_block(mode, self.fullscreen, self.cursor_confined);
+        }
+    }
+
+    fn game_guard_should_block(
+        mode: GameCompatibilityMode,
+        fullscreen: bool,
+        cursor_confined: bool,
+    ) -> bool {
+        match mode {
+            GameCompatibilityMode::Compatible => fullscreen || cursor_confined,
+            GameCompatibilityMode::Borderless => cursor_confined,
+            GameCompatibilityMode::AlwaysEnabled => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            InputSupervisorSnapshot, full_pipeline_stalled, game_guard_should_block,
+            hook_needs_repair, raw_input_stalled, remote_cursor_at_return_edge,
+        };
+        use edge_common::GameCompatibilityMode;
+        use edge_geometry::{Point, Size};
+        use edge_protocol::Edge;
+
+        #[test]
+        fn game_guard_modes_apply_expected_policy() {
+            assert!(game_guard_should_block(
+                GameCompatibilityMode::Compatible,
+                true,
+                false
+            ));
+            assert!(!game_guard_should_block(
+                GameCompatibilityMode::Borderless,
+                true,
+                false
+            ));
+            assert!(game_guard_should_block(
+                GameCompatibilityMode::Borderless,
+                false,
+                true
+            ));
+            assert!(!game_guard_should_block(
+                GameCompatibilityMode::AlwaysEnabled,
+                true,
+                true
+            ));
+        }
+
+        #[test]
+        fn watchdog_only_repairs_when_raw_input_outpaces_a_hook() {
+            assert!(hook_needs_repair(11, 10, 4, 4, true));
+            assert!(!hook_needs_repair(10, 10, 4, 4, true));
+            assert!(!hook_needs_repair(11, 10, 5, 4, true));
+            assert!(!hook_needs_repair(11, 10, 4, 4, false));
+        }
+
+        #[test]
+        fn supervisor_detects_system_input_missing_from_both_workers() {
+            let previous = input_snapshot(10, 20, 30, 40, 100);
+            let stalled = input_snapshot(10, 20, 30, 40, 101);
+            let healthy = input_snapshot(11, 20, 31, 40, 102);
+
+            assert!(full_pipeline_stalled(stalled, previous));
+            assert!(!full_pipeline_stalled(healthy, stalled));
+        }
+
+        #[test]
+        fn supervisor_detects_raw_input_worker_lag() {
+            let previous = input_snapshot(10, 20, 30, 40, 100);
+            let hook_only = input_snapshot(10, 20, 31, 40, 101);
+            let both = input_snapshot(11, 20, 32, 40, 102);
+
+            assert!(raw_input_stalled(hook_only, previous));
+            assert!(!raw_input_stalled(both, hook_only));
+        }
+
+        fn input_snapshot(
+            raw_mouse: u64,
+            raw_keyboard: u64,
+            hook_mouse: u64,
+            hook_keyboard: u64,
+            system_last_input: u32,
+        ) -> InputSupervisorSnapshot {
+            InputSupervisorSnapshot {
+                raw_mouse,
+                raw_keyboard,
+                hook_mouse,
+                hook_keyboard,
+                system_last_input: Some(system_last_input),
+            }
+        }
+
+        #[test]
+        fn controller_validates_the_remote_return_edge() {
+            let size = Size {
+                width: 1920,
+                height: 1080,
+            };
+            assert!(!remote_cursor_at_return_edge(
+                Edge::Left,
+                Point {
+                    x: 1887.0,
+                    y: 500.0
+                },
+                size
+            ));
+            assert!(remote_cursor_at_return_edge(
+                Edge::Left,
+                Point {
+                    x: 1910.0,
+                    y: 500.0
+                },
+                size
+            ));
+            assert!(remote_cursor_at_return_edge(
+                Edge::Right,
+                Point { x: 8.0, y: 500.0 },
+                size
+            ));
         }
     }
 
@@ -1040,6 +1901,13 @@ mod capture {
 
         fn bottom(&self) -> i32 {
             self.top + self.height.saturating_sub(1)
+        }
+
+        fn center(&self) -> Point {
+            Point {
+                x: f64::from(self.left + self.width / 2),
+                y: f64::from(self.top + self.height / 2),
+            }
         }
 
         fn anchor_for(&self, edge: Edge, point: POINT) -> POINT {
@@ -1271,16 +2139,17 @@ mod tray {
         UI::{
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-                NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+                NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+                Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
                 DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING,
-                MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN,
-                TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-                WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
-                WS_OVERLAPPEDWINDOW,
+                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_DISABLED, MF_SEPARATOR,
+                MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+                TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
+                WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
@@ -1374,27 +2243,16 @@ mod tray {
         unsafe {
             match message {
                 WM_TRAY_ICON => {
-                    if lparam as u32 == WM_RBUTTONUP || lparam as u32 == WM_LBUTTONDBLCLK {
+                    let event = tray_notification_event(lparam);
+                    if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK || event == NIN_SELECT {
+                        send_tray_command(WindowsTrayCommand::OpenSettings);
+                    } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                         show_menu(hwnd);
                     }
                     0
                 }
                 WM_COMMAND => {
-                    match wparam & 0xffff {
-                        ID_SETTINGS => {
-                            send_tray_command(WindowsTrayCommand::OpenSettings);
-                        }
-                        ID_RELEASE => {
-                            tracing::info!("release requested from tray");
-                            send_tray_command(WindowsTrayCommand::ReleaseControl);
-                        }
-                        ID_QUIT => {
-                            send_tray_command(WindowsTrayCommand::Quit);
-                            remove_tray_icon(hwnd);
-                            DestroyWindow(hwnd);
-                        }
-                        _ => {}
-                    }
+                    dispatch_menu_command(hwnd, wparam & 0xffff);
                     0
                 }
                 WM_DESTROY => {
@@ -1404,6 +2262,37 @@ mod tray {
                 }
                 _ => DefWindowProcW(hwnd, message, wparam, lparam),
             }
+        }
+    }
+
+    fn tray_notification_event(lparam: LPARAM) -> u32 {
+        (lparam as u32) & 0xffff
+    }
+
+    unsafe fn dispatch_menu_command(hwnd: HWND, command: usize) {
+        match command {
+            ID_SETTINGS => send_tray_command(WindowsTrayCommand::OpenSettings),
+            ID_RELEASE => {
+                tracing::info!("release requested from tray");
+                send_tray_command(WindowsTrayCommand::ReleaseControl);
+            }
+            ID_QUIT => {
+                send_tray_command(WindowsTrayCommand::Quit);
+                remove_tray_icon(hwnd);
+                unsafe { DestroyWindow(hwnd) };
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::tray_notification_event;
+
+        #[test]
+        fn extracts_version_four_notification_from_low_word() {
+            let encoded = ((1_u32 << 16) | 0x0205) as isize;
+            assert_eq!(tray_notification_event(encoded), 0x0205);
         }
     }
 
@@ -1482,7 +2371,7 @@ mod tray {
         let quit = to_wide("Quit");
 
         unsafe {
-            AppendMenuW(menu, MF_STRING, 0, status.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
@@ -1491,15 +2380,18 @@ mod tray {
             let mut point = POINT::default();
             if GetCursorPos(&mut point) != 0 {
                 SetForegroundWindow(hwnd);
-                TrackPopupMenu(
+                let command = TrackPopupMenu(
                     menu,
-                    TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+                    TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
                     point.x,
                     point.y,
                     0,
                     hwnd,
                     null_mut(),
                 );
+                if command != 0 {
+                    dispatch_menu_command(hwnd, command as usize);
+                }
             }
 
             DestroyMenu(menu);

@@ -866,12 +866,15 @@ dependencies = [
  "anyhow",
  "edge-common",
  "eframe",
+ "tracing",
+ "winit",
 ]
 
 [[package]]
 name = "edge-windows-input"
 version = "0.1.0"
 dependencies = [
+ "edge-common",
  "edge-geometry",
  "edge-keymap",
  "edge-protocol",
