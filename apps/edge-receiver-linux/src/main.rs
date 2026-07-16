@@ -367,19 +367,16 @@ async fn run_receiver(
         )
         .await?;
 
-        let screen_info = if let Some(monitor) = config.monitor.as_deref() {
-            match hyprland_screen_info(monitor).await {
-                Ok(info) => {
-                    write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
-                    Some(info)
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "failed to query Hyprland monitor geometry");
-                    None
-                }
+        let requested_monitor = config.monitor.as_deref().unwrap_or_default();
+        let screen_info = match hyprland_screen_info(requested_monitor).await {
+            Ok(info) => {
+                write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
+                Some(info)
             }
-        } else {
-            None
+            Err(err) => {
+                tracing::warn!(%err, "failed to query Hyprland monitor geometry");
+                None
+            }
         };
 
         match handle_controller(

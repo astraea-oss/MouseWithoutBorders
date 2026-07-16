@@ -34,6 +34,11 @@ use tokio::{net::TcpStream, sync::mpsc, time};
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
 #[cfg(windows)]
 const LIVE_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
+#[cfg(windows)]
+const FALLBACK_REMOTE_SIZE: Size = Size {
+    width: 1920,
+    height: 1080,
+};
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -807,10 +812,14 @@ fn start_live_input(
         .laptop
         .as_ref()
         .context("missing [peer.laptop] config")?;
-    let Some(remote_size) = remote_size(screen_info.as_ref()) else {
-        tracing::warn!("receiver did not provide screen info; live edge capture disabled");
-        return Ok(None);
-    };
+    let (remote_size, used_fallback_size) = remote_size(screen_info.as_ref());
+    if used_fallback_size {
+        tracing::warn!(
+            width = remote_size.width,
+            height = remote_size.height,
+            "receiver did not provide usable screen info; enabling live edge capture with fallback geometry"
+        );
+    }
     let capture = edge_windows_input::start_capture(edge_windows_input::CaptureConfig {
         edge: peer_position_to_edge(peer.position),
         remote_size,
@@ -917,17 +926,71 @@ impl PendingMotion {
 }
 
 #[cfg(windows)]
-fn remote_size(screen_info: Option<&ScreenInfo>) -> Option<Size> {
-    let info = screen_info?;
-    let output = info
-        .outputs
-        .iter()
-        .find(|output| output.name == info.primary_output)
-        .or_else(|| info.outputs.first())?;
-    Some(Size {
-        width: output.width,
-        height: output.height,
-    })
+fn remote_size(screen_info: Option<&ScreenInfo>) -> (Size, bool) {
+    let output = screen_info.and_then(|info| {
+        info.outputs
+            .iter()
+            .find(|output| output.name == info.primary_output)
+            .or_else(|| info.outputs.first())
+    });
+    match output {
+        Some(output) if output.width > 0 && output.height > 0 => (
+            Size {
+                width: output.width,
+                height: output.height,
+            },
+            false,
+        ),
+        _ => (FALLBACK_REMOTE_SIZE, true),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use edge_protocol::OutputInfo;
+
+    use super::{FALLBACK_REMOTE_SIZE, ScreenInfo, remote_size};
+
+    #[test]
+    fn missing_screen_info_keeps_capture_enabled_with_fallback_geometry() {
+        assert_eq!(remote_size(None), (FALLBACK_REMOTE_SIZE, true));
+    }
+
+    #[test]
+    fn advertised_primary_output_geometry_is_used() {
+        let info = ScreenInfo {
+            primary_output: "DP-2".to_string(),
+            outputs: vec![
+                OutputInfo {
+                    name: "DP-1".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    scale: 1.0,
+                    x: 0,
+                    y: 0,
+                },
+                OutputInfo {
+                    name: "DP-2".to_string(),
+                    width: 2560,
+                    height: 1440,
+                    scale: 1.0,
+                    x: 1920,
+                    y: 0,
+                },
+            ],
+        };
+
+        assert_eq!(
+            remote_size(Some(&info)),
+            (
+                edge_geometry::Size {
+                    width: 2560,
+                    height: 1440
+                },
+                false
+            )
+        );
+    }
 }
 
 #[cfg(windows)]

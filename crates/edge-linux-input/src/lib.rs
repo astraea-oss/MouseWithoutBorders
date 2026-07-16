@@ -724,6 +724,12 @@ pub async fn hyprland_screen_info(primary: &str) -> Result<ScreenInfo> {
     }
 
     let monitors: Vec<HyprMonitor> = serde_json::from_slice(&output.stdout)?;
+    let primary_output = monitors
+        .iter()
+        .find(|monitor| !primary.is_empty() && monitor.name == primary)
+        .or_else(|| monitors.first())
+        .map(|monitor| monitor.name.clone())
+        .unwrap_or_else(|| primary.to_string());
     let outputs = monitors
         .into_iter()
         .map(|monitor| OutputInfo {
@@ -738,7 +744,7 @@ pub async fn hyprland_screen_info(primary: &str) -> Result<ScreenInfo> {
 
     Ok(ScreenInfo {
         outputs,
-        primary_output: primary.to_string(),
+        primary_output,
     })
 }
 
