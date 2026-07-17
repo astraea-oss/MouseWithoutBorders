@@ -26,6 +26,7 @@ use edge_protocol::{
     PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
+use socket2::SockRef;
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::unix::{SignalKind, signal},
@@ -34,6 +35,7 @@ use tokio::{
 };
 
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const CONTROLLER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const RETURN_EDGE_MARGIN: i32 = 12;
 const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
@@ -324,6 +326,13 @@ async fn run_receiver(
             }
             incoming = listener.accept(), if connection_enabled => incoming?,
         };
+        if let Err(err) = configure_controller_socket(&stream) {
+            tracing::warn!(%err, %addr, "failed to configure controller socket timeout");
+            append_portable_log(
+                &log_path,
+                format!("failed to configure controller socket timeout for {addr}: {err:#}"),
+            );
+        }
         tracing::info!(%addr, "controller connected");
         append_portable_log(&log_path, format!("controller connected: {addr}"));
 
@@ -455,6 +464,12 @@ async fn run_receiver(
     }
     append_portable_log(&log_path, "receiver shutdown complete");
     Ok(())
+}
+
+fn configure_controller_socket(stream: &TcpStream) -> Result<()> {
+    SockRef::from(stream)
+        .set_tcp_user_timeout(Some(CONTROLLER_STALL_TIMEOUT))
+        .context("failed to set TCP_USER_TIMEOUT")
 }
 
 fn install_receiver_panic_log(log_path: PathBuf) {
@@ -1058,5 +1073,28 @@ impl ReceiverBackend {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn controller_socket_uses_bounded_tcp_user_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(address);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let _client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        configure_controller_socket(&server).unwrap();
+
+        assert_eq!(
+            SockRef::from(&server).tcp_user_timeout().unwrap(),
+            Some(CONTROLLER_STALL_TIMEOUT)
+        );
     }
 }

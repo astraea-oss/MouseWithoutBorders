@@ -855,6 +855,7 @@ dependencies = [
  "edge-protocol",
  "edge-ui",
  "ksni",
+ "socket2",
  "tokio",
  "tracing",
 ]

@@ -14,5 +14,6 @@ edge-linux-input = { path = "../../crates/edge-linux-input" }
 edge-protocol = { path = "../../crates/edge-protocol" }
 edge-ui = { path = "../../crates/edge-ui" }
 ksni = "0.3.5"
+socket2 = { version = "0.6.4", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true
