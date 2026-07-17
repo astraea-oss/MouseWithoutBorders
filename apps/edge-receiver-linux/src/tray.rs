@@ -9,6 +9,8 @@ use std::{
 use ksni::TrayMethods;
 use tokio::sync::{Mutex, mpsc};
 
+const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub enum TrayCommand {
     OpenSettings,
@@ -32,12 +34,11 @@ impl ReceiverTrayHandle {
     ) -> Result<(Self, mpsc::UnboundedReceiver<TrayCommand>), ksni::Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let tray = ReceiverTray {
-            state: "Starting".to_string(),
+            state: TrayState::Starting,
             listen,
             backend,
             allow_pairing,
             connected_peer: None,
-            connection_enabled: true,
             connections: 0,
             input_events: 0,
             clipboard_events: 0,
@@ -49,7 +50,7 @@ impl ReceiverTrayHandle {
             Self {
                 handle,
                 input_events: Arc::new(AtomicU64::new(0)),
-                last_input_update: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1))),
+                last_input_update: Arc::new(Mutex::new(Instant::now() - COUNTER_UPDATE_INTERVAL)),
             },
             command_rx,
         ))
@@ -57,8 +58,8 @@ impl ReceiverTrayHandle {
 
     pub async fn listening(&self) {
         self.update(|tray| {
-            tray.state = "Listening".to_string();
-            tray.connection_enabled = true;
+            tray.state = TrayState::Listening;
+            tray.connected_peer = None;
             tray.last_error = None;
         })
         .await;
@@ -67,9 +68,8 @@ impl ReceiverTrayHandle {
     pub async fn connected(&self, peer: String) {
         let input_events = self.input_events.load(Ordering::Relaxed);
         self.update(|tray| {
-            tray.state = "Connected".to_string();
+            tray.state = TrayState::Connected;
             tray.connected_peer = Some(peer);
-            tray.connection_enabled = true;
             tray.connections = tray.connections.saturating_add(1);
             tray.input_events = input_events;
             tray.last_error = None;
@@ -80,7 +80,11 @@ impl ReceiverTrayHandle {
     pub async fn disconnected(&self, error: Option<String>) {
         let input_events = self.input_events.load(Ordering::Relaxed);
         self.update(|tray| {
-            tray.state = "Listening".to_string();
+            tray.state = if error.is_some() {
+                TrayState::Error
+            } else {
+                TrayState::Listening
+            };
             tray.connected_peer = None;
             tray.input_events = input_events;
             tray.last_error = error;
@@ -91,9 +95,8 @@ impl ReceiverTrayHandle {
     pub async fn disconnected_by_user(&self) {
         let input_events = self.input_events.load(Ordering::Relaxed);
         self.update(|tray| {
-            tray.state = "Disconnected".to_string();
+            tray.state = TrayState::Paused;
             tray.connected_peer = None;
-            tray.connection_enabled = false;
             tray.input_events = input_events;
             tray.last_error = None;
         })
@@ -103,17 +106,13 @@ impl ReceiverTrayHandle {
     pub async fn input_event(&self) {
         let total = self.input_events.fetch_add(1, Ordering::Relaxed) + 1;
         let mut last_update = self.last_input_update.lock().await;
-        if last_update.elapsed() < Duration::from_millis(750) {
+        if last_update.elapsed() < COUNTER_UPDATE_INTERVAL {
             return;
         }
         *last_update = Instant::now();
         drop(last_update);
 
-        self.update(move |tray| {
-            tray.input_events = total;
-            tray.last_error = None;
-        })
-        .await;
+        self.update(move |tray| tray.input_events = total).await;
     }
 
     pub async fn clipboard_event(&self) {
@@ -121,13 +120,14 @@ impl ReceiverTrayHandle {
         self.update(|tray| {
             tray.input_events = input_events;
             tray.clipboard_events = tray.clipboard_events.saturating_add(1);
-            tray.last_error = None;
         })
         .await;
     }
 
     pub async fn error(&self, error: String) {
         self.update(|tray| {
+            tray.state = TrayState::Error;
+            tray.connected_peer = None;
             tray.last_error = Some(error);
         })
         .await;
@@ -142,14 +142,34 @@ impl ReceiverTrayHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayState {
+    Starting,
+    Listening,
+    Connected,
+    Paused,
+    Error,
+}
+
+impl TrayState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Listening => "Listening",
+            Self::Connected => "Connected",
+            Self::Paused => "Disconnected",
+            Self::Error => "Error",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReceiverTray {
-    state: String,
+    state: TrayState,
     listen: String,
     backend: String,
     allow_pairing: bool,
     connected_peer: Option<String>,
-    connection_enabled: bool,
     connections: u64,
     input_events: u64,
     clipboard_events: u64,
@@ -167,14 +187,16 @@ impl ksni::Tray for ReceiverTray {
     }
 
     fn title(&self) -> String {
-        format!("edge-kvm receiver: {}", self.state)
+        format!("edge-kvm receiver: {}", self.state.label())
     }
 
     fn status(&self) -> ksni::Status {
-        if self.last_error.is_some() {
-            ksni::Status::NeedsAttention
-        } else {
-            ksni::Status::Active
+        match self.state {
+            TrayState::Error => ksni::Status::NeedsAttention,
+            TrayState::Paused => ksni::Status::Passive,
+            TrayState::Starting | TrayState::Listening | TrayState::Connected => {
+                ksni::Status::Active
+            }
         }
     }
 
@@ -204,7 +226,7 @@ impl ksni::Tray for ReceiverTray {
         use ksni::menu::*;
 
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
-            disabled_item(format!("Status: {}", self.state)),
+            disabled_item(format!("Status: {}", self.state.label())),
             disabled_item(format!("Listen: {}", self.listen)),
             disabled_item(format!("Input backend: {}", self.backend)),
             disabled_item(format!(
@@ -222,39 +244,14 @@ impl ksni::Tray for ReceiverTray {
             disabled_item(format!("Connections: {}", self.connections)),
             disabled_item(format!("Input events: {}", self.input_events)),
             disabled_item(format!("Clipboard events: {}", self.clipboard_events)),
+            disabled_item(format!(
+                "Last error: {}",
+                self.last_error.as_deref().unwrap_or("None")
+            )),
         ];
 
-        if let Some(error) = &self.last_error {
-            items.push(MenuItem::Separator);
-            items.push(disabled_item(format!("Last error: {error}")));
-        }
-
         items.push(MenuItem::Separator);
-        if self.connection_enabled {
-            items.push(
-                StandardItem {
-                    label: "Disconnect".to_string(),
-                    icon_name: "network-offline".to_string(),
-                    activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.command_tx.send(TrayCommand::Disconnect);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else {
-            items.push(
-                StandardItem {
-                    label: "Reconnect".to_string(),
-                    icon_name: "network-connect".to_string(),
-                    activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.command_tx.send(TrayCommand::Reconnect);
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
+        items.push(self.connection_item());
         items.push(
             StandardItem {
                 label: "Settings...".to_string(),
@@ -283,19 +280,51 @@ impl ksni::Tray for ReceiverTray {
 }
 
 impl ReceiverTray {
+    fn connection_item(&self) -> ksni::MenuItem<Self> {
+        use ksni::menu::StandardItem;
+
+        match self.state {
+            TrayState::Connected => StandardItem {
+                label: "Disconnect".to_string(),
+                icon_name: "network-offline".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::Disconnect);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            TrayState::Paused => StandardItem {
+                label: "Reconnect".to_string(),
+                icon_name: "network-connect".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::Reconnect);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            TrayState::Starting | TrayState::Listening | TrayState::Error => StandardItem {
+                label: "Stop listening".to_string(),
+                icon_name: "network-offline".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::Disconnect);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        }
+    }
+
     fn icon_color(&self) -> IconColor {
-        if self.connected_peer.is_some() {
-            IconColor::Connected
-        } else if self.last_error.is_some() || self.state == "Listening" {
-            IconColor::Disconnected
-        } else {
-            IconColor::Connecting
+        match self.state {
+            TrayState::Connected => IconColor::Connected,
+            TrayState::Starting | TrayState::Listening => IconColor::Connecting,
+            TrayState::Paused | TrayState::Error => IconColor::Disconnected,
         }
     }
 
     fn description(&self) -> String {
         let mut lines = vec![
-            format!("Status: {}", self.state),
+            format!("Status: {}", self.state.label()),
             format!("Listen: {}", self.listen),
             format!("Input backend: {}", self.backend),
         ];
@@ -305,9 +334,10 @@ impl ReceiverTray {
         lines.push(format!("Connections: {}", self.connections));
         lines.push(format!("Input events: {}", self.input_events));
         lines.push(format!("Clipboard events: {}", self.clipboard_events));
-        if let Some(error) = &self.last_error {
-            lines.push(format!("Last error: {error}"));
-        }
+        lines.push(format!(
+            "Last error: {}",
+            self.last_error.as_deref().unwrap_or("None")
+        ));
         lines.join("\n")
     }
 }
@@ -390,4 +420,82 @@ fn disabled_item(label: String) -> ksni::MenuItem<ReceiverTray> {
         ..Default::default()
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ksni::Tray as _;
+
+    fn test_tray(state: TrayState, last_error: Option<&str>) -> ReceiverTray {
+        let (command_tx, _) = mpsc::unbounded_channel();
+        ReceiverTray {
+            state,
+            listen: "0.0.0.0:42420".to_string(),
+            backend: "hyprland".to_string(),
+            allow_pairing: true,
+            connected_peer: (state == TrayState::Connected).then(|| "controller".to_string()),
+            connections: 1,
+            input_events: 2,
+            clipboard_events: 3,
+            last_error: last_error.map(str::to_string),
+            command_tx,
+        }
+    }
+
+    fn menu_shape(tray: &ReceiverTray) -> Vec<&'static str> {
+        tray.menu()
+            .iter()
+            .map(|item| match item {
+                ksni::MenuItem::Standard(_) => "item",
+                ksni::MenuItem::Separator => "separator",
+                ksni::MenuItem::Checkmark(_) => "checkmark",
+                ksni::MenuItem::SubMenu(_) => "submenu",
+                ksni::MenuItem::RadioGroup(_) => "radio",
+            })
+            .collect()
+    }
+
+    fn menu_label(tray: &ReceiverTray, index: usize) -> String {
+        match &tray.menu()[index] {
+            ksni::MenuItem::Standard(item) => item.label.clone(),
+            _ => panic!("menu item {index} is not a standard item"),
+        }
+    }
+
+    #[test]
+    fn menu_structure_stays_fixed_across_states_and_errors() {
+        let connected = test_tray(TrayState::Connected, None);
+        let listening = test_tray(TrayState::Listening, None);
+        let paused = test_tray(TrayState::Paused, None);
+        let error = test_tray(TrayState::Error, Some("connection lost"));
+
+        let expected = menu_shape(&connected);
+        assert_eq!(expected.len(), 13);
+        assert_eq!(menu_shape(&listening), expected);
+        assert_eq!(menu_shape(&paused), expected);
+        assert_eq!(menu_shape(&error), expected);
+        assert_eq!(menu_label(&connected, 8), "Last error: None");
+        assert_eq!(menu_label(&error, 8), "Last error: connection lost");
+    }
+
+    #[test]
+    fn connection_action_matches_tray_state() {
+        assert_eq!(
+            menu_label(&test_tray(TrayState::Connected, None), 10),
+            "Disconnect"
+        );
+        assert_eq!(
+            menu_label(&test_tray(TrayState::Paused, None), 10),
+            "Reconnect"
+        );
+        assert_eq!(
+            menu_label(&test_tray(TrayState::Listening, None), 10),
+            "Stop listening"
+        );
+        assert_eq!(
+            menu_label(&test_tray(TrayState::Error, Some("failed")), 10),
+            "Stop listening"
+        );
+    }
 }
