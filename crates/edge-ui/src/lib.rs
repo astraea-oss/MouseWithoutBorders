@@ -268,6 +268,7 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         use eframe::egui::{self, Align, Layout};
 
+        #[cfg(windows)]
         if ui.ctx().input(|input| input.viewport().close_requested()) {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);

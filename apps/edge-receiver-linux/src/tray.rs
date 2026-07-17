@@ -12,6 +12,8 @@ use tokio::sync::{Mutex, mpsc};
 #[derive(Debug)]
 pub enum TrayCommand {
     OpenSettings,
+    Disconnect,
+    Reconnect,
     Quit,
 }
 
@@ -35,6 +37,7 @@ impl ReceiverTrayHandle {
             backend,
             allow_pairing,
             connected_peer: None,
+            connection_enabled: true,
             connections: 0,
             input_events: 0,
             clipboard_events: 0,
@@ -55,6 +58,7 @@ impl ReceiverTrayHandle {
     pub async fn listening(&self) {
         self.update(|tray| {
             tray.state = "Listening".to_string();
+            tray.connection_enabled = true;
             tray.last_error = None;
         })
         .await;
@@ -65,6 +69,7 @@ impl ReceiverTrayHandle {
         self.update(|tray| {
             tray.state = "Connected".to_string();
             tray.connected_peer = Some(peer);
+            tray.connection_enabled = true;
             tray.connections = tray.connections.saturating_add(1);
             tray.input_events = input_events;
             tray.last_error = None;
@@ -79,6 +84,18 @@ impl ReceiverTrayHandle {
             tray.connected_peer = None;
             tray.input_events = input_events;
             tray.last_error = error;
+        })
+        .await;
+    }
+
+    pub async fn disconnected_by_user(&self) {
+        let input_events = self.input_events.load(Ordering::Relaxed);
+        self.update(|tray| {
+            tray.state = "Disconnected".to_string();
+            tray.connected_peer = None;
+            tray.connection_enabled = false;
+            tray.input_events = input_events;
+            tray.last_error = None;
         })
         .await;
     }
@@ -132,6 +149,7 @@ pub struct ReceiverTray {
     backend: String,
     allow_pairing: bool,
     connected_peer: Option<String>,
+    connection_enabled: bool,
     connections: u64,
     input_events: u64,
     clipboard_events: u64,
@@ -140,8 +158,6 @@ pub struct ReceiverTray {
 }
 
 impl ksni::Tray for ReceiverTray {
-    const MENU_ON_ACTIVATE: bool = true;
-
     fn id(&self) -> String {
         "edge-kvm-receiver".to_string()
     }
@@ -180,6 +196,10 @@ impl ksni::Tray for ReceiverTray {
         }
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.command_tx.send(TrayCommand::OpenSettings);
+    }
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
 
@@ -210,6 +230,31 @@ impl ksni::Tray for ReceiverTray {
         }
 
         items.push(MenuItem::Separator);
+        if self.connection_enabled {
+            items.push(
+                StandardItem {
+                    label: "Disconnect".to_string(),
+                    icon_name: "network-offline".to_string(),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.command_tx.send(TrayCommand::Disconnect);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            items.push(
+                StandardItem {
+                    label: "Reconnect".to_string(),
+                    icon_name: "network-connect".to_string(),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.command_tx.send(TrayCommand::Reconnect);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(
             StandardItem {
                 label: "Settings...".to_string(),

@@ -500,7 +500,7 @@ async fn run_connected_inner(
         format!("connected session started: {}", connection.status()),
     );
     let mut input_rx = start_live_input(config, screen_info)?;
-    let mut live_clipboard = LiveClipboardState::default();
+    let mut live_clipboard = LiveClipboardState::new(config)?;
     let mut stats = ControllerInputStats::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
@@ -559,7 +559,11 @@ async fn run_connected_inner(
                 last_receiver_activity = Instant::now();
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
-                    Frame::Clipboard(event) => handle_remote_clipboard_event(event, config, &mut writer).await?,
+                    Frame::Clipboard(event) => {
+                        live_clipboard
+                            .handle_remote_event(event, config, &mut writer)
+                            .await?
+                    }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
                     Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
                         if edge_windows_input::handle_receiver_release(reason) {
@@ -689,9 +693,34 @@ struct LiveClipboardState {
     ctrl_down: bool,
     #[cfg(windows)]
     sequence: u64,
+    #[cfg(windows)]
+    last_observed_text: Option<String>,
 }
 
 impl LiveClipboardState {
+    fn new(config: &AppConfig) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            let last_observed_text = if config.clipboard.enabled {
+                edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
+                    .context("failed to read initial Windows clipboard")?
+            } else {
+                None
+            };
+            return Ok(Self {
+                ctrl_down: false,
+                sequence: 0,
+                last_observed_text,
+            });
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = config;
+            Ok(Self::default())
+        }
+    }
+
     fn frame_before_input(&mut self, frame: &Frame, config: &AppConfig) -> Result<Option<Frame>> {
         #[cfg(windows)]
         {
@@ -706,15 +735,9 @@ impl LiveClipboardState {
                     down: true
                 })
             ) && self.ctrl_down
-                && let Some(text) =
-                    edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
-                        .context("failed to read Windows clipboard")?
+                && let Some(frame) = self.local_clipboard_offer(config)?
             {
-                self.sequence = self.sequence.saturating_add(1);
-                return Ok(Some(Frame::Clipboard(ClipboardEvent::TextOffer {
-                    sequence: self.sequence,
-                    text,
-                })));
+                return Ok(Some(frame));
             }
         }
 
@@ -754,52 +777,101 @@ impl LiveClipboardState {
 
         let _ = (frame, config, clipboard_tx);
     }
-}
 
-async fn handle_remote_clipboard_event(
-    event: ClipboardEvent,
-    config: &AppConfig,
-    writer: &mut NoiseWriter,
-) -> Result<()> {
-    #[cfg(windows)]
-    {
-        if !config.clipboard.enabled {
-            tracing::debug!(
-                ?event,
-                "clipboard event ignored because clipboard sync is disabled"
-            );
-            return Ok(());
-        }
-
-        match event {
-            ClipboardEvent::TextOffer { text, .. } => {
-                edge_windows_input::write_clipboard_text(&text, config.clipboard.max_bytes)
-                    .context("failed to write Windows clipboard")?;
-                tracing::info!("updated Windows clipboard from receiver");
+    async fn handle_remote_event(
+        &mut self,
+        event: ClipboardEvent,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        {
+            if !config.clipboard.enabled {
+                tracing::debug!(
+                    ?event,
+                    "clipboard event ignored because clipboard sync is disabled"
+                );
+                return Ok(());
             }
-            ClipboardEvent::TextRequest => {
-                if let Some(text) =
-                    edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
-                        .context("failed to read Windows clipboard")?
-                {
-                    write_secure_frame_writer(
-                        writer,
-                        &Frame::Clipboard(ClipboardEvent::TextOffer { sequence: 0, text }),
-                    )
-                    .await?;
-                    tracing::info!("sent Windows clipboard to receiver");
+
+            match event {
+                ClipboardEvent::TextOffer { text, .. } => {
+                    if self
+                        .prefer_newer_local_clipboard(&text, config, writer)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    edge_windows_input::write_clipboard_text(&text, config.clipboard.max_bytes)
+                        .context("failed to write Windows clipboard")?;
+                    self.last_observed_text = Some(text);
+                    tracing::info!("updated Windows clipboard from receiver");
+                }
+                ClipboardEvent::TextRequest => {
+                    if let Some(frame) = self.local_clipboard_offer(config)? {
+                        write_secure_frame_writer(writer, &frame).await?;
+                        tracing::info!("sent Windows clipboard to receiver");
+                    }
                 }
             }
         }
+
+        #[cfg(not(windows))]
+        {
+            let _ = (config, writer);
+            tracing::info!(?event, "clipboard event");
+        }
+
+        Ok(())
     }
 
-    #[cfg(not(windows))]
-    {
-        let _ = (config, writer);
-        tracing::info!(?event, "clipboard event");
+    #[cfg(windows)]
+    fn local_clipboard_offer(&mut self, config: &AppConfig) -> Result<Option<Frame>> {
+        let Some(text) = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
+            .context("failed to read Windows clipboard")?
+        else {
+            return Ok(None);
+        };
+        self.last_observed_text = Some(text.clone());
+        self.sequence = self.sequence.saturating_add(1);
+        Ok(Some(Frame::Clipboard(ClipboardEvent::TextOffer {
+            sequence: self.sequence,
+            text,
+        })))
     }
 
-    Ok(())
+    #[cfg(windows)]
+    async fn prefer_newer_local_clipboard(
+        &mut self,
+        remote_text: &str,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+    ) -> Result<bool> {
+        let current = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
+            .context("failed to read Windows clipboard")?;
+        if current.as_deref() == Some(remote_text) {
+            self.last_observed_text = current;
+            return Ok(true);
+        }
+
+        if current.is_some() && current != self.last_observed_text {
+            self.last_observed_text = current.clone();
+            self.sequence = self.sequence.saturating_add(1);
+            let text = current.unwrap_or_default();
+            write_secure_frame_writer(
+                writer,
+                &Frame::Clipboard(ClipboardEvent::TextOffer {
+                    sequence: self.sequence,
+                    text,
+                }),
+            )
+            .await?;
+            tracing::info!("kept newer Windows clipboard and sent it to receiver");
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 #[cfg(windows)]

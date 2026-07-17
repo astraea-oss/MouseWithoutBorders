@@ -3,6 +3,8 @@ use std::{
     future,
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -23,7 +25,7 @@ use edge_protocol::{
     ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo,
     PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
 };
-use edge_ui::{PairingUiState, SettingsUiInput};
+use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::unix::{SignalKind, signal},
@@ -36,6 +38,7 @@ const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const RETURN_EDGE_MARGIN: i32 = 12;
 const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
 const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
+static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
@@ -53,6 +56,8 @@ struct Args {
     test_clipboard: bool,
     #[arg(long, help = "Disable the StatusNotifier tray item")]
     no_tray: bool,
+    #[arg(long, hide = true)]
+    settings: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -118,6 +123,20 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
             "receiver requires role = \"receiver\" in {}",
             config_path.display()
         );
+    }
+
+    if args.settings {
+        let settings_input = SettingsUiInput {
+            role: Role::Receiver,
+            config_path,
+            config,
+            local_ip: detect_primary_local_ip(),
+            pairing: PairingUiState::Idle,
+        };
+        tokio::task::spawn_blocking(move || run_settings_window(settings_input))
+            .await
+            .context("settings window task failed")??;
+        return Ok(());
     }
 
     let backend = ReceiverBackend::from_config(&config)?;
@@ -266,17 +285,32 @@ async fn run_receiver(
         ),
     );
 
+    let mut connection_enabled = true;
     loop {
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
-                        open_receiver_settings(&config_path, &config, &log_path);
+                        open_receiver_settings(&config_path, &log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         tracing::info!("quit requested from tray");
                         append_portable_log(&log_path, "quit requested from tray");
                         break;
+                    }
+                    TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                        connection_enabled = false;
+                        if let Some(tray) = &tray {
+                            tray.disconnected_by_user().await;
+                        }
+                    }
+                    TrayCommandEvent::Command(TrayCommand::Reconnect) => {
+                        connection_enabled = true;
+                        if let Some(tray) = &tray {
+                            tray.listening().await;
+                        }
+                        tracing::info!("reconnect requested from tray");
+                        append_portable_log(&log_path, "reconnect requested from tray");
                     }
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing without tray commands");
@@ -288,7 +322,7 @@ async fn run_receiver(
                 }
                 continue;
             }
-            incoming = listener.accept() => incoming?,
+            incoming = listener.accept(), if connection_enabled => incoming?,
         };
         tracing::info!(%addr, "controller connected");
         append_portable_log(&log_path, format!("controller connected: {addr}"));
@@ -396,6 +430,14 @@ async fn run_receiver(
                 append_portable_log(&log_path, "quit requested from tray");
                 break;
             }
+            Ok(ControllerSessionExit::DisconnectRequested) => {
+                connection_enabled = false;
+                if let Some(tray) = &tray {
+                    tray.disconnected_by_user().await;
+                }
+                tracing::info!("disconnect requested from tray");
+                append_portable_log(&log_path, "disconnect requested from tray");
+            }
             Err(err) => {
                 if let Some(tray) = &tray {
                     tray.disconnected(Some(err.to_string())).await;
@@ -431,23 +473,48 @@ fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     }
 }
 
-fn open_receiver_settings(config_path: &Path, config: &AppConfig, log_path: &Path) {
-    let config = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
-        tracing::warn!(%err, "failed to reload config for settings UI");
-        config.clone()
-    });
+fn open_receiver_settings(config_path: &Path, log_path: &Path) {
+    if SETTINGS_PROCESS_OPEN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     append_portable_log(log_path, "opening settings window");
-    edge_ui::spawn_settings_window(SettingsUiInput {
-        role: Role::Receiver,
-        config_path: config_path.to_path_buf(),
-        config,
-        local_ip: detect_primary_local_ip(),
-        pairing: PairingUiState::Idle,
-    });
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(err) => {
+            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to locate receiver executable for settings window");
+            append_portable_log(
+                log_path,
+                format!("failed to locate receiver executable for settings window: {err}"),
+            );
+            return;
+        }
+    };
+
+    match Command::new(executable)
+        .arg("--settings")
+        .arg("--config")
+        .arg(config_path)
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            });
+        }
+        Err(err) => {
+            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to start settings process");
+            append_portable_log(log_path, format!("failed to start settings process: {err}"));
+        }
+    }
 }
 
 enum ControllerSessionExit {
     QuitRequested,
+    DisconnectRequested,
 }
 
 async fn handle_controller(
@@ -467,6 +534,7 @@ async fn handle_controller(
     let (reader, mut writer) = session.split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
+    let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
 
     loop {
         tokio::select! {
@@ -481,11 +549,24 @@ async fn handle_controller(
             command = recv_tray_command(tray_commands) => {
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
-                        open_receiver_settings(config_path, config, log_path);
+                        open_receiver_settings(config_path, log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         return Ok(ControllerSessionExit::QuitRequested);
                     }
+                    TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                        backend.all_keys_up().await.ok();
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Control(ControlEvent::ReleaseToLocal {
+                                reason: ReleaseReason::UserRequest,
+                            }),
+                        )
+                        .await
+                        .ok();
+                        return Ok(ControllerSessionExit::DisconnectRequested);
+                    }
+                    TrayCommandEvent::Command(TrayCommand::Reconnect) => {}
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing session without tray commands");
                         append_portable_log(
@@ -531,18 +612,20 @@ async fn handle_controller(
                     }
                     Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) => {
                         stats.clipboard = stats.clipboard.saturating_add(1);
-                        write_clipboard_text(&config.clipboard, &text).await?;
+                        clipboard_sync
+                            .handle_text_offer(config, &mut writer, text)
+                            .await?;
                         if let Some(tray) = tray {
                             tray.clipboard_event().await;
                         }
                     }
                     Frame::Clipboard(ClipboardEvent::TextRequest) => {
                         stats.clipboard = stats.clipboard.saturating_add(1);
-                        if let Some(text) = read_clipboard_text(&config.clipboard).await? {
-                            write_secure_frame_writer(
-                                &mut writer,
-                                &Frame::Clipboard(ClipboardEvent::TextOffer { sequence: 0, text }),
-                            ).await?;
+                        if clipboard_sync
+                            .send_local_offer(config, &mut writer)
+                            .await?
+                            .is_some()
+                        {
                             if let Some(tray) = tray {
                                 tray.clipboard_event().await;
                             }
@@ -558,6 +641,94 @@ async fn handle_controller(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ReceiverClipboardState {
+    sequence: u64,
+    last_observed_text: Option<String>,
+}
+
+impl ReceiverClipboardState {
+    async fn new(config: &AppConfig) -> Result<Self> {
+        let last_observed_text = read_clipboard_text(&config.clipboard).await?;
+        Ok(Self {
+            sequence: 0,
+            last_observed_text,
+        })
+    }
+
+    async fn handle_text_offer(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+        remote_text: String,
+    ) -> Result<()> {
+        if self
+            .prefer_newer_local_clipboard(config, writer, &remote_text)
+            .await?
+        {
+            return Ok(());
+        }
+
+        write_clipboard_text(&config.clipboard, &remote_text).await?;
+        self.last_observed_text = Some(remote_text);
+        tracing::info!("updated Linux clipboard from controller");
+        Ok(())
+    }
+
+    async fn send_local_offer(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+    ) -> Result<Option<()>> {
+        let Some(text) = read_clipboard_text(&config.clipboard).await? else {
+            return Ok(None);
+        };
+
+        self.last_observed_text = Some(text.clone());
+        self.sequence = self.sequence.saturating_add(1);
+        write_secure_frame_writer(
+            writer,
+            &Frame::Clipboard(ClipboardEvent::TextOffer {
+                sequence: self.sequence,
+                text,
+            }),
+        )
+        .await?;
+        Ok(Some(()))
+    }
+
+    async fn prefer_newer_local_clipboard(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+        remote_text: &str,
+    ) -> Result<bool> {
+        let current = read_clipboard_text(&config.clipboard).await?;
+        if current.as_deref() == Some(remote_text) {
+            self.last_observed_text = current;
+            return Ok(true);
+        }
+
+        if current.is_some() && current != self.last_observed_text {
+            self.last_observed_text = current.clone();
+            self.sequence = self.sequence.saturating_add(1);
+            let text = current.unwrap_or_default();
+            write_secure_frame_writer(
+                writer,
+                &Frame::Clipboard(ClipboardEvent::TextOffer {
+                    sequence: self.sequence,
+                    text,
+                }),
+            )
+            .await?;
+            tracing::info!("kept newer Linux clipboard and sent it to controller");
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }
 
