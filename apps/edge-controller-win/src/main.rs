@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 #[cfg(windows)]
 use edge_common::PeerPosition;
-use edge_common::{
-    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
-};
+#[cfg(windows)]
+use edge_common::detect_primary_local_ip;
+use edge_common::{AppConfig, Role, default_state_dir, init_tracing, portable_config_path};
 use edge_crypto::{IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session};
 #[cfg(windows)]
 use edge_geometry::Size;
@@ -25,8 +25,9 @@ use edge_geometry::Size;
 use edge_protocol::Edge;
 use edge_protocol::{
     ClipboardEvent, ControlEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION,
-    ScreenInfo, decode_frame, encode_frame,
+    ReleaseReason, ScreenInfo, decode_frame, encode_frame,
 };
+#[cfg(windows)]
 use edge_ui::{PairingUiState, SettingsUiInput};
 use tokio::{net::TcpStream, sync::mpsc, time};
 
@@ -304,6 +305,16 @@ fn handle_pending_windows_tray_commands(
     Ok(false)
 }
 
+#[cfg(not(windows))]
+fn handle_pending_windows_tray_commands(
+    _commands: &mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>,
+    _config_path: &Path,
+    _config: &AppConfig,
+    _log_path: &Path,
+) -> Result<bool> {
+    Ok(false)
+}
+
 #[cfg(windows)]
 fn controller_pairing_state(config: &AppConfig) -> PairingUiState {
     if let Some(peer) = &config.peer.laptop
@@ -380,6 +391,13 @@ async fn read_initial_frames(session: &mut NoiseSession<TcpStream>) -> Result<Op
     loop {
         match read_secure_frame(session).await {
             Ok(Frame::Hello(hello)) => {
+                if hello.protocol_version != PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "protocol version mismatch: controller={}, receiver={}",
+                        PROTOCOL_VERSION,
+                        hello.protocol_version
+                    );
+                }
                 tracing::info!(
                     device = %hello.device_name,
                     fingerprint = %hello.public_key_fingerprint,
@@ -567,6 +585,9 @@ async fn run_connected_inner(
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
                     Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
                         if edge_windows_input::handle_receiver_release(reason) {
+                            if reason == ReleaseReason::LocalInput {
+                                stats.local_input_releases = stats.local_input_releases.saturating_add(1);
+                            }
                             tracing::info!(?reason, "accepted receiver-requested local release");
                             append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
                         } else {
@@ -592,6 +613,7 @@ struct ControllerInputStats {
     keys: u64,
     clipboard: u64,
     control: u64,
+    local_input_releases: u64,
 }
 
 impl ControllerInputStats {
@@ -628,7 +650,7 @@ impl ControllerInputStats {
         append_portable_log(
             path,
             format!(
-                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} capture_active={} capture_suspended={} capture_mouse_hook_installed={} hook_mouse={} hook_keyboard={} raw_mouse={} raw_keyboard={} raw_input_repairs={} mouse_hook_repairs={} keyboard_hook_repairs={} input_pipeline_restarts={} callback_contention_drops={} input_supervisor_checks={} system_last_input_tick={} raw_worker_thread_id={} hook_worker_thread_id={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_game_guard_blocks={} capture_game_guard_releases={} capture_suspend_toggles={} capture_suspend_blocks={} capture_suspend_auto_resumes={} capture_send_failures={} capture_unmapped_keys={}",
+                "{side} status frames={} motion={} buttons={} wheel={} keys={} clipboard={} control={} local_input_releases={} capture_active={} capture_suspended={} capture_mouse_hook_installed={} hook_mouse={} hook_keyboard={} raw_mouse={} raw_keyboard={} raw_input_repairs={} mouse_hook_repairs={} keyboard_hook_repairs={} input_pipeline_restarts={} callback_contention_drops={} input_supervisor_checks={} system_last_input_tick={} raw_worker_thread_id={} hook_worker_thread_id={} capture_input={} capture_control={} capture_enters={} capture_releases={} capture_return_edge_hits={} capture_game_guard_blocks={} capture_game_guard_releases={} capture_suspend_toggles={} capture_suspend_blocks={} capture_suspend_auto_resumes={} capture_send_failures={} capture_unmapped_keys={}",
                 self.frames,
                 self.motion,
                 self.buttons,
@@ -636,6 +658,7 @@ impl ControllerInputStats {
                 self.keys,
                 self.clipboard,
                 self.control,
+                self.local_input_releases,
                 capture.active,
                 capture.suspended,
                 capture.mouse_hook_installed,

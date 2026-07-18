@@ -37,6 +37,18 @@ cd ./portable-linux
 ./edge-receiver-linux --pair
 ```
 
+For local mouse or touchpad activity to restore the cursor during remote control, install the
+pointer-only udev access rule once, then reload the rules:
+
+```bash
+sudo install -m 0644 packaging/udev/72-edge-kvm-pointer.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=input
+```
+
+The rule grants the active desktop user access only to mouse and touchpad event devices. It does
+not grant access to keyboards and does not require membership in the `input` group.
+
 On first run it creates:
 
 ```text

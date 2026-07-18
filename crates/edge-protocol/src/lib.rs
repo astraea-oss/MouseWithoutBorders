@@ -2,7 +2,7 @@ use edge_common::Role;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_PORT: u16 = 42_420;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 
@@ -102,6 +102,7 @@ pub enum ReleaseReason {
     BackendFailure,
     UserRequest,
     Shutdown,
+    LocalInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,5 +167,14 @@ mod tests {
         let decoded = decode_frame(&encoded).unwrap();
 
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn local_input_release_round_trip() {
+        let frame = Frame::Control(ControlEvent::ReleaseToLocal {
+            reason: ReleaseReason::LocalInput,
+        });
+
+        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
     }
 }

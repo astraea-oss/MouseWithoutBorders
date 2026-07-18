@@ -59,20 +59,21 @@ Commands must use `tokio::process::Command` arguments directly, without shell in
 Add a Linux-only monitor that observes physical pointer devices without grabbing them:
 
 - discover only udev devices tagged `ID_INPUT_MOUSE=1` or `ID_INPUT_TOUCHPAD=1`;
-- obtain read-only device file descriptors for the active session through systemd-logind
-  `TakeDevice`, avoiding membership in the security-sensitive `input` group;
+- obtain read-only device file descriptors through an installed udev `uaccess` rule that matches
+  only mouse and touchpad event devices, avoiding membership in the security-sensitive `input`
+  group and avoiding logind session-controller conflicts with the compositor;
 - monitor mouse relative motion, pointer buttons, and wheel events;
 - monitor touchpad contact and meaningful absolute movement;
 - ignore keyboards and all unclassified devices;
-- handle device hotplug and logind pause/resume events;
+- handle device hotplug and loss of device access;
 - debounce touchpad noise and coalesce activity into a bounded Tokio channel.
 
 The WLR virtual pointer used by edge-kvm is not an evdev device and therefore cannot trigger this
 monitor. Device identity must still be asserted in tests so a future backend cannot accidentally
 wake itself.
 
-If logind access is unavailable, an optional explicitly configured evdev provider may be added
-later. The receiver must not recommend granting broad `/dev/input` keyboard access.
+The receiver must not recommend granting broad `/dev/input` keyboard access. If the pointer-only
+udev rule is not installed or active, initialization fails visibly and the cursor remains visible.
 
 ### `LinuxCursorHandoff`
 
@@ -116,7 +117,7 @@ dynamic rows to the right-click menu.
 ## Implementation sequence
 
 1. Add `LinuxCursorController` with parser, command-runner, idempotency, and restoration tests.
-2. Add physical-device discovery and logind-backed pointer activity monitoring.
+2. Add physical-device discovery and pointer-only udev-backed activity monitoring.
 3. Add the handoff state machine with a fake cursor controller and synthetic activity tests.
 4. Integrate `EnterRemote`, release, disconnect, and shutdown paths in the Linux receiver.
 5. Add `ReleaseReason::LocalInput`, bump the protocol version, and update Windows acceptance/logging.
@@ -135,7 +136,7 @@ changes into one untestable change.
 - remote virtual-pointer events do not count as local activity;
 - disconnect/error/shutdown restore the original cursor setting;
 - an originally hidden cursor remains hidden after the session;
-- device hotplug and logind pause/resume do not strand the cursor;
+- device hotplug and loss of device access do not strand the cursor;
 - touchpad noise below threshold does not trigger a handoff;
 - protocol round trips include `LocalInput` and reject mismatched protocol versions cleanly;
 - existing edge-return and manual release behavior remains unchanged.
