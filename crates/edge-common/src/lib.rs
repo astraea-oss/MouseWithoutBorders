@@ -96,6 +96,27 @@ pub struct InputConfig {
     pub backend: String,
     #[serde(default)]
     pub game_compatibility: GameCompatibilityMode,
+    #[serde(default)]
+    pub local_cursor_handoff: LocalCursorHandoffConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalCursorHandoffConfig {
+    pub enabled: bool,
+    pub hide_delay_ms: u64,
+    pub wake_on_mouse: bool,
+    pub wake_on_touchpad: bool,
+}
+
+impl Default for LocalCursorHandoffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hide_delay_ms: 100,
+            wake_on_mouse: true,
+            wake_on_touchpad: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +133,7 @@ impl Default for InputConfig {
         Self {
             backend: "auto".to_string(),
             game_compatibility: GameCompatibilityMode::default(),
+            local_cursor_handoff: LocalCursorHandoffConfig::default(),
         }
     }
 }

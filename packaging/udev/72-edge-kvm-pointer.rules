@@ -1,0 +1,4 @@
+# Give the active desktop user read access to pointer events only.
+# Keyboard-classified event devices are intentionally excluded.
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"

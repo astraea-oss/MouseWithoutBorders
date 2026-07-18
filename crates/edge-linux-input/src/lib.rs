@@ -7,6 +7,10 @@ use std::sync::Mutex;
 use tokio::{io::AsyncWriteExt, process::Command};
 
 #[cfg(target_os = "linux")]
+mod cursor;
+#[cfg(target_os = "linux")]
+mod local_pointer;
+#[cfg(target_os = "linux")]
 mod wayland_virtual_input;
 
 pub const LIBEI_PKG_CONFIG: &str = "libei-1.0";
@@ -40,10 +44,16 @@ pub enum LinuxInputError {
     Json(#[from] serde_json::Error),
     #[error("clipboard text exceeds configured max_bytes ({max_bytes})")]
     ClipboardTooLarge { max_bytes: usize },
+    #[error("local pointer monitor failed: {0}")]
+    LocalPointerMonitor(String),
 }
 
 pub type Result<T> = std::result::Result<T, LinuxInputError>;
 
+#[cfg(target_os = "linux")]
+pub use cursor::HyprlandCursorController;
+#[cfg(target_os = "linux")]
+pub use local_pointer::{LocalPointerActivity, LocalPointerActivityMonitor, LocalPointerKind};
 #[cfg(target_os = "linux")]
 pub use wayland_virtual_input::HyprlandVirtualInputBackend;
 

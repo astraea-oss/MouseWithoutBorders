@@ -35,3 +35,4 @@ tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "pro
 toml = "0.9.8"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+udev = "0.9.3"

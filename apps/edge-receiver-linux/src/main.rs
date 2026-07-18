@@ -18,7 +18,8 @@ use edge_crypto::{
     accept_noise_session,
 };
 use edge_linux_input::{
-    HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend, hyprland_cursor_position,
+    HyprCursorPosition, HyprlandCursorController, HyprlandVirtualInputBackend, LibeiBackend,
+    LocalPointerActivity, LocalPointerActivityMonitor, hyprland_cursor_position,
     hyprland_screen_info, read_clipboard_text, write_clipboard_text,
 };
 use edge_protocol::{
@@ -42,7 +43,9 @@ const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
 const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
+mod cursor_handoff;
 mod tray;
+use cursor_handoff::CursorHandoffState;
 use tray::{ReceiverTrayHandle, TrayCommand};
 
 #[derive(Debug, Parser)]
@@ -364,6 +367,25 @@ async fn run_receiver(
             }
         };
 
+        if hello.protocol_version != PROTOCOL_VERSION {
+            let message = format!(
+                "protocol version mismatch: controller={}, receiver={PROTOCOL_VERSION}",
+                hello.protocol_version
+            );
+            write_secure_frame(
+                &mut session,
+                &Frame::Error(RemoteError {
+                    code: "protocol_version_mismatch".to_string(),
+                    message: message.clone(),
+                }),
+            )
+            .await
+            .ok();
+            tracing::warn!(%message, "rejected controller");
+            append_portable_log(&log_path, &message);
+            continue;
+        }
+
         match pins.verify_or_pin(
             hello.device_name.clone(),
             peer_fingerprint.clone(),
@@ -532,6 +554,7 @@ enum ControllerSessionExit {
     DisconnectRequested,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
     config: &AppConfig,
@@ -550,8 +573,46 @@ async fn handle_controller(
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
     let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
+    let handoff_config = &config.input.local_cursor_handoff;
+    let (mut cursor_controller, mut pointer_monitor, mut handoff_state) = if handoff_config.enabled
+    {
+        let (cursor, monitor) = tokio::join!(
+            HyprlandCursorController::connect(),
+            LocalPointerActivityMonitor::connect(
+                handoff_config.wake_on_mouse,
+                handoff_config.wake_on_touchpad,
+            )
+        );
+        match (cursor, monitor) {
+            (Ok(cursor), Ok(monitor)) => {
+                tracing::info!("local cursor handoff ready");
+                append_portable_log(log_path, "local cursor handoff ready");
+                (Some(cursor), Some(monitor), CursorHandoffState::ready())
+            }
+            (cursor, monitor) => {
+                let cursor_error = cursor.err().map(|err| err.to_string());
+                let monitor_error = monitor.err().map(|err| err.to_string());
+                tracing::warn!(
+                    ?cursor_error,
+                    ?monitor_error,
+                    "local cursor handoff disabled"
+                );
+                append_portable_log(
+                    log_path,
+                    format!(
+                        "local cursor handoff disabled: cursor={cursor_error:?} monitor={monitor_error:?}"
+                    ),
+                );
+                (None, None, CursorHandoffState::Disabled)
+            }
+        }
+    } else {
+        (None, None, CursorHandoffState::Disabled)
+    };
+    let hide_delay = Duration::from_millis(handoff_config.hide_delay_ms);
 
     loop {
+        let hide_at = handoff_state.hide_at();
         tokio::select! {
             _ = heartbeat.tick() => {
                 heartbeat_sequence += 1;
@@ -560,6 +621,56 @@ async fn handle_controller(
             }
             _ = status_log.tick() => {
                 stats.log(log_path, "receiver");
+            }
+            _ = wait_for_cursor_hide(hide_at), if hide_at.is_some() => {
+                if handoff_state.mark_hidden_if_due(Instant::now()) {
+                    let hide_result = if let Some(cursor) = &mut cursor_controller {
+                        cursor.hide().await
+                    } else {
+                        continue;
+                    };
+                    if let Err(err) = hide_result {
+                        tracing::warn!(%err, "failed to hide Linux cursor; disabling handoff");
+                        append_portable_log(log_path, format!("failed to hide Linux cursor: {err}"));
+                        handoff_state.disable();
+                        if let Some(cursor) = &mut cursor_controller {
+                            cursor.restore().await.ok();
+                        }
+                        pointer_monitor = None;
+                    } else {
+                        tracing::info!("Linux cursor hidden for remote control");
+                    }
+                }
+            }
+            activity = recv_local_pointer_activity(&mut pointer_monitor), if pointer_monitor.is_some() => {
+                let Some(activity) = activity else {
+                    let restore = handoff_state.disable();
+                    if restore && let Some(cursor) = &mut cursor_controller {
+                        cursor.show().await.ok();
+                    }
+                    pointer_monitor = None;
+                    tracing::warn!("local pointer monitor stopped; cursor handoff disabled");
+                    continue;
+                };
+                if handoff_state.local_activity() {
+                    if let Some(cursor) = &mut cursor_controller
+                        && let Err(err) = cursor.show().await
+                    {
+                        tracing::warn!(%err, "failed to restore Linux cursor after local input");
+                    }
+                    backend.all_keys_up().await.ok();
+                    let control = ControlEvent::ReleaseToLocal {
+                        reason: ReleaseReason::LocalInput,
+                    };
+                    return_watcher.record_control(&control);
+                    write_secure_frame_writer(&mut writer, &Frame::Control(control)).await?;
+                    stats.local_input_releases = stats.local_input_releases.saturating_add(1);
+                    tracing::info!(kind = ?activity.kind, "physical Linux input restored local control");
+                    append_portable_log(
+                        log_path,
+                        format!("physical Linux {:?} restored local control", activity.kind),
+                    );
+                }
             }
             command = recv_tray_command(tray_commands) => {
                 match command {
@@ -602,6 +713,10 @@ async fn handle_controller(
                         }
                     }
                     Frame::Input(event) => {
+                        if handoff_state.enabled() && !handoff_state.remote_active() {
+                            stats.ignored_remote_input = stats.ignored_remote_input.saturating_add(1);
+                            continue;
+                        }
                         stats.record_input(&event);
                         let is_motion = matches!(event, InputEvent::PointerMotion { .. });
                         backend.inject(event).await?;
@@ -640,15 +755,27 @@ async fn handle_controller(
                             .send_local_offer(config, &mut writer)
                             .await?
                             .is_some()
+                            && let Some(tray) = tray
                         {
-                            if let Some(tray) = tray {
-                                tray.clipboard_event().await;
-                            }
+                            tray.clipboard_event().await;
                         }
                     }
                     Frame::Heartbeat(_) => {}
                     Frame::Control(control) => {
                         stats.control = stats.control.saturating_add(1);
+                        match &control {
+                            ControlEvent::EnterRemote { .. } => {
+                                handoff_state.enter_remote(Instant::now(), hide_delay);
+                            }
+                            ControlEvent::ReleaseToLocal { .. } | ControlEvent::LeaveRemote { .. } => {
+                                if handoff_state.release_remote()
+                                    && let Some(cursor) = &mut cursor_controller
+                                    && let Err(err) = cursor.show().await
+                                {
+                                    tracing::warn!(%err, "failed to restore Linux cursor on remote release");
+                                }
+                            }
+                        }
                         return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
                     }
@@ -656,6 +783,22 @@ async fn handle_controller(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_cursor_hide(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(time::Instant::from_std(deadline)).await,
+        None => future::pending().await,
+    }
+}
+
+async fn recv_local_pointer_activity(
+    monitor: &mut Option<LocalPointerActivityMonitor>,
+) -> Option<LocalPointerActivity> {
+    match monitor {
+        Some(monitor) => monitor.recv().await,
+        None => future::pending().await,
     }
 }
 
@@ -757,6 +900,8 @@ struct ReceiverInputStats {
     clipboard: u64,
     control: u64,
     return_releases: u64,
+    local_input_releases: u64,
+    ignored_remote_input: u64,
     heartbeats: u64,
 }
 
@@ -785,7 +930,7 @@ impl ReceiverInputStats {
         append_portable_log(
             path,
             format!(
-                "{side} status motion={} buttons={} wheel={} keys={} all_keys_up={} clipboard={} control={} return_releases={} heartbeats={}",
+                "{side} status motion={} buttons={} wheel={} keys={} all_keys_up={} clipboard={} control={} return_releases={} local_input_releases={} ignored_remote_input={} heartbeats={}",
                 self.motion,
                 self.buttons,
                 self.wheel,
@@ -794,6 +939,8 @@ impl ReceiverInputStats {
                 self.clipboard,
                 self.control,
                 self.return_releases,
+                self.local_input_releases,
+                self.ignored_remote_input,
                 self.heartbeats
             ),
         );

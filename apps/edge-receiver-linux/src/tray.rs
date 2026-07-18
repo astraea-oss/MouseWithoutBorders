@@ -214,7 +214,6 @@ impl ksni::Tray for ReceiverTray {
             icon_pixmap: self.icon_pixmap(),
             title: "edge-kvm receiver".to_string(),
             description: self.description(),
-            ..Default::default()
         }
     }
 

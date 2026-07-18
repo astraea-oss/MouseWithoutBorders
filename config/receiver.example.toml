@@ -6,6 +6,12 @@ monitor = "eDP-1"
 [input]
 backend = "auto"
 
+[input.local_cursor_handoff]
+enabled = true
+hide_delay_ms = 100
+wake_on_mouse = true
+wake_on_touchpad = true
+
 [clipboard]
 enabled = true
 text_only = true
