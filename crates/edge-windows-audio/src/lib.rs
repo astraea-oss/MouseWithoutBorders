@@ -410,7 +410,10 @@ mod implementation {
                 let mut concealer = PcmConcealer::default();
                 let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
                 let mut playback = time::interval(Duration::from_millis(FRAME_MS as u64));
-                playback.set_missed_tick_behavior(time::MissedTickBehavior::Burst);
+                // Catching up missed wall-clock ticks would advance the jitter
+                // sequence ahead of the live sender. Skip missed ticks and let
+                // the bounded output queue's clock correction absorb drift.
+                playback.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 let mut media_watchdog = time::interval(Duration::from_millis(500));
                 let mut output_watchdog = time::interval(Duration::from_secs(1));
                 let mut probe_retry = time::interval(Duration::from_millis(250));
