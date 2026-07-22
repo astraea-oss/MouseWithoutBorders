@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use edge_audio::{PacketCipher, SessionSecrets};
+use edge_audio::SessionSecrets;
 use edge_common::{
     AppConfig, AudioLocalPlayback, Role, default_state_dir, detect_primary_local_ip, init_tracing,
     portable_config_path,
@@ -751,6 +751,7 @@ async fn handle_controller(
                         tracing::info!(?control, "control event");
                     }
                     Frame::Audio(AudioControl::Start {
+                        udp_port,
                         session_id,
                         session_salt,
                         session_key,
@@ -759,7 +760,8 @@ async fn handle_controller(
                         jitter_target_ms: _,
                     }) => {
                         append_portable_log(log_path, "received Windows audio start request");
-                        if codec != AudioCodec::PcmS16Stereo48Khz
+                        if udp_port == 0
+                            || codec != AudioCodec::PcmS16Stereo48Khz
                             || frame_ms != edge_audio::FRAME_MS
                         {
                             write_secure_frame_writer(
@@ -780,76 +782,50 @@ async fn handle_controller(
                             session_salt,
                             session_key,
                         };
-                        let cipher = PacketCipher::new(&secrets);
+                        let destination = std::net::SocketAddr::new(controller_ip, udp_port);
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::Audio(AudioControl::State {
-                                state: AudioStreamState::WaitingForUdp,
+                                state: AudioStreamState::Starting,
                                 detail: None,
                             }),
                         )
                         .await?;
-                        match time::timeout(
-                            Duration::from_secs(3),
-                            edge_linux_audio::wait_for_probe(
-                                &audio_socket,
-                                &cipher,
-                                controller_ip,
-                            ),
+                        append_portable_log(
+                            log_path,
+                            format!("starting Linux audio outbound to {destination}"),
+                        );
+                        let redirect = config.audio.local_playback
+                            == AudioLocalPlayback::Redirect;
+                        match edge_linux_audio::LinuxAudioSender::start(
+                            audio_socket.clone(),
+                            destination,
+                            secrets,
+                            &default_state_dir(),
+                            redirect,
                         )
                         .await
                         {
-                            Ok(Ok(destination)) => {
-                                let redirect = config.audio.local_playback
-                                    == AudioLocalPlayback::Redirect;
-                                match edge_linux_audio::LinuxAudioSender::start(
-                                    audio_socket.clone(),
-                                    destination,
-                                    secrets,
-                                    &default_state_dir(),
-                                    redirect,
+                            Ok(sender) => {
+                                audio_sender = Some(sender);
+                                append_portable_log(log_path, "Linux audio capture is streaming");
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Streaming,
+                                        detail: None,
+                                    }),
                                 )
-                                .await
-                                {
-                                    Ok(sender) => {
-                                        audio_sender = Some(sender);
-                                        append_portable_log(log_path, "Linux audio capture is streaming");
-                                        write_secure_frame_writer(
-                                            &mut writer,
-                                            &Frame::Audio(AudioControl::State {
-                                                state: AudioStreamState::Streaming,
-                                                detail: None,
-                                            }),
-                                        )
-                                        .await?;
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, "failed to start Linux audio capture");
-                                        append_portable_log(log_path, format!("failed to start Linux audio capture: {error:#}"));
-                                        write_secure_frame_writer(
-                                            &mut writer,
-                                            &Frame::Audio(AudioControl::State {
-                                                state: AudioStreamState::Error,
-                                                detail: Some(error.to_string()),
-                                            }),
-                                        )
-                                        .await?;
-                                    }
-                                }
+                                .await?;
                             }
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "invalid Windows audio UDP probe");
-                            }
-                            Err(_) => {
-                                append_portable_log(log_path, "timed out waiting for Windows audio UDP probe");
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to start Linux audio capture");
+                                append_portable_log(log_path, format!("failed to start Linux audio capture: {error:#}"));
                                 write_secure_frame_writer(
                                     &mut writer,
                                     &Frame::Audio(AudioControl::State {
                                         state: AudioStreamState::Error,
-                                        detail: Some(
-                                            "timed out waiting for Windows audio UDP probe"
-                                                .to_string(),
-                                        ),
+                                        detail: Some(error.to_string()),
                                     }),
                                 )
                                 .await?;

@@ -1,5 +1,4 @@
 use std::{
-    net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -7,8 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, FLAG_PROBE, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL,
-    SAMPLES_PER_FRAME, SessionSecrets,
+    AudioPacket, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -183,26 +181,6 @@ async fn pactl(arguments: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-pub async fn wait_for_probe(
-    socket: &UdpSocket,
-    cipher: &PacketCipher,
-    expected_ip: IpAddr,
-) -> Result<std::net::SocketAddr> {
-    let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
-    loop {
-        let (length, source) = socket.recv_from(&mut buffer).await?;
-        if source.ip() != expected_ip {
-            continue;
-        }
-        if let Ok(packet) = cipher.open(&buffer[..length])
-            && packet.flags & FLAG_PROBE != 0
-            && packet.payload.is_empty()
-        {
-            return Ok(source);
-        }
-    }
 }
 
 pub struct LinuxAudioSender {

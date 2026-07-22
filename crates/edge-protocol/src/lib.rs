@@ -78,6 +78,7 @@ pub enum AudioControl {
         codecs: Vec<AudioCodec>,
     },
     Start {
+        udp_port: u16,
         session_id: [u8; 16],
         session_salt: [u8; 4],
         session_key: [u8; 32],
@@ -229,6 +230,7 @@ mod tests {
     #[test]
     fn audio_control_round_trip() {
         let frame = Frame::Audio(AudioControl::Start {
+            udp_port: 42_421,
             session_id: [7; 16],
             session_salt: [8; 4],
             session_key: [9; 32],

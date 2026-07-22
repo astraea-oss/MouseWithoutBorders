@@ -106,12 +106,12 @@ Compatibility rules:
 
 ### Establishment
 
-1. Linux binds UDP on the configured TCP port number, falling back to an ephemeral port if necessary, and advertises the actual port in an encrypted `Offer`.
+1. Linux binds an ephemeral UDP socket and advertises its source port in an encrypted `Offer`.
 2. Windows binds an ephemeral UDP socket and generates a fresh session ID, session salt, and 256-bit session key.
-3. Windows transfers that material in an encrypted `Start` control message.
-4. Windows sends an authenticated UDP probe to the Linux endpoint.
-5. Linux accepts the probe only if its source IP matches the paired TCP peer, its session ID is current, and authentication succeeds.
-6. Linux locks the media destination to the probe source address and starts capture.
+3. Windows transfers that material and its UDP receive port in an encrypted `Start` control message.
+4. Windows sends an authenticated best-effort probe to the Linux endpoint to establish its outbound UDP flow.
+5. Linux derives the destination IP from the authenticated TCP peer and sends encrypted media outbound to the advertised Windows port without waiting for inbound UDP. This avoids requiring a Linux firewall rule for a random media port.
+6. Windows connects its socket to the offered Linux endpoint and accepts only authenticated packets for the current session.
 7. Rotate keys on every start, reconnect, or UDP restart.
 
 ### Packet format

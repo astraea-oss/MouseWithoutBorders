@@ -866,7 +866,9 @@ async fn run_connected_inner(
                             let bind_addr = if peer_ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                             match UdpSocket::bind(bind_addr).await {
                                 Ok(socket) => {
+                                    let windows_udp_port = socket.local_addr()?.port();
                                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Start {
+                                        udp_port: windows_udp_port,
                                         session_id: secrets.session_id,
                                         session_salt: secrets.session_salt,
                                         session_key: secrets.session_key,
@@ -883,7 +885,7 @@ async fn run_connected_inner(
                                         Ok(receiver) => {
                                             _audio_receiver = Some(receiver);
                                             tracing::info!(udp_port, "started Linux audio receiver");
-                                            append_portable_log(log_path, "opened Windows audio output and sent UDP probe");
+                                            append_portable_log(log_path, format!("opened Windows audio output on UDP port {windows_udp_port} and sent UDP probe"));
                                         }
                                         Err(error) => {
                                             tracing::warn!(%error, "failed to start Windows audio playback");
