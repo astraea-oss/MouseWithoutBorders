@@ -29,6 +29,7 @@ pub enum Frame {
     Control(ControlEvent),
     Heartbeat(Heartbeat),
     Error(RemoteError),
+    Audio(AudioControl),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,64 @@ pub struct Hello {
     pub device_name: String,
     pub role: Role,
     pub public_key_fingerprint: String,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Capability {
+    AudioV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    PcmS16Stereo48Khz,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioStreamState {
+    Disabled,
+    WaitingForUdp,
+    Starting,
+    Streaming,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioStopReason {
+    UserRequest,
+    PeerDisconnected,
+    TransportFailure,
+    CaptureFailure,
+    PlaybackFailure,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioControl {
+    Offer {
+        udp_port: u16,
+        codecs: Vec<AudioCodec>,
+    },
+    Start {
+        udp_port: u16,
+        session_id: [u8; 16],
+        session_salt: [u8; 4],
+        session_key: [u8; 32],
+        codec: AudioCodec,
+        frame_ms: u16,
+        jitter_target_ms: u16,
+    },
+    SetEnabled {
+        enabled: bool,
+    },
+    State {
+        state: AudioStreamState,
+        detail: Option<String>,
+    },
+    Stop {
+        reason: AudioStopReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,5 +225,19 @@ mod tests {
         let decoded = decode_frame(&encoded).unwrap();
 
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn audio_control_round_trip() {
+        let frame = Frame::Audio(AudioControl::Start {
+            udp_port: 42_421,
+            session_id: [7; 16],
+            session_salt: [8; 4],
+            session_key: [9; 32],
+            codec: AudioCodec::PcmS16Stereo48Khz,
+            frame_ms: 5,
+            jitter_target_ms: 60,
+        });
+        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
     }
 }

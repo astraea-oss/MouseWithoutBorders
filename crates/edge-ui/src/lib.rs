@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, GameCompatibilityMode, PeerConfig, PeerPosition, Role, parse_listen_port,
-    update_listen_port, validate_device_name, validate_host, validate_port,
+    AppConfig, AudioLocalPlayback, GameCompatibilityMode, PeerConfig, PeerPosition, Role,
+    parse_listen_port, update_listen_port, validate_device_name, validate_host, validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -167,6 +167,8 @@ struct SettingsApp {
     port: String,
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
+    audio_enabled: bool,
+    audio_play_local: bool,
     save_message: Option<String>,
     error_message: Option<String>,
     result: Arc<Mutex<SettingsUiResult>>,
@@ -203,6 +205,8 @@ impl SettingsApp {
                 .map(|peer| peer.position)
                 .unwrap_or(PeerPosition::Left),
             game_compatibility: input.config.input.game_compatibility,
+            audio_enabled: input.config.audio.enabled,
+            audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
             original: input.config,
             save_message: None,
             error_message: None,
@@ -218,7 +222,10 @@ impl SettingsApp {
             Ok(config) => match config.save_blocking(&self.config_path) {
                 Ok(()) => {
                     self.original = config.clone();
-                    self.save_message = Some("Saved. Restart required.".to_string());
+                    self.save_message = Some(
+                        "Saved. Audio changes apply immediately; connection changes apply on reconnect."
+                            .to_string(),
+                    );
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));
                     }
@@ -241,6 +248,12 @@ impl SettingsApp {
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
         config.input.game_compatibility = self.game_compatibility;
+        config.audio.enabled = self.audio_enabled;
+        config.audio.local_playback = if self.audio_play_local {
+            AudioLocalPlayback::Mirror
+        } else {
+            AudioLocalPlayback::Redirect
+        };
 
         match self.role {
             Role::Controller => {
@@ -351,6 +364,19 @@ impl eframe::App for SettingsApp {
 
                 ui.label("Pairing status");
                 ui.label(pairing_text(&self.pairing));
+                ui.end_row();
+
+                ui.label("Stream Linux audio");
+                ui.checkbox(&mut self.audio_enabled, "Enabled on connection");
+                ui.end_row();
+
+                ui.label("Laptop playback");
+                ui.checkbox(&mut self.audio_play_local, "Keep playing locally");
+                ui.end_row();
+
+                ui.label("Windows output");
+                let mut output = "Follow system default".to_string();
+                ui.add_enabled(false, egui::TextEdit::singleline(&mut output));
                 ui.end_row();
             });
 

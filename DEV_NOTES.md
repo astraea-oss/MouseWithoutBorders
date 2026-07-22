@@ -76,6 +76,11 @@ Title: edge-kvm receiver: Listening
 
 Later portability work:
 
+- The portal-based libei sender is now opt-in because several distributions do
+  not package `liboeffis`. Build it with
+  `cargo build -p edge-receiver-linux --features libei` when both
+  `libei-1.0` and `liboeffis-1.0` are available. The default portable build
+  keeps the Hyprland/Wayland backend and has no libei link requirement.
 - Probe multiple pkg-config names if needed, starting with `libei-1.0`.
 - Replace the manual libei/liboeffis FFI with generated or maintained bindings.
 - Re-test libei when Hyprland/xdg-desktop-portal-hyprland exposes

@@ -74,6 +74,32 @@ pub struct AppConfig {
     pub input: InputConfig,
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioLocalPlayback {
+    Redirect,
+    Mirror,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub local_playback: AudioLocalPlayback,
+    pub jitter_target_ms: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            local_playback: AudioLocalPlayback::Redirect,
+            jitter_target_ms: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -151,6 +177,10 @@ impl AppConfig {
             },
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
+            audio: AudioConfig {
+                enabled: true,
+                ..AudioConfig::default()
+            },
         }
     }
 
@@ -164,6 +194,7 @@ impl AppConfig {
             peer: PeerConfigSection::default(),
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
+            audio: AudioConfig::default(),
         }
     }
 
@@ -338,6 +369,27 @@ mod tests {
         assert_eq!(actual.role, Role::Receiver);
         assert_eq!(actual.listen.as_deref(), Some("0.0.0.0:42420"));
         assert_eq!(actual.clipboard.max_bytes, 1_048_576);
+        assert!(!actual.audio.enabled);
+        assert_eq!(actual.audio.local_playback, AudioLocalPlayback::Redirect);
+    }
+
+    #[test]
+    fn new_controller_configs_enable_audio() {
+        assert!(AppConfig::controller_default().audio.enabled);
+    }
+
+    #[test]
+    fn legacy_config_defaults_audio_to_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+device_name = "Legacy"
+role = "receiver"
+listen = "0.0.0.0:42420"
+"#,
+        )
+        .unwrap();
+        assert!(!config.audio.enabled);
+        assert_eq!(config.audio.jitter_target_ms, 60);
     }
 
     #[test]

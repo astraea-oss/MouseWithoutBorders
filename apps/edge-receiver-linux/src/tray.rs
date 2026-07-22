@@ -16,6 +16,7 @@ pub enum TrayCommand {
     OpenSettings,
     Disconnect,
     Reconnect,
+    ToggleAudio,
     Quit,
 }
 
@@ -254,6 +255,18 @@ impl ksni::Tray for ReceiverTray {
         items.push(self.connection_item());
         items.push(
             StandardItem {
+                label: "Toggle audio streaming".to_string(),
+                icon_name: "audio-volume-high".to_string(),
+                enabled: self.state == TrayState::Connected,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::ToggleAudio);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
                 label: "Settings...".to_string(),
                 icon_name: "preferences-system".to_string(),
                 activate: Box::new(|tray: &mut Self| {
@@ -471,7 +484,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 13);
+        assert_eq!(expected.len(), 14);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);

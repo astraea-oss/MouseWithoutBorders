@@ -44,6 +44,17 @@ receiver.toml
 state/
 ```
 
+Linux audio streaming uses the PipeWire-Pulse command-line tools `pactl` and
+`parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside
+`pipewire-pulse`. Verify routing without a Windows connection:
+
+```bash
+./edge-receiver-linux --test-audio-route
+```
+
+The diagnostic temporarily creates the `edge_kvm_remote` sink and restores the
+previous default before exiting.
+
 Useful checks:
 
 ```bash
@@ -89,6 +100,19 @@ remote mouse movement uses Windows Raw Input so games cannot distort the
 forwarded relative motion.
 
 On non-Windows hosts, use `--dry-run` to validate config and the initial protocol hello.
+
+To verify Windows playback without Linux, run:
+
+```powershell
+.\edge-controller-win.exe --test-audio
+```
+
+Linux system-audio streaming is enabled by default for new Windows controller
+configs. Legacy controller configs without an `[audio]` section are migrated on
+startup; an explicit existing preference is preserved. Use Settings or the
+checked `Stream Linux audio` tray action to change it while connected. The
+initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
+1.54 Mbps.
 
 ## End-to-end test
 

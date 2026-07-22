@@ -1,0 +1,39 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Windows workspace
+        run: cargo test --workspace --exclude edge-receiver-linux
+      - name: Build Windows controller
+        run: cargo build -p edge-controller-win --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edge-controller-win
+          path: target/release/edge-controller-win.exe
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+      - name: Test Linux workspace
+        run: cargo test --workspace --exclude edge-controller-win
+      - name: Build Linux receiver
+        run: cargo build -p edge-receiver-linux --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edge-receiver-linux
+          path: target/release/edge-receiver-linux

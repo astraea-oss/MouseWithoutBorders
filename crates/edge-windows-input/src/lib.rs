@@ -46,6 +46,9 @@ pub enum CapturedInput {
 pub enum WindowsTrayCommand {
     OpenSettings,
     ReleaseControl,
+    Disconnect,
+    Reconnect,
+    ToggleAudio,
     Quit,
 }
 
@@ -130,6 +133,16 @@ pub fn update_tray_status(status: &str) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn update_tray_status(_status: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn update_tray_audio(enabled: bool, status: &str) -> Result<()> {
+    tray::update_audio(enabled, status)
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_audio(_enabled: bool, _status: &str) -> Result<()> {
     Ok(())
 }
 
@@ -2128,7 +2141,7 @@ mod tray {
         ptr::null_mut,
         sync::{
             Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
     };
@@ -2145,8 +2158,8 @@ mod tray {
             WindowsAndMessaging::{
                 AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
                 DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_DISABLED, MF_SEPARATOR,
-                MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_DISABLED,
+                MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
                 TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
                 TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
                 WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
@@ -2161,11 +2174,16 @@ mod tray {
     const ID_SETTINGS: usize = 1001;
     const ID_RELEASE: usize = 1002;
     const ID_QUIT: usize = 1003;
+    const ID_AUDIO: usize = 1004;
+    const ID_CONNECTION: usize = 1005;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_COMMANDS: Mutex<Option<mpsc::Sender<WindowsTrayCommand>>> = Mutex::new(None);
     static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
+    static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
 
     pub fn run(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
         unsafe {
@@ -2234,6 +2252,15 @@ mod tray {
         modify_tray_icon(hwnd as _, status)
     }
 
+    pub fn update_audio(enabled: bool, status: &str) -> Result<()> {
+        TRAY_AUDIO_ENABLED.store(enabled, Ordering::Relaxed);
+        let mut audio_status = TRAY_AUDIO_STATUS
+            .lock()
+            .expect("tray audio status poisoned");
+        *audio_status = to_wide(status);
+        Ok(())
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         message: u32,
@@ -2276,6 +2303,14 @@ mod tray {
                 tracing::info!("release requested from tray");
                 send_tray_command(WindowsTrayCommand::ReleaseControl);
             }
+            ID_CONNECTION => {
+                if TRAY_CONNECTED.load(Ordering::Relaxed) {
+                    send_tray_command(WindowsTrayCommand::Disconnect);
+                } else {
+                    send_tray_command(WindowsTrayCommand::Reconnect);
+                }
+            }
+            ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
             ID_QUIT => {
                 send_tray_command(WindowsTrayCommand::Quit);
                 remove_tray_icon(hwnd);
@@ -2366,15 +2401,30 @@ mod tray {
         }
 
         let status = current_tray_status();
+        let audio_status = current_audio_status();
         let settings = to_wide("Settings...");
         let release = to_wide("Release control");
+        let connection = to_wide(if TRAY_CONNECTED.load(Ordering::Relaxed) {
+            "Disconnect"
+        } else {
+            "Reconnect"
+        });
+        let audio = to_wide("Stream Linux audio");
         let quit = to_wide("Quit");
+        let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
 
         unsafe {
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, audio_flags, ID_AUDIO, audio.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
             let mut point = POINT::default();
@@ -2399,6 +2449,7 @@ mod tray {
     }
 
     fn set_tray_status(status: &str) {
+        TRAY_CONNECTED.store(status.starts_with("Connected"), Ordering::Relaxed);
         let mut tray_status = TRAY_STATUS.lock().expect("tray status poisoned");
         *tray_status = to_wide(status);
     }
@@ -2421,6 +2472,17 @@ mod tray {
             to_wide("edge-kvm")
         } else {
             tray_status.clone()
+        }
+    }
+
+    fn current_audio_status() -> Vec<u16> {
+        let audio_status = TRAY_AUDIO_STATUS
+            .lock()
+            .expect("tray audio status poisoned");
+        if audio_status.is_empty() {
+            to_wide("Audio: Off")
+        } else {
+            audio_status.clone()
         }
     }
 
