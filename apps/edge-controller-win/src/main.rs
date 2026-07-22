@@ -25,9 +25,9 @@ use edge_geometry::Size;
 #[cfg(windows)]
 use edge_protocol::Edge;
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStopReason, AudioStreamState, Capability, ClipboardEvent,
-    ControlEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION, ScreenInfo,
-    decode_frame, encode_frame,
+    AudioCodec, AudioControl, AudioStopReason, AudioStreamState, Capability,
+    ClipboardChangeTracker, ClipboardEvent, ControlEvent, Frame, Hello, InputEvent, MouseButton,
+    PROTOCOL_VERSION, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput};
 use tokio::{
@@ -46,6 +46,7 @@ const FALLBACK_REMOTE_SIZE: Size = Size {
     height: 1080,
 };
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -684,6 +685,8 @@ async fn run_connected_inner(
     let mut input_rx = start_live_input(config, screen_info)?;
     let mut runtime_config = config.clone();
     let mut live_clipboard = LiveClipboardState::new(&runtime_config)?;
+    let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
+    clipboard_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut stats = ControllerInputStats::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut config_refresh = time::interval(Duration::from_millis(500));
@@ -805,6 +808,19 @@ async fn run_connected_inner(
                     );
                 }
             },
+            _ = clipboard_poll.tick() => {
+                match live_clipboard.local_change_offer(&runtime_config) {
+                    Ok(Some(frame)) => {
+                        write_secure_frame_writer(&mut writer, &frame).await?;
+                        stats.record_frame(&frame);
+                        tracing::info!("sent changed Windows clipboard to receiver");
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "skipped Windows clipboard poll");
+                    }
+                }
+            },
             _ = tray_command_poll.tick(), if tray_commands.is_some() => {
                 if let Some(commands) = tray_commands.as_deref_mut() {
                     match handle_pending_windows_tray_commands(commands, config_path, config, log_path)? {
@@ -862,9 +878,13 @@ async fn run_connected_inner(
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
                     Frame::Clipboard(event) => {
-                        live_clipboard
+                        if let Err(error) = live_clipboard
                             .handle_remote_event(event, &runtime_config, &mut writer)
-                            .await?
+                            .await
+                        {
+                            tracing::warn!(%error, "failed to synchronize receiver clipboard");
+                            append_portable_log(log_path, format!("failed to synchronize receiver clipboard: {error}"));
+                        }
                     }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
                     Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
@@ -1081,9 +1101,7 @@ struct LiveClipboardState {
     #[cfg(windows)]
     ctrl_down: bool,
     #[cfg(windows)]
-    sequence: u64,
-    #[cfg(windows)]
-    last_observed_text: Option<String>,
+    tracker: ClipboardChangeTracker,
 }
 
 impl LiveClipboardState {
@@ -1098,8 +1116,7 @@ impl LiveClipboardState {
             };
             return Ok(Self {
                 ctrl_down: false,
-                sequence: 0,
-                last_observed_text,
+                tracker: ClipboardChangeTracker::new(last_observed_text),
             });
         }
 
@@ -1193,7 +1210,7 @@ impl LiveClipboardState {
                     }
                     edge_windows_input::write_clipboard_text(&text, config.clipboard.max_bytes)
                         .context("failed to write Windows clipboard")?;
-                    self.last_observed_text = Some(text);
+                    self.tracker.mark_observed(Some(text));
                     tracing::info!("updated Windows clipboard from receiver");
                 }
                 ClipboardEvent::TextRequest => {
@@ -1216,17 +1233,25 @@ impl LiveClipboardState {
 
     #[cfg(windows)]
     fn local_clipboard_offer(&mut self, config: &AppConfig) -> Result<Option<Frame>> {
-        let Some(text) = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
-            .context("failed to read Windows clipboard")?
-        else {
+        let current = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
+            .context("failed to read Windows clipboard")?;
+        Ok(self.tracker.offer_current(current).map(Frame::Clipboard))
+    }
+
+    #[cfg(windows)]
+    fn local_change_offer(&mut self, config: &AppConfig) -> Result<Option<Frame>> {
+        if !config.clipboard.enabled {
             return Ok(None);
-        };
-        self.last_observed_text = Some(text.clone());
-        self.sequence = self.sequence.saturating_add(1);
-        Ok(Some(Frame::Clipboard(ClipboardEvent::TextOffer {
-            sequence: self.sequence,
-            text,
-        })))
+        }
+        let current = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
+            .context("failed to read Windows clipboard")?;
+        Ok(self.tracker.offer_if_changed(current).map(Frame::Clipboard))
+    }
+
+    #[cfg(not(windows))]
+    fn local_change_offer(&mut self, config: &AppConfig) -> Result<Option<Frame>> {
+        let _ = config;
+        Ok(None)
     }
 
     #[cfg(windows)]
@@ -1239,24 +1264,16 @@ impl LiveClipboardState {
         let current = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
             .context("failed to read Windows clipboard")?;
         if current.as_deref() == Some(remote_text) {
-            self.last_observed_text = current;
+            self.tracker.mark_observed(current);
             return Ok(true);
         }
 
-        if current.is_some() && current != self.last_observed_text {
-            self.last_observed_text = current.clone();
-            self.sequence = self.sequence.saturating_add(1);
-            let text = current.unwrap_or_default();
-            write_secure_frame_writer(
-                writer,
-                &Frame::Clipboard(ClipboardEvent::TextOffer {
-                    sequence: self.sequence,
-                    text,
-                }),
-            )
-            .await?;
-            tracing::info!("kept newer Windows clipboard and sent it to receiver");
-            return Ok(true);
+        if current.is_some() && !self.tracker.is_observed(&current) {
+            if let Some(event) = self.tracker.offer_current(current) {
+                write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
+                tracing::info!("kept newer Windows clipboard and sent it to receiver");
+                return Ok(true);
+            }
         }
 
         Ok(false)
