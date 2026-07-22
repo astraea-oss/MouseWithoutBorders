@@ -341,6 +341,8 @@ fn spawn_capture(source: &str) -> Result<Child> {
             "--format=float32le",
             "--rate=48000",
             "--channels=2",
+            "--latency-msec=5",
+            "--process-time-msec=5",
             "--raw",
         ])
         .stdin(Stdio::null())
