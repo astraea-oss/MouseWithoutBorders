@@ -177,7 +177,10 @@ impl AppConfig {
             },
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
-            audio: AudioConfig::default(),
+            audio: AudioConfig {
+                enabled: true,
+                ..AudioConfig::default()
+            },
         }
     }
 
@@ -368,6 +371,11 @@ mod tests {
         assert_eq!(actual.clipboard.max_bytes, 1_048_576);
         assert!(!actual.audio.enabled);
         assert_eq!(actual.audio.local_playback, AudioLocalPlayback::Redirect);
+    }
+
+    #[test]
+    fn new_controller_configs_enable_audio() {
+        assert!(AppConfig::controller_default().audio.enabled);
     }
 
     #[test]

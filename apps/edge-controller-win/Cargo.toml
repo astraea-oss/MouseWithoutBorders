@@ -19,3 +19,6 @@ edge-windows-input = { path = "../../crates/edge-windows-input" }
 edge-windows-audio = { path = "../../crates/edge-windows-audio" }
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

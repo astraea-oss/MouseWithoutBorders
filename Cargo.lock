@@ -862,6 +862,7 @@ dependencies = [
  "edge-ui",
  "edge-windows-audio",
  "edge-windows-input",
+ "tempfile",
  "tokio",
  "tracing",
 ]

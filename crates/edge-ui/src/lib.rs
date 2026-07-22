@@ -222,7 +222,10 @@ impl SettingsApp {
             Ok(config) => match config.save_blocking(&self.config_path) {
                 Ok(()) => {
                     self.original = config.clone();
-                    self.save_message = Some("Saved. Restart required.".to_string());
+                    self.save_message = Some(
+                        "Saved. Audio changes apply immediately; connection changes apply on reconnect."
+                            .to_string(),
+                    );
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));
                     }

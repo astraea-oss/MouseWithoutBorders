@@ -423,6 +423,7 @@ async fn run_receiver(
             tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
                 .await;
         }
+        let controller_supports_audio = hello.capabilities.contains(&Capability::AudioV1);
 
         write_secure_frame(
             &mut session,
@@ -470,6 +471,7 @@ async fn run_receiver(
             screen_info,
             audio_socket,
             addr.ip(),
+            controller_supports_audio,
         )
         .await
         {
@@ -582,6 +584,7 @@ async fn handle_controller(
     screen_info: Option<ScreenInfo>,
     audio_socket: Arc<UdpSocket>,
     controller_ip: std::net::IpAddr,
+    controller_supports_audio: bool,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
@@ -603,6 +606,22 @@ async fn handle_controller(
             }
             _ = status_log.tick() => {
                 stats.log(log_path, "receiver");
+                if audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
+                    if let Some(sender) = audio_sender.take() {
+                        sender.stop().await.ok();
+                    }
+                    tracing::warn!("Linux audio capture task stopped unexpectedly");
+                    append_portable_log(log_path, "Linux audio capture task stopped unexpectedly; routing restored");
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Audio(AudioControl::State {
+                            state: AudioStreamState::Error,
+                            detail: Some("Linux audio capture stopped unexpectedly".to_string()),
+                        }),
+                    )
+                    .await
+                    .ok();
+                }
             }
             command = recv_tray_command(tray_commands) => {
                 match command {
@@ -632,7 +651,22 @@ async fn handle_controller(
                     }
                     TrayCommandEvent::Command(TrayCommand::Reconnect) => {}
                     TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
+                        if !controller_supports_audio {
+                            tracing::warn!("audio toggle ignored because controller lacks AudioV1");
+                            append_portable_log(
+                                log_path,
+                                "audio toggle ignored because controller lacks AudioV1",
+                            );
+                            continue;
+                        }
                         audio_requested = !audio_requested;
+                        persist_receiver_audio_enabled(
+                            config_path,
+                            config,
+                            audio_requested,
+                            log_path,
+                        )
+                        .await;
                         if !audio_requested
                             && let Some(sender) = audio_sender.take()
                         {
@@ -724,6 +758,7 @@ async fn handle_controller(
                         frame_ms,
                         jitter_target_ms: _,
                     }) => {
+                        append_portable_log(log_path, "received Windows audio start request");
                         if codec != AudioCodec::PcmS16Stereo48Khz
                             || frame_ms != edge_audio::FRAME_MS
                         {
@@ -778,6 +813,7 @@ async fn handle_controller(
                                 {
                                     Ok(sender) => {
                                         audio_sender = Some(sender);
+                                        append_portable_log(log_path, "Linux audio capture is streaming");
                                         write_secure_frame_writer(
                                             &mut writer,
                                             &Frame::Audio(AudioControl::State {
@@ -789,6 +825,7 @@ async fn handle_controller(
                                     }
                                     Err(error) => {
                                         tracing::warn!(%error, "failed to start Linux audio capture");
+                                        append_portable_log(log_path, format!("failed to start Linux audio capture: {error:#}"));
                                         write_secure_frame_writer(
                                             &mut writer,
                                             &Frame::Audio(AudioControl::State {
@@ -804,6 +841,7 @@ async fn handle_controller(
                                 tracing::warn!(%error, "invalid Windows audio UDP probe");
                             }
                             Err(_) => {
+                                append_portable_log(log_path, "timed out waiting for Windows audio UDP probe");
                                 write_secure_frame_writer(
                                     &mut writer,
                                     &Frame::Audio(AudioControl::State {
@@ -818,13 +856,27 @@ async fn handle_controller(
                             }
                         }
                     }
-                    Frame::Audio(
-                        AudioControl::SetEnabled { enabled: false }
-                        | AudioControl::Stop { .. },
-                    ) => {
+                    Frame::Audio(AudioControl::SetEnabled { enabled: false }) => {
+                        audio_requested = false;
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
+                        persist_receiver_audio_enabled(config_path, config, false, log_path).await;
+                        append_portable_log(log_path, "Linux audio streaming disabled");
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Disabled,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Frame::Audio(AudioControl::Stop { reason }) => {
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
+                        append_portable_log(log_path, format!("Linux audio stopped by controller: {reason:?}"));
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::Audio(AudioControl::State {
@@ -835,6 +887,9 @@ async fn handle_controller(
                         .await?;
                     }
                     Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
+                        audio_requested = true;
+                        persist_receiver_audio_enabled(config_path, config, true, log_path).await;
+                        append_portable_log(log_path, "Linux audio streaming enabled; sending UDP offer");
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::Audio(AudioControl::Offer {
@@ -849,6 +904,29 @@ async fn handle_controller(
                 }
             }
         }
+    }
+}
+
+async fn persist_receiver_audio_enabled(
+    config_path: &Path,
+    fallback: &AppConfig,
+    enabled: bool,
+    log_path: &Path,
+) {
+    let mut updated = match AppConfig::load(config_path).await {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "failed to reload receiver config before saving audio state");
+            fallback.clone()
+        }
+    };
+    updated.audio.enabled = enabled;
+    if let Err(error) = updated.save(config_path).await {
+        tracing::warn!(%error, "failed to persist receiver audio state");
+        append_portable_log(
+            log_path,
+            format!("failed to persist receiver audio state enabled={enabled}: {error}"),
+        );
     }
 }
 

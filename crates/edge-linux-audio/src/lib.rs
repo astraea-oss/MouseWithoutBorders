@@ -275,6 +275,10 @@ impl LinuxAudioSender {
         Ok(Self { task, routing })
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
     pub async fn stop(mut self) -> Result<()> {
         self.task.abort();
         self.routing.restore_now().await

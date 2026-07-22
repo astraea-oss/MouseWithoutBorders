@@ -107,9 +107,12 @@ To verify Windows playback without Linux, run:
 .\edge-controller-win.exe --test-audio
 ```
 
-Enable `[audio].enabled` in Settings or in the portable `controller.toml` to
-start Linux system-audio streaming automatically after connection. The initial
-format is encrypted 48 kHz stereo PCM over UDP, requiring roughly 1.54 Mbps.
+Linux system-audio streaming is enabled by default for new Windows controller
+configs. Legacy controller configs without an `[audio]` section are migrated on
+startup; an explicit existing preference is preserved. Use Settings or the
+checked `Stream Linux audio` tray action to change it while connected. The
+initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
+1.54 Mbps.
 
 ## End-to-end test
 

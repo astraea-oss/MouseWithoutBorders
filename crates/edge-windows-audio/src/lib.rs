@@ -4,7 +4,7 @@ mod implementation {
         collections::VecDeque,
         net::SocketAddr,
         sync::mpsc::{self, SyncSender, TryRecvError},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ mod implementation {
     pub struct AudioPlayer {
         sender: SyncSender<Vec<f32>>,
         _stream: Stream,
+        output_name: String,
         output_rate: u32,
         output_channels: usize,
     }
@@ -33,6 +34,7 @@ mod implementation {
             let device = host
                 .default_output_device()
                 .context("Windows has no default audio output")?;
+            let output_name = device.to_string();
             let supported = device
                 .default_output_config()
                 .context("failed to query the default Windows audio format")?;
@@ -53,14 +55,23 @@ mod implementation {
             tracing::info!(
                 output_rate,
                 output_channels,
+                output_name,
                 "opened default Windows audio output"
             );
             Ok(Self {
                 sender,
                 _stream: stream,
+                output_name,
                 output_rate,
                 output_channels,
             })
+        }
+
+        fn default_output_name() -> Result<String> {
+            let device = cpal::default_host()
+                .default_output_device()
+                .context("Windows has no default audio output")?;
+            Ok(device.to_string())
         }
 
         pub fn push_48k_stereo(&self, pcm: &[f32]) {
@@ -163,16 +174,23 @@ mod implementation {
                 .context("failed to send audio UDP probe")?;
 
             let task = tokio::spawn(async move {
+                let mut player = player;
                 let mut jitter = JitterBuffer::new(jitter_target_ms);
                 let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
                 let mut playback = time::interval(Duration::from_millis(FRAME_MS as u64));
                 playback.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                let mut media_watchdog = time::interval(Duration::from_millis(500));
+                let mut output_watchdog = time::interval(Duration::from_secs(1));
+                let mut last_authenticated_media = Instant::now();
                 loop {
                     tokio::select! {
                         received = socket.recv(&mut buffer) => {
                             match received {
                                 Ok(length) => match cipher.open(&buffer[..length]) {
-                                    Ok(packet) if packet.flags & FLAG_PROBE == 0 => { jitter.push(packet); }
+                                    Ok(packet) if packet.flags & FLAG_PROBE == 0 => {
+                                        last_authenticated_media = Instant::now();
+                                        jitter.push(packet);
+                                    }
                                     Ok(_) => {}
                                     Err(error) => tracing::debug!(%error, "rejected audio datagram"),
                                 },
@@ -190,10 +208,35 @@ mod implementation {
                                 }
                             }
                         }
+                        _ = media_watchdog.tick() => {
+                            if last_authenticated_media.elapsed() > Duration::from_secs(2) {
+                                tracing::warn!("Linux audio media timed out");
+                                break;
+                            }
+                        }
+                        _ = output_watchdog.tick() => {
+                            match AudioPlayer::default_output_name() {
+                                Ok(name) if name != player.output_name => {
+                                    match AudioPlayer::open_default() {
+                                        Ok(updated) => {
+                                            tracing::info!(previous = %player.output_name, current = %updated.output_name, "followed Windows default audio output change");
+                                            player = updated;
+                                        }
+                                        Err(error) => tracing::warn!(%error, "failed to follow Windows default audio output change"),
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => tracing::warn!(%error, "failed to poll Windows default audio output"),
+                            }
+                        }
                     }
                 }
             });
             Ok(Self { task })
+        }
+
+        pub fn is_finished(&self) -> bool {
+            self.task.is_finished()
         }
 
         pub fn stop(self) {

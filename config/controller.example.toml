@@ -18,6 +18,6 @@ text_only = true
 max_bytes = 1048576
 
 [audio]
-enabled = false
+enabled = true
 local_playback = "redirect"
 jitter_target_ms = 60
