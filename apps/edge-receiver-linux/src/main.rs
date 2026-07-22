@@ -782,7 +782,54 @@ async fn handle_controller(
                             session_salt,
                             session_key,
                         };
-                        let destination = std::net::SocketAddr::new(controller_ip, udp_port);
+                        let advertised_destination =
+                            std::net::SocketAddr::new(controller_ip, udp_port);
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::WaitingForUdp,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                        append_portable_log(
+                            log_path,
+                            format!(
+                                "establishing authenticated UDP audio path to {advertised_destination}"
+                            ),
+                        );
+                        let cipher = edge_audio::PacketCipher::new(&secrets);
+                        let destination = match edge_linux_audio::establish_peer(
+                            &audio_socket,
+                            &cipher,
+                            advertised_destination,
+                            controller_ip,
+                            Duration::from_secs(3),
+                        )
+                        .await
+                        {
+                            Ok(destination) => destination,
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to establish Windows audio UDP path");
+                                append_portable_log(
+                                    log_path,
+                                    format!("failed to establish Windows audio UDP path: {error:#}"),
+                                );
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Error,
+                                        detail: Some(error.to_string()),
+                                    }),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        append_portable_log(
+                            log_path,
+                            format!("authenticated Windows audio UDP endpoint: {destination}"),
+                        );
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::Audio(AudioControl::State {
@@ -791,10 +838,6 @@ async fn handle_controller(
                             }),
                         )
                         .await?;
-                        append_portable_log(
-                            log_path,
-                            format!("starting Linux audio outbound to {destination}"),
-                        );
                         let redirect = config.audio.local_playback
                             == AudioLocalPlayback::Redirect;
                         match edge_linux_audio::LinuxAudioSender::start(

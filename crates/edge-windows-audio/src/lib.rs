@@ -140,12 +140,14 @@ mod implementation {
     }
 
     pub struct WindowsAudioReceiver {
-        task: JoinHandle<()>,
+        task: Option<JoinHandle<String>>,
     }
 
     impl Drop for WindowsAudioReceiver {
         fn drop(&mut self) {
-            self.task.abort();
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
         }
     }
 
@@ -181,7 +183,9 @@ mod implementation {
                 playback.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 let mut media_watchdog = time::interval(Duration::from_millis(500));
                 let mut output_watchdog = time::interval(Duration::from_secs(1));
+                let mut probe_retry = time::interval(Duration::from_millis(250));
                 let mut last_authenticated_media = Instant::now();
+                let mut received_media = false;
                 loop {
                     tokio::select! {
                         received = socket.recv(&mut buffer) => {
@@ -189,6 +193,7 @@ mod implementation {
                                 Ok(length) => match cipher.open(&buffer[..length]) {
                                     Ok(packet) if packet.flags & FLAG_PROBE == 0 => {
                                         last_authenticated_media = Instant::now();
+                                        received_media = true;
                                         jitter.push(packet);
                                     }
                                     Ok(_) => {}
@@ -196,8 +201,14 @@ mod implementation {
                                 },
                                 Err(error) => {
                                     tracing::warn!(%error, "audio UDP receive failed");
-                                    break;
+                                    break format!("audio UDP receive failed: {error}");
                                 }
+                            }
+                        }
+                        _ = probe_retry.tick(), if !received_media => {
+                            if let Err(error) = socket.send(&probe).await {
+                                tracing::warn!(%error, "audio UDP probe retry failed");
+                                break format!("audio UDP probe retry failed: {error}");
                             }
                         }
                         _ = playback.tick() => {
@@ -209,9 +220,9 @@ mod implementation {
                             }
                         }
                         _ = media_watchdog.tick() => {
-                            if last_authenticated_media.elapsed() > Duration::from_secs(2) {
+                            if last_authenticated_media.elapsed() > Duration::from_secs(5) {
                                 tracing::warn!("Linux audio media timed out");
-                                break;
+                                break "no authenticated Linux UDP audio received for 5 seconds".to_string();
                             }
                         }
                         _ = output_watchdog.tick() => {
@@ -232,15 +243,21 @@ mod implementation {
                     }
                 }
             });
-            Ok(Self { task })
+            Ok(Self { task: Some(task) })
         }
 
         pub fn is_finished(&self) -> bool {
-            self.task.is_finished()
+            self.task.as_ref().is_none_or(|task| task.is_finished())
         }
 
-        pub fn stop(self) {
-            drop(self);
+        pub async fn failure_reason(mut self) -> String {
+            let Some(task) = self.task.take() else {
+                return "Windows audio receiver stopped without a result".to_string();
+            };
+            match task.await {
+                Ok(reason) => reason,
+                Err(error) => format!("Windows audio receiver task failed: {error}"),
+            }
         }
     }
 

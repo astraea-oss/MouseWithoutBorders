@@ -740,16 +740,20 @@ async fn run_connected_inner(
             },
             _ = audio_watch.tick() => {
                 if _audio_receiver.as_ref().is_some_and(|receiver| receiver.is_finished()) {
-                    _audio_receiver = None;
+                    let failure = _audio_receiver
+                        .take()
+                        .expect("finished Windows audio receiver disappeared")
+                        .failure_reason()
+                        .await;
                     if audio_enabled && peer_supports_audio && !audio_restart_attempted {
                         audio_restart_attempted = true;
                         update_windows_tray_audio(true, "Audio: Restarting", log_path);
-                        append_portable_log(log_path, "Windows audio media stopped; requesting one restart");
+                        append_portable_log(log_path, format!("Windows audio media stopped ({failure}); requesting one restart"));
                         write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
                     } else {
-                        update_windows_tray_audio(audio_enabled, "Audio error: playback stopped", log_path);
-                        append_portable_log(log_path, "Windows audio playback task stopped unexpectedly");
-                        write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::PlaybackFailure })).await.ok();
+                        update_windows_tray_audio(audio_enabled, &format!("Audio error: {failure}"), log_path);
+                        append_portable_log(log_path, format!("Windows audio transport stopped: {failure}"));
+                        write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::TransportFailure })).await.ok();
                     }
                 }
             },

@@ -1,12 +1,15 @@
 use std::{
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
+    AudioPacket, FLAG_PROBE, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL,
+    SAMPLES_PER_FRAME, SessionSecrets,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -183,6 +186,53 @@ async fn pactl(arguments: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Opens the UDP path in both directions and returns the controller endpoint as
+/// observed by Linux. Using the observed source port keeps audio working across
+/// host firewalls and NAT instead of trusting the port in the TCP control frame.
+pub async fn establish_peer(
+    socket: &UdpSocket,
+    cipher: &PacketCipher,
+    advertised_destination: SocketAddr,
+    expected_ip: IpAddr,
+    timeout: Duration,
+) -> Result<SocketAddr> {
+    let probe = cipher.seal(&AudioPacket {
+        sequence: u64::MAX,
+        sample_timestamp: 0,
+        flags: FLAG_PROBE,
+        payload: Vec::new(),
+    })?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+
+    loop {
+        socket
+            .send_to(&probe, advertised_destination)
+            .await
+            .context("failed to send Linux audio UDP probe")?;
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("timed out establishing the authenticated UDP audio path");
+        }
+        let wait = (deadline - now).min(Duration::from_millis(250));
+        match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((length, source))) if source.ip() == expected_ip => {
+                if let Ok(packet) = cipher.open(&buffer[..length])
+                    && packet.flags & FLAG_PROBE != 0
+                    && packet.payload.is_empty()
+                {
+                    return Ok(source);
+                }
+            }
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("failed to receive Windows audio UDP probe");
+            }
+        }
+    }
+}
+
 pub struct LinuxAudioSender {
     task: JoinHandle<()>,
     routing: AudioRoutingGuard,
@@ -280,4 +330,46 @@ fn spawn_capture(source: &str) -> Result<Child> {
     command
         .spawn()
         .context("failed to start parec; install PipeWire PulseAudio tools")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn authenticated_probe_uses_observed_peer_endpoint() {
+        let linux = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let windows = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let windows_addr = windows.local_addr().unwrap();
+        let secrets = SessionSecrets::generate();
+        let linux_cipher = PacketCipher::new(&secrets);
+        let windows_cipher = PacketCipher::new(&secrets);
+
+        let handshake = establish_peer(
+            &linux,
+            &linux_cipher,
+            windows_addr,
+            windows_addr.ip(),
+            Duration::from_secs(1),
+        );
+        let peer = async {
+            let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+            let (length, linux_addr) = windows.recv_from(&mut buffer).await.unwrap();
+            let probe = windows_cipher.open(&buffer[..length]).unwrap();
+            assert_ne!(probe.flags & FLAG_PROBE, 0);
+
+            let response = windows_cipher
+                .seal(&AudioPacket {
+                    sequence: 0,
+                    sample_timestamp: 0,
+                    flags: FLAG_PROBE,
+                    payload: Vec::new(),
+                })
+                .unwrap();
+            windows.send_to(&response, linux_addr).await.unwrap();
+        };
+
+        let (observed, ()) = tokio::join!(handshake, peer);
+        assert_eq!(observed.unwrap(), windows_addr);
+    }
 }
