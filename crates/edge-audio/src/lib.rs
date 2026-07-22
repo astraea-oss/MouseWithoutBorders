@@ -80,20 +80,35 @@ impl PacketCipher {
     }
 
     pub fn seal(&self, packet: &AudioPacket) -> Result<Vec<u8>> {
+        self.seal_payload(
+            packet.sequence,
+            packet.sample_timestamp,
+            packet.flags,
+            &packet.payload,
+        )
+    }
+
+    pub fn seal_payload(
+        &self,
+        sequence: u64,
+        sample_timestamp: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(&MAGIC);
         header.push(VERSION);
-        header.push(packet.flags);
+        header.push(flags);
         header.extend_from_slice(&(HEADER_LEN as u16).to_be_bytes());
         header.extend_from_slice(&self.session_id);
-        header.extend_from_slice(&packet.sequence.to_be_bytes());
-        header.extend_from_slice(&packet.sample_timestamp.to_be_bytes());
+        header.extend_from_slice(&sequence.to_be_bytes());
+        header.extend_from_slice(&sample_timestamp.to_be_bytes());
         let encrypted = self
             .cipher
             .encrypt(
-                &self.nonce(packet.sequence),
+                &self.nonce(sequence),
                 Payload {
-                    msg: &packet.payload,
+                    msg: payload,
                     aad: &header,
                 },
             )
@@ -165,6 +180,20 @@ impl PcmCodec {
         Ok(output)
     }
 
+    pub fn encode_f32le_into(input: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        if input.len() != SAMPLES_PER_FRAME * size_of::<f32>() {
+            return Err(AudioError::InvalidPacket);
+        }
+        output.clear();
+        output.reserve(PCM_BYTES_PER_FRAME.saturating_sub(output.capacity()));
+        for bytes in input.chunks_exact(size_of::<f32>()) {
+            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
+            let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
+
     pub fn decode(packet: Option<&[u8]>) -> Result<Vec<f32>> {
         let Some(packet) = packet else {
             return Ok(vec![0.0; SAMPLES_PER_FRAME]);
@@ -190,21 +219,29 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(target_ms: u32) -> Self {
+        let target_packets = ((target_ms.max(FRAME_MS as u32) / FRAME_MS as u32) as usize).max(1);
         Self {
             packets: BTreeMap::new(),
             next_sequence: None,
-            target_packets: ((target_ms.max(FRAME_MS as u32) / FRAME_MS as u32) as usize).max(1),
-            max_packets: 24,
+            target_packets,
+            max_packets: (target_packets * 3).clamp(24, 96),
             started: false,
         }
     }
 
     pub fn push(&mut self, packet: AudioPacket) -> bool {
-        if self
-            .next_sequence
-            .is_some_and(|next| packet.sequence < next)
-        {
-            return false;
+        if self.started {
+            if self
+                .next_sequence
+                .is_some_and(|next| packet.sequence < next)
+            {
+                return false;
+            }
+        } else {
+            self.next_sequence = Some(
+                self.next_sequence
+                    .map_or(packet.sequence, |next| next.min(packet.sequence)),
+            );
         }
         self.next_sequence.get_or_insert(packet.sequence);
         let inserted = self.packets.insert(packet.sequence, packet).is_none();
@@ -224,9 +261,6 @@ impl JitterBuffer {
                 return None;
             }
             self.started = true;
-        }
-        if self.packets.is_empty() {
-            return None;
         }
         let sequence = self.next_sequence?;
         self.next_sequence = Some(sequence.wrapping_add(1));
@@ -280,6 +314,16 @@ mod tests {
         assert_eq!(jitter.pop().unwrap().unwrap().sequence, 10);
         assert!(jitter.pop().unwrap().is_none());
         assert_eq!(jitter.pop().unwrap().unwrap().sequence, 12);
+        assert!(jitter.pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn jitter_buffer_accepts_initial_out_of_order_packets() {
+        let mut jitter = JitterBuffer::new(10);
+        assert!(jitter.push(packet(11)));
+        assert!(jitter.push(packet(10)));
+        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 10);
+        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 11);
     }
 
     #[test]
@@ -294,5 +338,20 @@ mod tests {
         for (expected, actual) in pcm.iter().zip(decoded) {
             assert!((expected - actual).abs() < 0.000_1);
         }
+    }
+
+    #[test]
+    fn raw_f32le_encoder_matches_sample_encoder() {
+        let pcm = (0..SAMPLES_PER_FRAME)
+            .map(|index| (index as f32 / SAMPLES_PER_FRAME as f32) * 2.0 - 1.0)
+            .collect::<Vec<_>>();
+        let raw = pcm
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected = PcmCodec::encode(&pcm).unwrap();
+        let mut actual = Vec::new();
+        PcmCodec::encode_f32le_into(&raw, &mut actual).unwrap();
+        assert_eq!(actual, expected);
     }
 }

@@ -37,6 +37,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     signal::unix::{SignalKind, signal},
     sync::mpsc,
+    task::JoinHandle,
     time,
 };
 
@@ -573,6 +574,19 @@ enum ControllerSessionExit {
     DisconnectRequested,
 }
 
+struct AbortOnDropTask(JoinHandle<()>);
+
+impl Drop for AbortOnDropTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct AudioStartResult {
+    generation: u64,
+    result: std::result::Result<(std::net::SocketAddr, edge_linux_audio::LinuxAudioSender), String>,
+}
+
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
     config: &AppConfig,
@@ -595,6 +609,9 @@ async fn handle_controller(
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
     let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
     let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
+    let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
+    let mut audio_start_task: Option<AbortOnDropTask> = None;
+    let mut audio_start_generation = 0_u64;
     let mut audio_requested = config.audio.enabled;
 
     loop {
@@ -623,18 +640,62 @@ async fn handle_controller(
                     .ok();
                 }
             }
+            Some(started) = audio_start_rx.recv(), if audio_start_task.is_some() => {
+                if started.generation != audio_start_generation {
+                    if let Ok((_, sender)) = started.result {
+                        sender.stop().await.ok();
+                    }
+                    continue;
+                }
+                audio_start_task = None;
+                match started.result {
+                    Ok((destination, sender)) => {
+                        audio_sender = Some(sender);
+                        append_portable_log(
+                            log_path,
+                            format!("authenticated Windows audio UDP endpoint: {destination}"),
+                        );
+                        append_portable_log(log_path, "Linux audio capture is streaming");
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Streaming,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to start Linux audio transport");
+                        append_portable_log(
+                            log_path,
+                            format!("failed to start Linux audio transport: {error}"),
+                        );
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Error,
+                                detail: Some(error),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
             command = recv_tray_command(tray_commands) => {
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                         open_receiver_settings(config_path, log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
+                        drop(audio_start_task.take());
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
                         return Ok(ControllerSessionExit::QuitRequested);
                     }
                     TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                        drop(audio_start_task.take());
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
@@ -667,10 +728,12 @@ async fn handle_controller(
                             log_path,
                         )
                         .await;
-                        if !audio_requested
-                            && let Some(sender) = audio_sender.take()
-                        {
-                            sender.stop().await.ok();
+                        if !audio_requested {
+                            drop(audio_start_task.take());
+                            audio_start_generation = audio_start_generation.wrapping_add(1);
+                            if let Some(sender) = audio_sender.take() {
+                                sender.stop().await.ok();
+                            }
                         }
                         write_secure_frame_writer(
                             &mut writer,
@@ -777,6 +840,9 @@ async fn handle_controller(
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
+                        drop(audio_start_task.take());
+                        audio_start_generation = audio_start_generation.wrapping_add(1);
+                        let generation = audio_start_generation;
                         let secrets = SessionSecrets {
                             session_id,
                             session_salt,
@@ -798,85 +864,41 @@ async fn handle_controller(
                                 "establishing authenticated UDP audio path to {advertised_destination}"
                             ),
                         );
-                        let cipher = edge_audio::PacketCipher::new(&secrets);
-                        let destination = match edge_linux_audio::establish_peer(
-                            &audio_socket,
-                            &cipher,
-                            advertised_destination,
-                            controller_ip,
-                            Duration::from_secs(3),
-                        )
-                        .await
-                        {
-                            Ok(destination) => destination,
-                            Err(error) => {
-                                tracing::warn!(%error, "failed to establish Windows audio UDP path");
-                                append_portable_log(
-                                    log_path,
-                                    format!("failed to establish Windows audio UDP path: {error:#}"),
-                                );
-                                write_secure_frame_writer(
-                                    &mut writer,
-                                    &Frame::Audio(AudioControl::State {
-                                        state: AudioStreamState::Error,
-                                        detail: Some(error.to_string()),
-                                    }),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        append_portable_log(
-                            log_path,
-                            format!("authenticated Windows audio UDP endpoint: {destination}"),
-                        );
-                        write_secure_frame_writer(
-                            &mut writer,
-                            &Frame::Audio(AudioControl::State {
-                                state: AudioStreamState::Starting,
-                                detail: None,
-                            }),
-                        )
-                        .await?;
                         let redirect = config.audio.local_playback
                             == AudioLocalPlayback::Redirect;
-                        match edge_linux_audio::LinuxAudioSender::start(
-                            audio_socket.clone(),
-                            destination,
-                            secrets,
-                            &default_state_dir(),
-                            redirect,
-                        )
-                        .await
-                        {
-                            Ok(sender) => {
-                                audio_sender = Some(sender);
-                                append_portable_log(log_path, "Linux audio capture is streaming");
-                                write_secure_frame_writer(
-                                    &mut writer,
-                                    &Frame::Audio(AudioControl::State {
-                                        state: AudioStreamState::Streaming,
-                                        detail: None,
-                                    }),
+                        let start_socket = audio_socket.clone();
+                        let state_dir = default_state_dir();
+                        let result_tx = audio_start_tx.clone();
+                        audio_start_task = Some(AbortOnDropTask(tokio::spawn(async move {
+                            let result = async {
+                                let cipher = edge_audio::PacketCipher::new(&secrets);
+                                let destination = edge_linux_audio::establish_peer(
+                                    &start_socket,
+                                    &cipher,
+                                    advertised_destination,
+                                    controller_ip,
+                                    Duration::from_secs(3),
                                 )
                                 .await?;
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "failed to start Linux audio capture");
-                                append_portable_log(log_path, format!("failed to start Linux audio capture: {error:#}"));
-                                write_secure_frame_writer(
-                                    &mut writer,
-                                    &Frame::Audio(AudioControl::State {
-                                        state: AudioStreamState::Error,
-                                        detail: Some(error.to_string()),
-                                    }),
+                                let sender = edge_linux_audio::LinuxAudioSender::start(
+                                    start_socket,
+                                    destination,
+                                    secrets,
+                                    &state_dir,
+                                    redirect,
                                 )
                                 .await?;
+                                Ok::<_, anyhow::Error>((destination, sender))
                             }
-                        }
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                            let _ = result_tx.send(AudioStartResult { generation, result });
+                        })));
                     }
                     Frame::Audio(AudioControl::SetEnabled { enabled: false }) => {
                         audio_requested = false;
+                        drop(audio_start_task.take());
+                        audio_start_generation = audio_start_generation.wrapping_add(1);
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
@@ -892,6 +914,8 @@ async fn handle_controller(
                         .await?;
                     }
                     Frame::Audio(AudioControl::Stop { reason }) => {
+                        drop(audio_start_task.take());
+                        audio_start_generation = audio_start_generation.wrapping_add(1);
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }

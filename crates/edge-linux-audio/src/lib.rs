@@ -263,6 +263,7 @@ impl LinuxAudioSender {
         let (first_packet_tx, first_packet_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut frame = vec![0; SAMPLES_PER_FRAME * 4];
+            let mut payload = Vec::with_capacity(edge_audio::PCM_BYTES_PER_FRAME);
             let mut sequence = 1_u64;
             let mut timestamp = 0_u32;
             let mut first_packet_tx = Some(first_packet_tx);
@@ -271,23 +272,11 @@ impl LinuxAudioSender {
                     tracing::warn!(%error, "Linux audio capture ended");
                     break;
                 }
-                let pcm: Vec<f32> = frame
-                    .chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect();
-                let payload = match PcmCodec::encode(&pcm) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        tracing::warn!(%error, "PCM encoding failed");
-                        break;
-                    }
-                };
-                let datagram = match cipher.seal(&AudioPacket {
-                    sequence,
-                    sample_timestamp: timestamp,
-                    flags: 0,
-                    payload,
-                }) {
+                if let Err(error) = PcmCodec::encode_f32le_into(&frame, &mut payload) {
+                    tracing::warn!(%error, "PCM encoding failed");
+                    break;
+                }
+                let datagram = match cipher.seal_payload(sequence, timestamp, 0, &payload) {
                     Ok(packet) => packet,
                     Err(error) => {
                         tracing::warn!(%error, "audio packet encryption failed");
