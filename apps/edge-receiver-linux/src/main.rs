@@ -23,13 +23,14 @@ use edge_crypto::{
     accept_noise_session,
 };
 use edge_linux_input::{
-    HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend, hyprland_cursor_position,
-    hyprland_screen_info, read_clipboard_text, write_clipboard_text,
+    ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
+    hyprland_cursor_position, hyprland_screen_info, read_clipboard_text,
+    spawn_clipboard_change_watcher, write_clipboard_text,
 };
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStreamState, Capability, ClipboardEvent, ControlEvent, Edge,
-    Frame, Heartbeat, Hello, InputEvent, OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError,
-    ScreenInfo, decode_frame, encode_frame,
+    AudioCodec, AudioControl, AudioStreamState, Capability, ClipboardChangeTracker, ClipboardEvent,
+    ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo, PROTOCOL_VERSION,
+    ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
 use socket2::SockRef;
@@ -587,6 +588,23 @@ struct AudioStartResult {
     result: std::result::Result<(std::net::SocketAddr, edge_linux_audio::LinuxAudioSender), String>,
 }
 
+enum ClipboardWatchEvent {
+    Changed,
+    Closed,
+}
+
+async fn recv_clipboard_change(
+    watcher: &mut Option<ClipboardChangeWatcher>,
+) -> ClipboardWatchEvent {
+    match watcher {
+        Some(watcher) => match watcher.recv().await {
+            Some(()) => ClipboardWatchEvent::Changed,
+            None => ClipboardWatchEvent::Closed,
+        },
+        None => future::pending().await,
+    }
+}
+
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
     config: &AppConfig,
@@ -608,6 +626,10 @@ async fn handle_controller(
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
     let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
+    let mut clipboard_watcher = config
+        .clipboard
+        .enabled
+        .then(spawn_clipboard_change_watcher);
     let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
     let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
     let mut audio_start_task: Option<AbortOnDropTask> = None;
@@ -752,6 +774,31 @@ async fn handle_controller(
                     }
                 }
             }
+            event = recv_clipboard_change(&mut clipboard_watcher) => {
+                match event {
+                    ClipboardWatchEvent::Changed => {
+                        match clipboard_sync.send_changed_offer(config, &mut writer).await {
+                            Ok(true) => {
+                                stats.clipboard = stats.clipboard.saturating_add(1);
+                                tracing::info!("sent changed Linux clipboard to controller");
+                                if let Some(tray) = tray {
+                                    tray.clipboard_event().await;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to synchronize changed Linux clipboard");
+                                append_portable_log(log_path, format!("failed to synchronize changed Linux clipboard: {error}"));
+                            }
+                        }
+                    }
+                    ClipboardWatchEvent::Closed => {
+                        tracing::warn!("Wayland clipboard watcher stopped; restarting");
+                        append_portable_log(log_path, "Wayland clipboard watcher stopped; restarting");
+                        clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                    }
+                }
+            }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
                 match frame {
@@ -788,22 +835,30 @@ async fn handle_controller(
                     }
                     Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) => {
                         stats.clipboard = stats.clipboard.saturating_add(1);
-                        clipboard_sync
-                            .handle_text_offer(config, &mut writer, text)
-                            .await?;
-                        if let Some(tray) = tray {
-                            tray.clipboard_event().await;
+                        match clipboard_sync.handle_text_offer(config, &mut writer, text).await {
+                            Ok(()) => {
+                                if let Some(tray) = tray {
+                                    tray.clipboard_event().await;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to apply controller clipboard");
+                                append_portable_log(log_path, format!("failed to apply controller clipboard: {error}"));
+                            }
                         }
                     }
                     Frame::Clipboard(ClipboardEvent::TextRequest) => {
                         stats.clipboard = stats.clipboard.saturating_add(1);
-                        if clipboard_sync
-                            .send_local_offer(config, &mut writer)
-                            .await?
-                            .is_some()
-                        {
-                            if let Some(tray) = tray {
-                                tray.clipboard_event().await;
+                        match clipboard_sync.send_local_offer(config, &mut writer).await {
+                            Ok(Some(())) => {
+                                if let Some(tray) = tray {
+                                    tray.clipboard_event().await;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to answer controller clipboard request");
+                                append_portable_log(log_path, format!("failed to answer controller clipboard request: {error}"));
                             }
                         }
                     }
@@ -975,16 +1030,14 @@ async fn persist_receiver_audio_enabled(
 
 #[derive(Default)]
 struct ReceiverClipboardState {
-    sequence: u64,
-    last_observed_text: Option<String>,
+    tracker: ClipboardChangeTracker,
 }
 
 impl ReceiverClipboardState {
     async fn new(config: &AppConfig) -> Result<Self> {
         let last_observed_text = read_clipboard_text(&config.clipboard).await?;
         Ok(Self {
-            sequence: 0,
-            last_observed_text,
+            tracker: ClipboardChangeTracker::new(last_observed_text),
         })
     }
 
@@ -1002,7 +1055,7 @@ impl ReceiverClipboardState {
         }
 
         write_clipboard_text(&config.clipboard, &remote_text).await?;
-        self.last_observed_text = Some(remote_text);
+        self.tracker.mark_observed(Some(remote_text));
         tracing::info!("updated Linux clipboard from controller");
         Ok(())
     }
@@ -1012,21 +1065,25 @@ impl ReceiverClipboardState {
         config: &AppConfig,
         writer: &mut NoiseWriter,
     ) -> Result<Option<()>> {
-        let Some(text) = read_clipboard_text(&config.clipboard).await? else {
+        let current = read_clipboard_text(&config.clipboard).await?;
+        let Some(event) = self.tracker.offer_current(current) else {
             return Ok(None);
         };
-
-        self.last_observed_text = Some(text.clone());
-        self.sequence = self.sequence.saturating_add(1);
-        write_secure_frame_writer(
-            writer,
-            &Frame::Clipboard(ClipboardEvent::TextOffer {
-                sequence: self.sequence,
-                text,
-            }),
-        )
-        .await?;
+        write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
         Ok(Some(()))
+    }
+
+    async fn send_changed_offer(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut NoiseWriter,
+    ) -> Result<bool> {
+        let current = read_clipboard_text(&config.clipboard).await?;
+        let Some(event) = self.tracker.offer_if_changed(current) else {
+            return Ok(false);
+        };
+        write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
+        Ok(true)
     }
 
     async fn prefer_newer_local_clipboard(
@@ -1037,24 +1094,16 @@ impl ReceiverClipboardState {
     ) -> Result<bool> {
         let current = read_clipboard_text(&config.clipboard).await?;
         if current.as_deref() == Some(remote_text) {
-            self.last_observed_text = current;
+            self.tracker.mark_observed(current);
             return Ok(true);
         }
 
-        if current.is_some() && current != self.last_observed_text {
-            self.last_observed_text = current.clone();
-            self.sequence = self.sequence.saturating_add(1);
-            let text = current.unwrap_or_default();
-            write_secure_frame_writer(
-                writer,
-                &Frame::Clipboard(ClipboardEvent::TextOffer {
-                    sequence: self.sequence,
-                    text,
-                }),
-            )
-            .await?;
-            tracing::info!("kept newer Linux clipboard and sent it to controller");
-            return Ok(true);
+        if current.is_some() && !self.tracker.is_observed(&current) {
+            if let Some(event) = self.tracker.offer_current(current) {
+                write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
+                tracing::info!("kept newer Linux clipboard and sent it to controller");
+                return Ok(true);
+            }
         }
 
         Ok(false)

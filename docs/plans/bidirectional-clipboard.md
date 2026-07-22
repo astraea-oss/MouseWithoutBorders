@@ -54,14 +54,14 @@ Rules:
 
 ## Implementation Checklist
 
-- [ ] Add a shared, testable clipboard change tracker.
-- [ ] Add connected-session Windows clipboard change polling.
-- [ ] Add an event-driven Linux Wayland clipboard watcher.
-- [ ] Send unsolicited Linux text offers to Windows.
-- [ ] Suppress remote-write echo loops in both directions.
-- [ ] Keep existing copy/paste-triggered fallback behavior.
-- [ ] Rate-limit or suppress transient clipboard access errors.
-- [ ] Add tracker and platform integration tests.
+- [x] Add a shared, testable clipboard change tracker.
+- [x] Add connected-session Windows clipboard change polling.
+- [x] Add an event-driven Linux Wayland clipboard watcher.
+- [x] Send unsolicited Linux text offers to Windows.
+- [x] Suppress remote-write echo loops in both directions.
+- [x] Keep existing copy/paste-triggered fallback behavior.
+- [x] Rate-limit or suppress transient clipboard access errors.
+- [x] Add tracker and platform integration tests.
 - [ ] Build portable Windows and Linux release artifacts in CI.
 
 ## Acceptance Criteria

@@ -204,7 +204,7 @@ pub fn write_clipboard_text(_text: &str, _max_bytes: usize) -> Result<()> {
 
 #[cfg(windows)]
 mod clipboard {
-    use std::{ptr::null_mut, slice};
+    use std::{ptr::null_mut, slice, thread, time::Duration};
 
     use windows_sys::Win32::{
         Foundation::{GetLastError, GlobalFree},
@@ -294,10 +294,19 @@ mod clipboard {
 
     impl OpenClipboardGuard {
         fn open() -> Result<Self> {
-            if unsafe { OpenClipboard(null_mut()) } == 0 {
-                return Err(last_error("OpenClipboard"));
+            let mut error = 0;
+            for attempt in 0..8 {
+                if unsafe { OpenClipboard(null_mut()) } != 0 {
+                    return Ok(Self);
+                }
+                error = unsafe { GetLastError() };
+                if attempt < 7 {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
-            Ok(Self)
+            Err(WindowsInputError::Clipboard(format!(
+                "OpenClipboard failed with Win32 error {error}"
+            )))
         }
     }
 

@@ -132,10 +132,51 @@ pub enum MouseButton {
     Forward,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardEvent {
     TextOffer { sequence: u64, text: String },
     TextRequest,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardChangeTracker {
+    sequence: u64,
+    last_observed_text: Option<String>,
+}
+
+impl ClipboardChangeTracker {
+    pub fn new(last_observed_text: Option<String>) -> Self {
+        Self {
+            sequence: 0,
+            last_observed_text,
+        }
+    }
+
+    pub fn is_observed(&self, current: &Option<String>) -> bool {
+        &self.last_observed_text == current
+    }
+
+    pub fn mark_observed(&mut self, current: Option<String>) {
+        self.last_observed_text = current;
+    }
+
+    pub fn offer_if_changed(&mut self, current: Option<String>) -> Option<ClipboardEvent> {
+        if self.is_observed(&current) {
+            return None;
+        }
+
+        self.offer_current(current)
+    }
+
+    pub fn offer_current(&mut self, current: Option<String>) -> Option<ClipboardEvent> {
+        self.last_observed_text = current.clone();
+        let text = current?;
+        self.sequence = self.sequence.saturating_add(1);
+        Some(ClipboardEvent::TextOffer {
+            sequence: self.sequence,
+            text,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,6 +279,54 @@ mod tests {
             frame_ms: 5,
             jitter_target_ms: 60,
         });
+        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn clipboard_tracker_only_offers_changed_text() {
+        let mut tracker = ClipboardChangeTracker::new(Some("initial".to_string()));
+
+        assert_eq!(tracker.offer_if_changed(Some("initial".to_string())), None);
+        assert_eq!(
+            tracker.offer_if_changed(Some("next".to_string())),
+            Some(ClipboardEvent::TextOffer {
+                sequence: 1,
+                text: "next".to_string(),
+            })
+        );
+        assert_eq!(tracker.offer_if_changed(Some("next".to_string())), None);
+    }
+
+    #[test]
+    fn clipboard_tracker_suppresses_remote_write_echo() {
+        let mut tracker = ClipboardChangeTracker::new(Some("local".to_string()));
+
+        tracker.mark_observed(Some("remote".to_string()));
+
+        assert_eq!(tracker.offer_if_changed(Some("remote".to_string())), None);
+    }
+
+    #[test]
+    fn clipboard_tracker_reset_allows_identical_text_to_be_copied_again() {
+        let mut tracker = ClipboardChangeTracker::new(Some("repeat".to_string()));
+
+        assert_eq!(tracker.offer_if_changed(None), None);
+        assert_eq!(
+            tracker.offer_if_changed(Some("repeat".to_string())),
+            Some(ClipboardEvent::TextOffer {
+                sequence: 1,
+                text: "repeat".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn clipboard_event_round_trip_preserves_multiline_unicode() {
+        let frame = Frame::Clipboard(ClipboardEvent::TextOffer {
+            sequence: 42,
+            text: "first line\nemoji: ✨\n日本語".to_string(),
+        });
+
         assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
     }
 }

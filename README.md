@@ -62,6 +62,12 @@ cargo run -p edge-receiver-linux -- --test-clipboard
 cargo run -p edge-receiver-linux -- --test-input pointer
 ```
 
+With `[clipboard].enabled = true`, connected devices automatically synchronize
+text clipboard changes in both directions. Linux uses the existing `wl-paste
+--watch` and `wl-copy` tools; Windows uses the native Win32 clipboard. Clipboard
+text remains in memory and on the encrypted session and is never written to an
+app-owned file.
+
 With `input.backend = "auto"`, `--test-input` logs events. The receiver detects
 `libei-1.0` on CachyOS/Arch, but real local injection is still a development
 task. Set `input.backend = "libei"` only once the sender backend is implemented.

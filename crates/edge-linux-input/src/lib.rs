@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc};
+use std::{process::Stdio, sync::Arc, time::Duration};
 
 #[cfg(all(target_os = "linux", feature = "libei"))]
 use std::collections::BTreeSet;
@@ -9,7 +9,13 @@ use edge_protocol::MouseButton;
 use edge_protocol::{InputEvent, OutputInfo, ScreenInfo};
 use serde::Deserialize;
 use std::sync::Mutex;
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::mpsc,
+    task::JoinHandle,
+    time,
+};
 
 #[cfg(target_os = "linux")]
 mod wayland_virtual_input;
@@ -803,6 +809,91 @@ pub async fn read_clipboard_text(config: &ClipboardConfig) -> Result<Option<Stri
         });
     }
     Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+}
+
+pub struct ClipboardChangeWatcher {
+    receiver: mpsc::Receiver<()>,
+    task: JoinHandle<()>,
+}
+
+impl ClipboardChangeWatcher {
+    pub async fn recv(&mut self) -> Option<()> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for ClipboardChangeWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub fn spawn_clipboard_change_watcher() -> ClipboardChangeWatcher {
+    let (sender, receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        loop {
+            let mut command = Command::new("wl-paste");
+            command
+                .arg("--type")
+                .arg("text")
+                .arg("--watch")
+                .arg("sh")
+                .arg("-c")
+                .arg("cat >/dev/null; printf .")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to start Wayland clipboard watcher");
+                    if sender.is_closed() {
+                        return;
+                    }
+                    time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let Some(mut stdout) = child.stdout.take() else {
+                tracing::warn!("Wayland clipboard watcher has no stdout pipe");
+                time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            let mut notifications = [0_u8; 64];
+            loop {
+                match stdout.read(&mut notifications).await {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        for _ in 0..count {
+                            match sender.try_send(()) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                                Err(mpsc::error::TrySendError::Closed(())) => return,
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to read Wayland clipboard watcher");
+                        break;
+                    }
+                }
+            }
+
+            match child.wait().await {
+                Ok(status) => {
+                    tracing::warn!(%status, "Wayland clipboard watcher exited; restarting")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to wait for Wayland clipboard watcher")
+                }
+            }
+            if sender.is_closed() {
+                return;
+            }
+            time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    ClipboardChangeWatcher { receiver, task }
 }
 
 pub async fn write_clipboard_text(config: &ClipboardConfig, text: &str) -> Result<()> {
