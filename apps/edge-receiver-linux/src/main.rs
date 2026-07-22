@@ -4,14 +4,19 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use edge_audio::{PacketCipher, SessionSecrets};
 use edge_common::{
-    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
+    AppConfig, AudioLocalPlayback, Role, default_state_dir, detect_primary_local_ip, init_tracing,
+    portable_config_path,
 };
 use edge_crypto::{
     IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinDecision, PinStore,
@@ -22,13 +27,14 @@ use edge_linux_input::{
     hyprland_screen_info, read_clipboard_text, write_clipboard_text,
 };
 use edge_protocol::{
-    ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo,
-    PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
+    AudioCodec, AudioControl, AudioStreamState, Capability, ClipboardEvent, ControlEvent, Edge,
+    Frame, Heartbeat, Hello, InputEvent, OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError,
+    ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
 use socket2::SockRef;
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     signal::unix::{SignalKind, signal},
     sync::mpsc,
     time,
@@ -56,6 +62,8 @@ struct Args {
     test_input: Option<TestInput>,
     #[arg(long)]
     test_clipboard: bool,
+    #[arg(long, help = "Exercise and restore the Linux audio routing path")]
+    test_audio_route: bool,
     #[arg(long, help = "Disable the StatusNotifier tray item")]
     no_tray: bool,
     #[arg(long, hide = true)]
@@ -127,6 +135,14 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         );
     }
 
+    if let Err(error) = edge_linux_audio::recover_portable_routing(&default_state_dir()).await {
+        tracing::warn!(%error, "failed to recover previous Linux audio routing");
+        append_portable_log(
+            &receiver_log,
+            format!("failed to recover previous Linux audio routing: {error:#}"),
+        );
+    }
+
     if args.settings {
         let settings_input = SettingsUiInput {
             role: Role::Receiver,
@@ -138,6 +154,12 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         tokio::task::spawn_blocking(move || run_settings_window(settings_input))
             .await
             .context("settings window task failed")??;
+        return Ok(());
+    }
+
+    if args.test_audio_route {
+        edge_linux_audio::test_audio_route(&default_state_dir()).await?;
+        tracing::info!("Linux audio route test completed and restored");
         return Ok(());
     }
 
@@ -314,6 +336,9 @@ async fn run_receiver(
                         tracing::info!("reconnect requested from tray");
                         append_portable_log(&log_path, "reconnect requested from tray");
                     }
+                    TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
+                        tracing::info!("audio toggle ignored while no controller is connected");
+                    }
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing without tray commands");
                         append_portable_log(
@@ -406,6 +431,7 @@ async fn run_receiver(
                 device_name: config.device_name.clone(),
                 role: Role::Receiver,
                 public_key_fingerprint: identity.fingerprint(),
+                capabilities: vec![Capability::AudioV1],
             }),
         )
         .await?;
@@ -422,6 +448,17 @@ async fn run_receiver(
             }
         };
 
+        let audio_bind = if addr.ip().is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let audio_socket = Arc::new(
+            UdpSocket::bind(audio_bind)
+                .await
+                .context("failed to bind Linux audio UDP socket")?,
+        );
+
         match handle_controller(
             session,
             &config,
@@ -431,6 +468,8 @@ async fn run_receiver(
             &mut tray_commands,
             &log_path,
             screen_info,
+            audio_socket,
+            addr.ip(),
         )
         .await
         {
@@ -541,6 +580,8 @@ async fn handle_controller(
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
     log_path: &Path,
     screen_info: Option<ScreenInfo>,
+    audio_socket: Arc<UdpSocket>,
+    controller_ip: std::net::IpAddr,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
@@ -550,6 +591,8 @@ async fn handle_controller(
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
     let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
+    let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
+    let mut audio_requested = config.audio.enabled;
 
     loop {
         tokio::select! {
@@ -567,9 +610,15 @@ async fn handle_controller(
                         open_receiver_settings(config_path, log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
                         return Ok(ControllerSessionExit::QuitRequested);
                     }
                     TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
                         backend.all_keys_up().await.ok();
                         write_secure_frame_writer(
                             &mut writer,
@@ -582,6 +631,21 @@ async fn handle_controller(
                         return Ok(ControllerSessionExit::DisconnectRequested);
                     }
                     TrayCommandEvent::Command(TrayCommand::Reconnect) => {}
+                    TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
+                        audio_requested = !audio_requested;
+                        if !audio_requested
+                            && let Some(sender) = audio_sender.take()
+                        {
+                            sender.stop().await.ok();
+                        }
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::SetEnabled {
+                                enabled: audio_requested,
+                            }),
+                        )
+                        .await?;
+                    }
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing session without tray commands");
                         append_portable_log(
@@ -652,6 +716,135 @@ async fn handle_controller(
                         return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
                     }
+                    Frame::Audio(AudioControl::Start {
+                        session_id,
+                        session_salt,
+                        session_key,
+                        codec,
+                        frame_ms,
+                        jitter_target_ms: _,
+                    }) => {
+                        if codec != AudioCodec::PcmS16Stereo48Khz
+                            || frame_ms != edge_audio::FRAME_MS
+                        {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::State {
+                                    state: AudioStreamState::Error,
+                                    detail: Some("unsupported audio format".to_string()),
+                                }),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
+                        let secrets = SessionSecrets {
+                            session_id,
+                            session_salt,
+                            session_key,
+                        };
+                        let cipher = PacketCipher::new(&secrets);
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::WaitingForUdp,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                        match time::timeout(
+                            Duration::from_secs(3),
+                            edge_linux_audio::wait_for_probe(
+                                &audio_socket,
+                                &cipher,
+                                controller_ip,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(destination)) => {
+                                let redirect = config.audio.local_playback
+                                    == AudioLocalPlayback::Redirect;
+                                match edge_linux_audio::LinuxAudioSender::start(
+                                    audio_socket.clone(),
+                                    destination,
+                                    secrets,
+                                    &default_state_dir(),
+                                    redirect,
+                                )
+                                .await
+                                {
+                                    Ok(sender) => {
+                                        audio_sender = Some(sender);
+                                        write_secure_frame_writer(
+                                            &mut writer,
+                                            &Frame::Audio(AudioControl::State {
+                                                state: AudioStreamState::Streaming,
+                                                detail: None,
+                                            }),
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "failed to start Linux audio capture");
+                                        write_secure_frame_writer(
+                                            &mut writer,
+                                            &Frame::Audio(AudioControl::State {
+                                                state: AudioStreamState::Error,
+                                                detail: Some(error.to_string()),
+                                            }),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "invalid Windows audio UDP probe");
+                            }
+                            Err(_) => {
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Error,
+                                        detail: Some(
+                                            "timed out waiting for Windows audio UDP probe"
+                                                .to_string(),
+                                        ),
+                                    }),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Frame::Audio(
+                        AudioControl::SetEnabled { enabled: false }
+                        | AudioControl::Stop { .. },
+                    ) => {
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Disabled,
+                                detail: None,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::Offer {
+                                udp_port: audio_socket.local_addr()?.port(),
+                                codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+                            }),
+                        )
+                        .await?;
+                    }
+                    Frame::Audio(AudioControl::State { .. } | AudioControl::Offer { .. }) => {}
                     Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
                 }
             }

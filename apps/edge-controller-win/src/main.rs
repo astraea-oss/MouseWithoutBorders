@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use edge_audio::SessionSecrets;
 #[cfg(windows)]
 use edge_common::PeerPosition;
 use edge_common::{
@@ -24,11 +25,15 @@ use edge_geometry::Size;
 #[cfg(windows)]
 use edge_protocol::Edge;
 use edge_protocol::{
-    ClipboardEvent, ControlEvent, Frame, Hello, InputEvent, MouseButton, PROTOCOL_VERSION,
-    ScreenInfo, decode_frame, encode_frame,
+    AudioCodec, AudioControl, Capability, ClipboardEvent, ControlEvent, Frame, Hello, InputEvent,
+    MouseButton, PROTOCOL_VERSION, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput};
-use tokio::{net::TcpStream, sync::mpsc, time};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    sync::mpsc,
+    time,
+};
 
 #[cfg(windows)]
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
@@ -58,6 +63,8 @@ struct Args {
         help = "Send one text clipboard offer over the encrypted session"
     )]
     test_clipboard_text: Option<String>,
+    #[arg(long, help = "Play a local audio pipeline test tone")]
+    test_audio: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -102,6 +109,13 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         );
     }
 
+    if args.test_audio {
+        tokio::task::spawn_blocking(edge_windows_audio::play_test_tone)
+            .await
+            .context("audio test task failed")??;
+        return Ok(());
+    }
+
     let identity = IdentityKey::load_or_create(default_state_dir().join("identity.toml"))
         .await
         .context("failed to load controller identity")?;
@@ -137,12 +151,15 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             });
 
             loop {
-                if handle_pending_windows_tray_commands(
-                    &mut tray_command_rx,
-                    &config_path,
-                    &config,
-                    &controller_log,
-                )? {
+                if matches!(
+                    handle_pending_windows_tray_commands(
+                        &mut tray_command_rx,
+                        &config_path,
+                        &config,
+                        &controller_log,
+                    )?,
+                    TrayCommandOutcome::Quit
+                ) {
                     return Ok(());
                 }
 
@@ -269,12 +286,19 @@ fn update_windows_tray_status(status: &str, log_path: &Path) {
 }
 
 #[cfg(windows)]
+enum TrayCommandOutcome {
+    Continue,
+    Quit,
+    AudioChanged(bool),
+}
+
+#[cfg(windows)]
 fn handle_pending_windows_tray_commands(
     commands: &mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>,
     config_path: &Path,
     config: &AppConfig,
     log_path: &Path,
-) -> Result<bool> {
+) -> Result<TrayCommandOutcome> {
     while let Ok(command) = commands.try_recv() {
         match command {
             edge_windows_input::WindowsTrayCommand::OpenSettings => {
@@ -294,14 +318,27 @@ fn handle_pending_windows_tray_commands(
             edge_windows_input::WindowsTrayCommand::ReleaseControl => {
                 edge_windows_input::release_to_local(edge_protocol::ReleaseReason::UserRequest);
             }
+            edge_windows_input::WindowsTrayCommand::ToggleAudio => {
+                let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
+                    tracing::warn!(%err, "failed to reload config for audio toggle");
+                    config.clone()
+                });
+                updated.audio.enabled = !updated.audio.enabled;
+                updated.save_blocking(config_path)?;
+                append_portable_log(
+                    log_path,
+                    format!("audio streaming toggled to {}", updated.audio.enabled),
+                );
+                return Ok(TrayCommandOutcome::AudioChanged(updated.audio.enabled));
+            }
             edge_windows_input::WindowsTrayCommand::Quit => {
                 append_portable_log(log_path, "quit requested from tray");
-                return Ok(true);
+                return Ok(TrayCommandOutcome::Quit);
             }
         }
     }
 
-    Ok(false)
+    Ok(TrayCommandOutcome::Continue)
 }
 
 #[cfg(windows)]
@@ -329,6 +366,7 @@ fn install_controller_panic_log(log_path: PathBuf) {
 struct ControllerConnection {
     session: NoiseSession<TcpStream>,
     addr: String,
+    peer_addr: std::net::SocketAddr,
     peer_fingerprint: String,
 }
 
@@ -351,6 +389,9 @@ async fn connect_session(
     let stream = TcpStream::connect(&addr)
         .await
         .with_context(|| format!("failed to connect to {addr}"))?;
+    let peer_addr = stream
+        .peer_addr()
+        .context("failed to query receiver address")?;
     let (mut session, peer_fingerprint) =
         initiate_noise_session(stream, identity, Some(&peer.pinned_fingerprint))
             .await
@@ -363,6 +404,7 @@ async fn connect_session(
             device_name: config.device_name.clone(),
             role: Role::Controller,
             public_key_fingerprint: identity.fingerprint(),
+            capabilities: vec![Capability::AudioV1],
         }),
     )
     .await?;
@@ -371,6 +413,7 @@ async fn connect_session(
     Ok(ControllerConnection {
         session,
         addr,
+        peer_addr,
         peer_fingerprint,
     })
 }
@@ -509,6 +552,16 @@ async fn run_connected_inner(
     let mut tray_command_poll = time::interval(Duration::from_millis(200));
     let mut connection_watchdog = time::interval(Duration::from_secs(1));
     let mut last_receiver_activity = Instant::now();
+    let peer_ip = connection.peer_addr.ip();
+    let mut _audio_receiver: Option<edge_windows_audio::WindowsAudioReceiver> = None;
+    let mut audio_enabled = config.audio.enabled;
+    write_secure_frame_writer(
+        &mut writer,
+        &Frame::Audio(AudioControl::SetEnabled {
+            enabled: audio_enabled,
+        }),
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -530,11 +583,19 @@ async fn run_connected_inner(
                 }
             },
             _ = tray_command_poll.tick(), if tray_commands.is_some() => {
-                if let Some(commands) = tray_commands.as_deref_mut()
-                    && handle_pending_windows_tray_commands(commands, config_path, config, log_path)?
-                {
-                    write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
-                    return Ok(());
+                if let Some(commands) = tray_commands.as_deref_mut() {
+                    match handle_pending_windows_tray_commands(commands, config_path, config, log_path)? {
+                        TrayCommandOutcome::Quit => {
+                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            return Ok(());
+                        }
+                        TrayCommandOutcome::AudioChanged(enabled) => {
+                            audio_enabled = enabled;
+                            if !enabled { _audio_receiver = None; }
+                            write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled })).await?;
+                        }
+                        TrayCommandOutcome::Continue => {}
+                    }
                 }
             },
             event = recv_live_input(&mut input_rx) => {
@@ -576,6 +637,59 @@ async fn run_connected_inner(
                     }
                     Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
+                    Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
+                        if audio_enabled && codecs.contains(&AudioCodec::PcmS16Stereo48Khz) {
+                            let secrets = SessionSecrets::generate();
+                            let bind_addr = if peer_ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                            match UdpSocket::bind(bind_addr).await {
+                                Ok(socket) => {
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Start {
+                                        session_id: secrets.session_id,
+                                        session_salt: secrets.session_salt,
+                                        session_key: secrets.session_key,
+                                        codec: AudioCodec::PcmS16Stereo48Khz,
+                                        frame_ms: edge_audio::FRAME_MS,
+                                        jitter_target_ms: config.audio.jitter_target_ms as u16,
+                                    })).await?;
+                                    match edge_windows_audio::WindowsAudioReceiver::start(
+                                        socket,
+                                        std::net::SocketAddr::new(peer_ip, udp_port),
+                                        secrets,
+                                        config.audio.jitter_target_ms,
+                                    ).await {
+                                        Ok(receiver) => {
+                                            _audio_receiver = Some(receiver);
+                                            tracing::info!(udp_port, "started Linux audio receiver");
+                                        }
+                                        Err(error) => tracing::warn!(%error, "failed to start Windows audio playback"),
+                                    }
+                                }
+                                Err(error) => tracing::warn!(%error, "failed to bind Windows audio UDP socket"),
+                            }
+                        }
+                    }
+                    Frame::Audio(AudioControl::State { state, detail }) => {
+                        tracing::info!(?state, ?detail, "Linux audio state changed");
+                    }
+                    Frame::Audio(AudioControl::Stop { .. } | AudioControl::SetEnabled { enabled: false }) => {
+                        audio_enabled = false;
+                        _audio_receiver = None;
+                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| config.clone());
+                        updated.audio.enabled = false;
+                        if let Err(error) = updated.save_blocking(config_path) {
+                            tracing::warn!(%error, "failed to persist Linux audio toggle");
+                        }
+                    }
+                    Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
+                        audio_enabled = true;
+                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| config.clone());
+                        updated.audio.enabled = true;
+                        if let Err(error) = updated.save_blocking(config_path) {
+                            tracing::warn!(%error, "failed to persist Linux audio toggle");
+                        }
+                        write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
+                    }
+                    Frame::Audio(other) => tracing::debug!(?other, "audio control frame"),
                     other => tracing::debug!(?other, "receiver frame"),
                 }
             },

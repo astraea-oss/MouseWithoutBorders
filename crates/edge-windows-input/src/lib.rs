@@ -46,6 +46,7 @@ pub enum CapturedInput {
 pub enum WindowsTrayCommand {
     OpenSettings,
     ReleaseControl,
+    ToggleAudio,
     Quit,
 }
 
@@ -2161,6 +2162,7 @@ mod tray {
     const ID_SETTINGS: usize = 1001;
     const ID_RELEASE: usize = 1002;
     const ID_QUIT: usize = 1003;
+    const ID_AUDIO: usize = 1004;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_COMMANDS: Mutex<Option<mpsc::Sender<WindowsTrayCommand>>> = Mutex::new(None);
@@ -2276,6 +2278,7 @@ mod tray {
                 tracing::info!("release requested from tray");
                 send_tray_command(WindowsTrayCommand::ReleaseControl);
             }
+            ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
             ID_QUIT => {
                 send_tray_command(WindowsTrayCommand::Quit);
                 remove_tray_icon(hwnd);
@@ -2368,6 +2371,7 @@ mod tray {
         let status = current_tray_status();
         let settings = to_wide("Settings...");
         let release = to_wide("Release control");
+        let audio = to_wide("Toggle Linux audio");
         let quit = to_wide("Quit");
 
         unsafe {
@@ -2375,6 +2379,7 @@ mod tray {
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_AUDIO, audio.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
             let mut point = POINT::default();

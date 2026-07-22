@@ -8,7 +8,7 @@ The first release will:
 
 - Capture the Linux system mix through PipeWire.
 - Redirect audio away from the laptop speakers while streaming.
-- Encode stereo audio as Opus at 48 kHz and approximately 128 kbps.
+- Encode stereo audio as signed 16-bit PCM at 48 kHz with no native codec dependency.
 - Send audio over a separate encrypted UDP channel so audio congestion cannot stall mouse, keyboard, clipboard, or heartbeat traffic.
 - Target approximately 60–100 ms end-to-end latency on a normal LAN.
 - Play through the current Windows default multimedia output and follow device changes.
@@ -23,7 +23,7 @@ Audio remains disabled by default after upgrading, preventing an update from une
 
 Add three crates:
 
-- `crates/edge-audio`: shared Opus wrappers, the encrypted UDP packet format, replay protection, packet-loss handling, jitter buffering, and statistics.
+- `crates/edge-audio`: shared PCM conversion, the encrypted UDP packet format, replay protection, packet-loss handling, jitter buffering, and statistics.
 - `crates/edge-linux-audio`: PipeWire capture, PipeWire-Pulse routing and restoration, and Linux audio lifecycle and crash recovery.
 - `crates/edge-windows-audio`: Windows output through CPAL/WASAPI, default-output monitoring, decoding, resampling, and playback buffering.
 
@@ -35,11 +35,11 @@ Keep audio out of the existing input crates because its real-time lifecycle and 
 Linux applications
     -> temporary edge_kvm_remote PipeWire sink
     -> edge-linux-audio capture
-    -> 20 ms stereo PCM frames
-    -> Opus encoder
+    -> 5 ms stereo PCM frames
+    -> signed 16-bit PCM conversion
     -> ChaCha20-Poly1305 UDP packets
     -> Windows jitter buffer
-    -> Opus decoder / packet-loss concealment
+    -> PCM decoder / silence concealment
     -> sample-rate converter
     -> CPAL/WASAPI default output
 ```
@@ -54,7 +54,6 @@ Extend `edge_common::AppConfig` with an `AudioConfig`:
 pub struct AudioConfig {
     pub enabled: bool,
     pub local_playback: AudioLocalPlayback,
-    pub bitrate_kbps: u32,
     pub jitter_target_ms: u32,
 }
 
@@ -71,17 +70,15 @@ Defaults:
 [audio]
 enabled = false
 local_playback = "redirect"
-bitrate_kbps = 128
 jitter_target_ms = 60
 ```
 
 Requirements:
 
 - Existing configurations deserialize with audio disabled.
-- Validate `bitrate_kbps` within `64..=256`.
 - Validate `jitter_target_ms` within `40..=120`.
 - Initially expose only the enable and local-playback choices in the settings UI.
-- Keep bitrate and jitter as advanced TOML options.
+- Keep jitter as an advanced TOML option.
 - Store configuration, logs, and `state/audio-routing.toml` beside each executable.
 
 ## Control Protocol
@@ -91,12 +88,12 @@ Retain the authenticated Noise TCP connection for negotiation and state changes.
 Add `Frame::Audio(AudioControl)` with these messages:
 
 - `Offer { udp_port, codecs }`
-- `Start { session_id, session_salt, session_key, codec, bitrate_kbps, frame_ms, jitter_target_ms }`
+- `Start { session_id, session_salt, session_key, codec, frame_ms, jitter_target_ms }`
 - `SetEnabled { enabled }`
 - `State { state, detail }`
 - `Stop { reason }`
 
-The initial codec is `AudioCodec::OpusStereo48Khz`. Stream states are `Disabled`, `WaitingForUdp`, `Starting`, `Streaming`, and `Error`.
+The initial format is `AudioCodec::PcmS16Stereo48Khz`. Stream states are `Disabled`, `WaitingForUdp`, `Starting`, `Streaming`, and `Error`.
 
 Compatibility rules:
 
@@ -121,7 +118,7 @@ Compatibility rules:
 
 Use a compact, versioned header with magic `EKA1`, version, flags, header length, 128-bit session ID, 64-bit sequence, and 32-bit sample timestamp.
 
-- Encrypt each Opus payload with ChaCha20-Poly1305.
+- Encrypt each PCM payload with ChaCha20-Poly1305.
 - Build the nonce from the four-byte session salt and 64-bit sequence.
 - Authenticate the complete header as additional authenticated data.
 - Keep datagrams below 1,200 bytes.
@@ -167,19 +164,19 @@ Run restoration on toggle-off, control disconnect, heartbeat timeout, UDP timeou
 ### Encoding
 
 - Capture interleaved stereo `f32` at 48 kHz.
-- Encode 960 samples per channel into each 20 ms Opus packet.
-- Use audio mode, 128 kbps VBR, no DTX, and LAN-appropriate packet-loss resilience.
-- Vendor and statically link libopus so Windows needs no Opus DLL.
+- Encode 240 samples per channel into each 5 ms PCM packet.
+- Use interleaved signed 16-bit little-endian samples, requiring approximately 1.54 Mbps before packet overhead.
+- Keep packets below 1,200 bytes and avoid native codec libraries or DLLs.
 - Bound all PCM and encoded queues.
 
 ## Windows Playback
 
 ### Receive pipeline
 
-- Authenticate and decrypt before parsing Opus data.
+- Authenticate and decrypt before parsing PCM data.
 - Buffer packets by sequence and begin playback near 60 ms.
 - Adapt between 40 and 120 ms based on late packets and underruns.
-- Use Opus in-band recovery when possible and packet-loss concealment otherwise.
+- Conceal a missing 5 ms packet with silence while keeping the timeline bounded.
 - Drop packets that have missed their playback deadline.
 - Reset on session or timestamp discontinuity.
 - Drop oldest buffered audio and resynchronize rather than allowing delay to grow indefinitely.
@@ -249,7 +246,7 @@ Windows metrics:
 
 - Received, rejected, duplicate, late, and lost packets.
 - Authentication failures.
-- Jitter depth and FEC/PLC recovery.
+- Jitter depth and concealed packet count.
 - Playback underruns and overflows.
 - Output-device rebuilds.
 
@@ -263,7 +260,7 @@ If authenticated media is absent for two seconds, request one audio-channel rest
 - Capability compatibility and every audio control MessagePack round trip.
 - Packet round trips, tampering, wrong session, replay, truncation, oversize, and nonce uniqueness.
 - Jitter ordering, loss, duplication, late delivery, overflow, reset, and sequence wraparound.
-- Opus silence, tone, stereo separation, and concealment frame length.
+- PCM silence, tone, stereo separation, and concealment frame length.
 
 ### Linux tests
 
@@ -281,7 +278,7 @@ Add `edge-receiver-linux --test-audio-route` to create the temporary sink, captu
 
 ### Windows tests
 
-- Drive decoding, resampling, and buffering with synthetic encrypted Opus packets.
+- Drive decoding, resampling, and buffering with synthetic encrypted PCM packets.
 - Verify underrun silence and overflow policy.
 - Verify default-device rebuild and stale-buffer reset.
 - Verify audio failures do not affect input capture.
@@ -304,7 +301,7 @@ Add `edge-controller-win.exe --test-audio` to play a local encoded/decoded test 
 ## Implementation Sequence
 
 1. Add configuration, validation, capabilities, and audio control messages.
-2. Build shared packet security, Opus, jitter, and unit tests.
+2. Build shared packet security, PCM conversion, jitter, and unit tests.
 3. Build Windows synthetic receive/decode/playback and output switching.
 4. Add Linux PipeWire capture without rerouting and verify Windows playback.
 5. Add transactional null-sink routing, restoration, and crash recovery.
@@ -320,7 +317,7 @@ Included:
 
 - One Linux source and one Windows destination.
 - All system audio.
-- Stereo Opus.
+- Stereo signed 16-bit PCM, with optional compressed profiles deferred.
 - Redirect and mirror behavior.
 - LAN operation through the existing paired relationship.
 - Default Windows output.
