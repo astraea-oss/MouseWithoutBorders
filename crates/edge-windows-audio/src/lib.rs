@@ -22,14 +22,15 @@ mod implementation {
     };
     use tokio::{net::UdpSocket, task::JoinHandle, time};
 
-    const PLAYBACK_QUEUE_CHUNKS: usize = 32;
+    const PLAYBACK_QUEUE_CHUNKS: usize = 64;
+    const OUTPUT_PREBUFFER_MS: u32 = 30;
+    const OUTPUT_QUEUE_LIMIT_MS: u32 = 200;
 
     pub struct AudioPlayer {
         sender: SyncSender<Vec<f32>>,
         _stream: Stream,
         output_name: String,
-        output_rate: u32,
-        output_channels: usize,
+        converter: OutputConverter,
     }
 
     impl AudioPlayer {
@@ -46,11 +47,33 @@ mod implementation {
             let config: StreamConfig = supported.into();
             let output_rate = config.sample_rate;
             let output_channels = config.channels as usize;
+            let prebuffer_samples =
+                duration_samples(output_rate, output_channels, OUTPUT_PREBUFFER_MS);
+            let queue_limit_samples =
+                duration_samples(output_rate, output_channels, OUTPUT_QUEUE_LIMIT_MS);
             let (sender, receiver) = mpsc::sync_channel(PLAYBACK_QUEUE_CHUNKS);
             let stream = match sample_format {
-                SampleFormat::F32 => build_stream::<f32>(&device, config, receiver)?,
-                SampleFormat::I16 => build_stream::<i16>(&device, config, receiver)?,
-                SampleFormat::U16 => build_stream::<u16>(&device, config, receiver)?,
+                SampleFormat::F32 => build_stream::<f32>(
+                    &device,
+                    config,
+                    receiver,
+                    prebuffer_samples,
+                    queue_limit_samples,
+                )?,
+                SampleFormat::I16 => build_stream::<i16>(
+                    &device,
+                    config,
+                    receiver,
+                    prebuffer_samples,
+                    queue_limit_samples,
+                )?,
+                SampleFormat::U16 => build_stream::<u16>(
+                    &device,
+                    config,
+                    receiver,
+                    prebuffer_samples,
+                    queue_limit_samples,
+                )?,
                 format => anyhow::bail!("unsupported Windows output sample format: {format}"),
             };
             stream
@@ -66,8 +89,7 @@ mod implementation {
                 sender,
                 _stream: stream,
                 output_name,
-                output_rate,
-                output_channels,
+                converter: OutputConverter::new(output_rate, output_channels),
             })
         }
 
@@ -78,8 +100,8 @@ mod implementation {
             Ok(device.to_string())
         }
 
-        pub fn push_48k_stereo(&self, pcm: &[f32]) {
-            let converted = convert_output(pcm, self.output_rate, self.output_channels);
+        pub fn push_48k_stereo(&mut self, pcm: &[f32]) {
+            let converted = self.converter.convert(pcm);
             let _ = self.sender.try_send(converted);
         }
     }
@@ -88,11 +110,14 @@ mod implementation {
         device: &Device,
         config: StreamConfig,
         receiver: mpsc::Receiver<Vec<f32>>,
+        prebuffer_samples: usize,
+        queue_limit_samples: usize,
     ) -> Result<Stream>
     where
         T: SizedSample + Sample + FromSample<f32>,
     {
         let mut queued = VecDeque::with_capacity(SAMPLE_RATE as usize * 2);
+        let mut playback_started = false;
         device
             .build_output_stream(
                 config,
@@ -103,8 +128,25 @@ mod implementation {
                             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                         }
                     }
+                    while queued.len() > queue_limit_samples {
+                        queued.pop_front();
+                    }
+                    if !playback_started && queued.len() >= prebuffer_samples {
+                        playback_started = true;
+                    }
                     for sample in output {
-                        *sample = T::from_sample(queued.pop_front().unwrap_or(0.0));
+                        let value = if playback_started {
+                            match queued.pop_front() {
+                                Some(value) => value,
+                                None => {
+                                    playback_started = false;
+                                    0.0
+                                }
+                            }
+                        } else {
+                            0.0
+                        };
+                        *sample = T::from_sample(value);
                     }
                 },
                 |error| tracing::warn!(%error, "Windows audio output error"),
@@ -113,34 +155,64 @@ mod implementation {
             .context("failed to build Windows output stream")
     }
 
-    fn convert_output(input: &[f32], output_rate: u32, output_channels: usize) -> Vec<f32> {
-        if input.is_empty() || output_channels == 0 {
-            return Vec::new();
-        }
-        let input_frames = input.len() / CHANNELS;
-        let output_frames =
-            ((input_frames as u64 * output_rate as u64) / SAMPLE_RATE as u64) as usize;
-        let mut output = Vec::with_capacity(output_frames * output_channels);
-        for output_frame in 0..output_frames {
-            let source = output_frame as f64 * SAMPLE_RATE as f64 / output_rate as f64;
-            let left_index = source.floor() as usize;
-            let right_index = (left_index + 1).min(input_frames.saturating_sub(1));
-            let fraction = (source - left_index as f64) as f32;
-            let left = [input[left_index * 2], input[left_index * 2 + 1]];
-            let right = [input[right_index * 2], input[right_index * 2 + 1]];
-            let stereo = [
-                left[0] + (right[0] - left[0]) * fraction,
-                left[1] + (right[1] - left[1]) * fraction,
-            ];
-            for channel in 0..output_channels {
-                output.push(match channel {
-                    0 => stereo[0],
-                    1 => stereo[1],
-                    _ => (stereo[0] + stereo[1]) * 0.5,
-                });
+    fn duration_samples(rate: u32, channels: usize, duration_ms: u32) -> usize {
+        ((rate as u64 * channels as u64 * duration_ms as u64) / 1_000) as usize
+    }
+
+    struct OutputConverter {
+        output_rate: u32,
+        output_channels: usize,
+        source_position: f64,
+        input_frames: VecDeque<[f32; CHANNELS]>,
+    }
+
+    impl OutputConverter {
+        fn new(output_rate: u32, output_channels: usize) -> Self {
+            Self {
+                output_rate,
+                output_channels,
+                source_position: 0.0,
+                input_frames: VecDeque::new(),
             }
         }
-        output
+
+        fn convert(&mut self, input: &[f32]) -> Vec<f32> {
+            if input.is_empty() || self.output_channels == 0 || self.output_rate == 0 {
+                return Vec::new();
+            }
+            self.input_frames.extend(
+                input
+                    .chunks_exact(CHANNELS)
+                    .map(|frame| [frame[0], frame[1]]),
+            );
+            let step = SAMPLE_RATE as f64 / self.output_rate as f64;
+            let estimated_frames =
+                ((self.input_frames.len() as f64 - self.source_position).max(0.0) / step).ceil()
+                    as usize;
+            let mut output = Vec::with_capacity(estimated_frames * self.output_channels);
+            while self.source_position + 1.0 < self.input_frames.len() as f64 {
+                let left_index = self.source_position.floor() as usize;
+                let fraction = (self.source_position - left_index as f64) as f32;
+                let left = self.input_frames[left_index];
+                let right = self.input_frames[left_index + 1];
+                let stereo = [
+                    left[0] + (right[0] - left[0]) * fraction,
+                    left[1] + (right[1] - left[1]) * fraction,
+                ];
+                for channel in 0..self.output_channels {
+                    output.push(match channel {
+                        0 => stereo[0],
+                        1 => stereo[1],
+                        _ => (stereo[0] + stereo[1]) * 0.5,
+                    });
+                }
+                self.source_position += step;
+            }
+            let consumed = self.source_position.floor() as usize;
+            self.input_frames.drain(..consumed);
+            self.source_position -= consumed as f64;
+            output
+        }
     }
 
     pub struct WindowsAudioReceiver {
@@ -286,7 +358,7 @@ mod implementation {
     }
 
     pub fn play_test_tone() -> Result<()> {
-        let player = AudioPlayer::open_default()?;
+        let mut player = AudioPlayer::open_default()?;
         for frame in 0..200 {
             let mut pcm = Vec::with_capacity(SAMPLES_PER_CHANNEL * 2);
             for sample in 0..SAMPLES_PER_CHANNEL {
@@ -307,7 +379,11 @@ mod implementation {
         #[test]
         fn resampler_preserves_duration_and_channels() {
             let input = vec![0.25; 480 * 2];
-            let output = convert_output(&input, 44_100, 2);
+            let mut converter = OutputConverter::new(44_100, 2);
+            let mut output = Vec::new();
+            for frame in input.chunks_exact(SAMPLES_PER_CHANNEL * CHANNELS) {
+                output.extend(converter.convert(frame));
+            }
             assert_eq!(output.len(), 441 * 2);
             assert!(
                 output
