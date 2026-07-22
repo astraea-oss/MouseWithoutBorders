@@ -255,14 +255,14 @@ impl JitterBuffer {
         inserted
     }
 
-    pub fn pop(&mut self) -> Option<Option<AudioPacket>> {
-        if !self.started {
-            if self.packets.len() < self.target_packets {
-                return None;
-            }
-            self.started = true;
-        }
+    pub fn pop_ready(&mut self) -> Option<Option<AudioPacket>> {
         let sequence = self.next_sequence?;
+        let highest = *self.packets.last_key_value()?.0;
+        let buffered_timeline = highest.saturating_sub(sequence) as usize + 1;
+        if buffered_timeline < self.target_packets {
+            return None;
+        }
+        self.started = true;
         self.next_sequence = Some(sequence.wrapping_add(1));
         Some(self.packets.remove(&sequence))
     }
@@ -311,10 +311,11 @@ mod tests {
         let mut jitter = JitterBuffer::new(10);
         assert!(jitter.push(packet(10)));
         assert!(jitter.push(packet(12)));
-        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 10);
-        assert!(jitter.pop().unwrap().is_none());
-        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 12);
-        assert!(jitter.pop().unwrap().is_none());
+        assert_eq!(jitter.pop_ready().unwrap().unwrap().sequence, 10);
+        assert!(jitter.pop_ready().unwrap().is_none());
+        assert!(jitter.pop_ready().is_none());
+        assert!(jitter.push(packet(13)));
+        assert_eq!(jitter.pop_ready().unwrap().unwrap().sequence, 12);
     }
 
     #[test]
@@ -322,8 +323,10 @@ mod tests {
         let mut jitter = JitterBuffer::new(10);
         assert!(jitter.push(packet(11)));
         assert!(jitter.push(packet(10)));
-        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 10);
-        assert_eq!(jitter.pop().unwrap().unwrap().sequence, 11);
+        assert_eq!(jitter.pop_ready().unwrap().unwrap().sequence, 10);
+        assert!(jitter.pop_ready().is_none());
+        assert!(jitter.push(packet(12)));
+        assert_eq!(jitter.pop_ready().unwrap().unwrap().sequence, 11);
     }
 
     #[test]
