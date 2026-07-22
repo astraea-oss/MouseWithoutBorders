@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+libei = []
+
 [dependencies]
 edge-common = { path = "../edge-common" }
 edge-protocol = { path = "../edge-protocol" }

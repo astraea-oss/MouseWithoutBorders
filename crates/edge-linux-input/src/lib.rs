@@ -1,7 +1,12 @@
-use std::{collections::BTreeSet, process::Stdio, sync::Arc};
+use std::{process::Stdio, sync::Arc};
+
+#[cfg(all(target_os = "linux", feature = "libei"))]
+use std::collections::BTreeSet;
 
 use edge_common::ClipboardConfig;
-use edge_protocol::{InputEvent, MouseButton, OutputInfo, ScreenInfo};
+#[cfg(all(target_os = "linux", feature = "libei"))]
+use edge_protocol::MouseButton;
+use edge_protocol::{InputEvent, OutputInfo, ScreenInfo};
 use serde::Deserialize;
 use std::sync::Mutex;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -140,11 +145,11 @@ impl LibeiBackend {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", feature = "libei")))]
 #[derive(Debug)]
 struct LibeiSender;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", feature = "libei")))]
 impl LibeiSender {
     fn connect() -> Result<Self> {
         Err(LinuxInputError::LibeiUnsupportedPlatform)
@@ -155,7 +160,7 @@ impl LibeiSender {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 #[derive(Debug)]
 struct LibeiSender {
     oeffis: *mut ffi::Oeffis,
@@ -170,10 +175,10 @@ struct LibeiSender {
     sequence: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 unsafe impl Send for LibeiSender {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 impl LibeiSender {
     fn connect() -> Result<Self> {
         let oeffis = OeffisContext::connect_to_eis()?;
@@ -473,7 +478,7 @@ impl LibeiSender {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 impl Drop for LibeiSender {
     fn drop(&mut self) {
         let _ = self.all_keys_up();
@@ -501,13 +506,13 @@ impl Drop for LibeiSender {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 #[derive(Debug)]
 struct OeffisContext {
     raw: *mut ffi::Oeffis,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 impl OeffisContext {
     fn connect_to_eis() -> Result<Self> {
         let raw = unsafe { ffi::oeffis_new(std::ptr::null_mut()) };
@@ -595,7 +600,7 @@ impl OeffisContext {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 impl Drop for OeffisContext {
     fn drop(&mut self) {
         if !self.raw.is_null() {
@@ -606,7 +611,7 @@ impl Drop for OeffisContext {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 fn poll_fd(fd: libc::c_int, timeout_ms: i32) -> Result<bool> {
     let mut pollfd = libc::pollfd {
         fd,
@@ -620,7 +625,7 @@ fn poll_fd(fd: libc::c_int, timeout_ms: i32) -> Result<bool> {
     Ok(rc > 0 && (pollfd.revents & libc::POLLIN) != 0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 fn linux_button_code(button: MouseButton) -> u32 {
     match button {
         MouseButton::Left => 0x110,
@@ -631,7 +636,7 @@ fn linux_button_code(button: MouseButton) -> u32 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "libei"))]
 #[allow(non_upper_case_globals)]
 mod ffi {
     use libc::{c_char, c_int, c_uint, c_void, size_t};

@@ -1,8 +1,6 @@
 name: Audio feature builds
 
 on:
-  push:
-    branches: [feature/linux-audio-streaming]
   pull_request:
     branches: [main]
 
@@ -27,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libei-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
       - name: Test Linux workspace
         run: cargo test --workspace --exclude edge-controller-win
       - name: Build Linux receiver
