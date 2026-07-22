@@ -62,7 +62,7 @@ Rules:
 - [x] Keep existing copy/paste-triggered fallback behavior.
 - [x] Rate-limit or suppress transient clipboard access errors.
 - [x] Add tracker and platform integration tests.
-- [ ] Build portable Windows and Linux release artifacts in CI.
+- [x] Build portable Windows and Linux release artifacts in CI.
 
 ## Acceptance Criteria
 
@@ -83,3 +83,12 @@ Rules:
 - Run the Windows workspace tests and release build.
 - Run the Linux workspace tests and release build in CI.
 - Perform live copy/paste checks in both directions using keyboard shortcuts and application menus.
+
+## Live Acceptance Results
+
+- [x] Windows-to-Linux text copy and paste works on the physical devices.
+- [x] Linux-to-Windows text copy and paste works on the physical devices.
+- [x] Clipboard activity produces no synchronization errors or repeated network loop.
+- [x] Input remains operational during clipboard synchronization.
+- [x] Audio remains streaming with stable queue depth after clipboard testing.
+- [x] Portable configuration and state remain beside the executables.
