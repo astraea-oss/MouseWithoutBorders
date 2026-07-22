@@ -16,6 +16,7 @@ use tokio::{
     io::AsyncReadExt,
     net::UdpSocket,
     process::{Child, Command},
+    sync::oneshot,
     task::JoinHandle,
 };
 
@@ -252,17 +253,19 @@ impl LinuxAudioSender {
         state_dir: &Path,
         redirect: bool,
     ) -> Result<Self> {
-        let routing = AudioRoutingGuard::activate(state_dir, redirect).await?;
+        let mut routing = AudioRoutingGuard::activate(state_dir, redirect).await?;
         let mut capture = spawn_capture(routing.capture_source())?;
         let mut stdout = capture
             .stdout
             .take()
             .context("parec stdout was not piped")?;
         let cipher = PacketCipher::new(&secrets);
+        let (first_packet_tx, first_packet_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut frame = vec![0; SAMPLES_PER_FRAME * 4];
             let mut sequence = 1_u64;
             let mut timestamp = 0_u32;
+            let mut first_packet_tx = Some(first_packet_tx);
             loop {
                 if let Err(error) = stdout.read_exact(&mut frame).await {
                     tracing::warn!(%error, "Linux audio capture ended");
@@ -295,11 +298,28 @@ impl LinuxAudioSender {
                     tracing::warn!(%error, "audio UDP send failed");
                     break;
                 }
+                if let Some(started) = first_packet_tx.take() {
+                    let _ = started.send(());
+                    tracing::info!(%destination, "sent first encrypted Linux audio packet");
+                }
                 sequence = sequence.wrapping_add(1);
                 timestamp = timestamp.wrapping_add(SAMPLES_PER_CHANNEL as u32);
             }
             let _ = capture.kill().await;
         });
+        match tokio::time::timeout(Duration::from_secs(3), first_packet_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                task.abort();
+                let _ = routing.restore_now().await;
+                anyhow::bail!("Linux audio capture ended before sending its first packet");
+            }
+            Err(_) => {
+                task.abort();
+                let _ = routing.restore_now().await;
+                anyhow::bail!("Linux audio capture produced no media for 3 seconds");
+            }
+        }
         Ok(Self { task, routing })
     }
 
