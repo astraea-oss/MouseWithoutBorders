@@ -3,7 +3,11 @@ mod implementation {
     use std::{
         collections::VecDeque,
         net::SocketAddr,
-        sync::mpsc::{self, SyncSender, TryRecvError},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc::{self, SyncSender, TryRecvError},
+        },
         time::{Duration, Instant},
     };
 
@@ -141,6 +145,7 @@ mod implementation {
 
     pub struct WindowsAudioReceiver {
         task: Option<JoinHandle<String>>,
+        linux_streaming: Arc<AtomicBool>,
     }
 
     impl Drop for WindowsAudioReceiver {
@@ -175,6 +180,8 @@ mod implementation {
                 .await
                 .context("failed to send audio UDP probe")?;
 
+            let linux_streaming = Arc::new(AtomicBool::new(false));
+            let task_linux_streaming = linux_streaming.clone();
             let task = tokio::spawn(async move {
                 let mut player = player;
                 let mut jitter = JitterBuffer::new(jitter_target_ms);
@@ -184,7 +191,9 @@ mod implementation {
                 let mut media_watchdog = time::interval(Duration::from_millis(500));
                 let mut output_watchdog = time::interval(Duration::from_secs(1));
                 let mut probe_retry = time::interval(Duration::from_millis(250));
+                let receiver_started = Instant::now();
                 let mut last_authenticated_media = Instant::now();
+                let mut expecting_media = false;
                 let mut received_media = false;
                 loop {
                     tokio::select! {
@@ -220,9 +229,17 @@ mod implementation {
                             }
                         }
                         _ = media_watchdog.tick() => {
-                            if last_authenticated_media.elapsed() > Duration::from_secs(5) {
+                            if !expecting_media && task_linux_streaming.load(Ordering::Acquire) {
+                                expecting_media = true;
+                                last_authenticated_media = Instant::now();
+                            }
+                            if expecting_media && last_authenticated_media.elapsed() > Duration::from_secs(2) {
                                 tracing::warn!("Linux audio media timed out");
-                                break "no authenticated Linux UDP audio received for 5 seconds".to_string();
+                                break "no authenticated Linux UDP audio received for 2 seconds after streaming started".to_string();
+                            }
+                            if !expecting_media && receiver_started.elapsed() > Duration::from_secs(8) {
+                                tracing::warn!("Linux audio startup timed out");
+                                break "Linux did not start audio media within 8 seconds".to_string();
                             }
                         }
                         _ = output_watchdog.tick() => {
@@ -243,11 +260,18 @@ mod implementation {
                     }
                 }
             });
-            Ok(Self { task: Some(task) })
+            Ok(Self {
+                task: Some(task),
+                linux_streaming,
+            })
         }
 
         pub fn is_finished(&self) -> bool {
             self.task.as_ref().is_none_or(|task| task.is_finished())
+        }
+
+        pub fn mark_linux_streaming(&self) {
+            self.linux_streaming.store(true, Ordering::Release);
         }
 
         pub async fn failure_reason(mut self) -> String {

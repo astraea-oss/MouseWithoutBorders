@@ -910,6 +910,11 @@ async fn run_connected_inner(
                     Frame::Audio(AudioControl::State { state, detail }) => {
                         tracing::info!(?state, ?detail, "Linux audio state changed");
                         append_portable_log(log_path, format!("Linux audio state changed: {state:?}{}", detail.as_deref().map(|detail| format!(": {detail}")).unwrap_or_default()));
+                        if state == AudioStreamState::Streaming
+                            && let Some(receiver) = &_audio_receiver
+                        {
+                            receiver.mark_linux_streaming();
+                        }
                         let status = match state {
                             AudioStreamState::Disabled => "Audio: Off".to_string(),
                             AudioStreamState::WaitingForUdp | AudioStreamState::Starting => "Audio: Starting".to_string(),
