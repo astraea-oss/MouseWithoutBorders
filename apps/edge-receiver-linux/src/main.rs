@@ -1374,13 +1374,11 @@ impl ReceiverBackend {
                         tracing::info!("using Hyprland virtual input backend");
                         Ok(Self::Hyprland(backend))
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            %err,
-                            "failed to initialize Hyprland virtual input backend; using log-only input backend for testing"
-                        );
-                        Ok(Self::LogOnly)
-                    }
+                    Err(err) => Err(err).context(
+                        "input.backend is \"auto\", but no real input backend could be initialized; \
+                         ensure the receiver starts inside the graphical session or set \
+                         input.backend = \"log\" explicitly for protocol-only testing",
+                    ),
                 }
             }
             "hyprland" => {
