@@ -9,9 +9,9 @@ This workspace follows `PLAN.md` and is intentionally narrow:
 - Protocol frames are length-prefixed MessagePack.
 - Pairing uses persistent device identities and pinned peer fingerprints.
 - Portable by default: configs and state live beside the running executable.
-- Linux input detects CachyOS/Arch `libei-1.0`, but real sender injection is not
-  implemented yet. `backend = "auto"` currently falls back to log-only input so
-  the encrypted network path can be tested honestly.
+- Linux input tries the optional `libei-1.0` backend first and then Hyprland's
+  virtual input protocols. `backend = "auto"` exits if neither real input path
+  can initialize, instead of accepting events that cannot affect the desktop.
 
 ## Build
 
@@ -68,9 +68,10 @@ text clipboard changes in both directions. Linux uses the existing `wl-paste
 text remains in memory and on the encrypted session and is never written to an
 app-owned file.
 
-With `input.backend = "auto"`, `--test-input` logs events. The receiver detects
-`libei-1.0` on CachyOS/Arch, but real local injection is still a development
-task. Set `input.backend = "libei"` only once the sender backend is implemented.
+With `input.backend = "auto"`, `--test-input` uses the first real input backend
+that initializes. On this Hyprland setup that is normally the Wayland virtual
+input backend. Set `input.backend = "log"` explicitly when testing only the
+encrypted protocol without injecting local input.
 
 ## Windows controller
 
@@ -138,6 +139,6 @@ From Windows, send test events:
 .\edge-controller-win.exe --test-clipboard-text "hello from Windows"
 ```
 
-Expected result with `backend = "auto"`: the receiver stays connected and logs
-each received input or clipboard event. Real Hyprland injection is the next
-backend implementation step.
+Expected result with `backend = "auto"`: pointer, click, and key events are
+injected into the Linux desktop. If no real input backend can initialize, the
+receiver exits with an error instead of appearing healthy in log-only mode.

@@ -24,6 +24,11 @@ Current behavior:
   and there is no direct EIS socket, so libei initialization fails here.
 - After libei fails, `auto` falls back to the Hyprland/wlroots virtual input
   backend.
+- If neither real backend initializes, `auto` exits with an error. This lets a
+  service manager retry after the graphical-session environment becomes
+  available and prevents a connected receiver from silently discarding input.
+- `input.backend = "log"` explicitly enables protocol-only testing without
+  local input injection.
 - `input.backend = "hyprland"` forces the Hyprland virtual input backend and is
   the correct development mode for Lua's current setup.
 - `input.backend = "libei"` is strict and should fail clearly if the portal/EIS
@@ -86,5 +91,5 @@ Later portability work:
 - Re-test libei when Hyprland/xdg-desktop-portal-hyprland exposes
   RemoteDesktop/ConnectToEIS or another EIS socket path.
 - Keep a strict `libei` mode that fails if real injection cannot be initialized.
-- Keep `auto` mode useful for diagnostics by falling back to log-only with a
-  clear warning.
+- Keep log-only mode explicit so production receivers cannot appear healthy
+  while discarding input.
