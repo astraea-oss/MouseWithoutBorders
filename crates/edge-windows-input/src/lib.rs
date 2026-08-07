@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 
-use edge_common::GameCompatibilityMode;
+use edge_clipboard::{CanonicalImage, ClipboardItem};
+use edge_common::{ClipboardConfig, GameCompatibilityMode};
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
 use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
@@ -199,6 +200,94 @@ pub fn write_clipboard_text(text: &str, max_bytes: usize) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn write_clipboard_text(_text: &str, _max_bytes: usize) -> Result<()> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+pub fn clipboard_sequence_number() -> u32 {
+    unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_sequence_number() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+pub fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    if config.images_enabled {
+        let mut last_error = None;
+        for attempt in 0..8 {
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+            match clipboard.get_image() {
+                Ok(image) => {
+                    let canonical = CanonicalImage::from_rgba(
+                        image.width as u32,
+                        image.height as u32,
+                        image.bytes.into_owned(),
+                        config.max_image_bytes,
+                    )
+                    .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+                    return Ok(Some(ClipboardItem::Image(canonical)));
+                }
+                Err(arboard::Error::ContentNotAvailable) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 7 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(WindowsInputError::Clipboard(error.to_string()));
+        }
+    }
+    Ok(read_clipboard_text(config.max_bytes)?.map(ClipboardItem::Text))
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_item(_config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+pub fn write_clipboard_image(image: &CanonicalImage) -> Result<()> {
+    use std::borrow::Cow;
+    let mut last_error = None;
+    for attempt in 0..8 {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+        match clipboard.set_image(arboard::ImageData {
+            width: image.width as usize,
+            height: image.height as usize,
+            bytes: Cow::Borrowed(&image.rgba),
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+    Err(WindowsInputError::Clipboard(
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown image clipboard failure".to_string()),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_image(_image: &CanonicalImage) -> Result<()> {
     Err(WindowsInputError::UnsupportedPlatform)
 }
 

@@ -63,10 +63,21 @@ cargo run -p edge-receiver-linux -- --test-input pointer
 ```
 
 With `[clipboard].enabled = true`, connected devices automatically synchronize
-text clipboard changes in both directions. Linux uses the existing `wl-paste
---watch` and `wl-copy` tools; Windows uses the native Win32 clipboard. Clipboard
-text remains in memory and on the encrypted session and is never written to an
-app-owned file.
+text clipboard changes in both directions. With `images_enabled = true`, static
+clipboard images are normalized to PNG and synchronized too. Linux uses
+`wl-paste --watch` and `wl-copy`; Windows uses the native clipboard through
+`arboard`. Image payloads are capped by `max_image_bytes` (4 MiB by default),
+chunked on the encrypted session, and never written to an app-owned file.
+
+```toml
+[clipboard]
+enabled = true
+images_enabled = true
+max_bytes = 1048576
+max_image_bytes = 4194304
+```
+
+Copied file paths and arbitrary files are intentionally not transferred.
 
 With `input.backend = "auto"`, `--test-input` uses the first real input backend
 that initializes. On this Hyprland setup that is normally the Wayland virtual

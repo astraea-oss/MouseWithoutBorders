@@ -167,6 +167,7 @@ struct SettingsApp {
     port: String,
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
+    clipboard_images_enabled: bool,
     audio_enabled: bool,
     audio_play_local: bool,
     save_message: Option<String>,
@@ -205,6 +206,7 @@ impl SettingsApp {
                 .map(|peer| peer.position)
                 .unwrap_or(PeerPosition::Left),
             game_compatibility: input.config.input.game_compatibility,
+            clipboard_images_enabled: input.config.clipboard.images_enabled,
             audio_enabled: input.config.audio.enabled,
             audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
             original: input.config,
@@ -248,6 +250,7 @@ impl SettingsApp {
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
         config.input.game_compatibility = self.game_compatibility;
+        config.clipboard.images_enabled = self.clipboard_images_enabled;
         config.audio.enabled = self.audio_enabled;
         config.audio.local_playback = if self.audio_play_local {
             AudioLocalPlayback::Mirror
@@ -364,6 +367,13 @@ impl eframe::App for SettingsApp {
 
                 ui.label("Pairing status");
                 ui.label(pairing_text(&self.pairing));
+                ui.end_row();
+
+                ui.label("Clipboard images");
+                ui.checkbox(
+                    &mut self.clipboard_images_enabled,
+                    "Sync images on connection",
+                );
                 ui.end_row();
 
                 ui.label("Stream Linux audio");

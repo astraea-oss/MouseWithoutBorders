@@ -14,8 +14,9 @@ game_compatibility = "always-enabled"
 
 [clipboard]
 enabled = true
-text_only = true
+images_enabled = true
 max_bytes = 1048576
+max_image_bytes = 4194304
 
 [audio]
 enabled = true

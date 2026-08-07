@@ -8,7 +8,7 @@ Build a focused personal software KVM from scratch in Rust:
 - **Target:** this CachyOS/Hyprland laptop on Wayland.
 - **Direction:** Windows controls the laptop; the laptop does not capture physical input.
 - **Input backend:** Linux uses `libei` first for Wayland input emulation.
-- **Clipboard:** bidirectional **text-only** clipboard sync in the first usable version.
+- **Clipboard:** bidirectional text and bounded static-image clipboard sync.
 - **Security:** pinned-key encrypted pairing.
 - **Safety:** global Windows release hotkey, timeout release, and stuck-key cleanup.
 
@@ -226,8 +226,9 @@ pinned_fingerprint = ""
 
 [clipboard]
 enabled = true
-text_only = true
+images_enabled = true
 max_bytes = 1048576
+max_image_bytes = 4194304
 ```
 
 Linux config:
@@ -244,8 +245,9 @@ backend = "libei"
 
 [clipboard]
 enabled = true
-text_only = true
+images_enabled = true
 max_bytes = 1048576
+max_image_bytes = 4194304
 ```
 
 Pairing mode:
@@ -500,7 +502,7 @@ The first version is accepted when:
 - Laptop position: left of Windows.
 - Linux target: this Hyprland laptop only.
 - Linux input backend: `libei` first.
-- Clipboard scope: text only.
+- Clipboard scope: text plus in-memory static images; file lists remain excluded.
 - Port: `42420/tcp`.
 - Security: pinned encrypted pairing.
 - UI: Windows tray app plus Linux background receiver.

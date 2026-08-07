@@ -145,18 +145,30 @@ impl Default for InputConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardConfig {
     pub enabled: bool,
-    pub text_only: bool,
+    #[serde(default = "default_true")]
+    pub images_enabled: bool,
     pub max_bytes: usize,
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
 }
 
 impl Default for ClipboardConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            text_only: true,
+            images_enabled: true,
             max_bytes: 1_048_576,
+            max_image_bytes: default_max_image_bytes(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_image_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 impl AppConfig {
@@ -369,6 +381,8 @@ mod tests {
         assert_eq!(actual.role, Role::Receiver);
         assert_eq!(actual.listen.as_deref(), Some("0.0.0.0:42420"));
         assert_eq!(actual.clipboard.max_bytes, 1_048_576);
+        assert!(actual.clipboard.images_enabled);
+        assert_eq!(actual.clipboard.max_image_bytes, 4_194_304);
         assert!(!actual.audio.enabled);
         assert_eq!(actual.audio.local_playback, AudioLocalPlayback::Redirect);
     }
