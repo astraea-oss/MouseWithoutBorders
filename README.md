@@ -68,6 +68,9 @@ clipboard images are normalized to PNG and synchronized too. Linux uses
 `wl-paste --watch` and `wl-copy`; Windows uses the native clipboard through
 `arboard`. Image payloads are capped by `max_image_bytes` (4 MiB by default),
 chunked on the encrypted session, and never written to an app-owned file.
+When Windows Explorer contains exactly one copied PNG, JPEG, or BMP file, the
+controller reads that bounded local file and sends only its decoded pixels as a
+clipboard image. It never sends the source path.
 
 ```toml
 [clipboard]
@@ -77,7 +80,8 @@ max_bytes = 1048576
 max_image_bytes = 4194304
 ```
 
-Copied file paths and arbitrary files are intentionally not transferred.
+Multiple copied files, arbitrary files, and file paths themselves are
+intentionally not transferred.
 
 With `input.backend = "auto"`, `--test-input` uses the first real input backend
 that initializes. On this Hyprland setup that is normally the Wayland virtual

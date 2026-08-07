@@ -3,14 +3,18 @@
 ## Summary
 
 The encrypted clipboard channel synchronizes static raster images automatically
-between the Windows controller and Linux receiver. Clipboard files and file
-paths remain out of scope.
+between the Windows controller and Linux receiver. A single supported image
+file copied in Windows Explorer is decoded locally and treated as an in-memory
+image; its file path is never transferred. Other clipboard files and file lists
+remain out of scope.
 
 ## Selected behavior
 
 - Advertise the forward-compatible `clipboard-image-v1` Hello extension.
 - Prefer a supported image over ancillary HTML or text on the same clipboard.
 - Decode Windows bitmap data and Linux PNG, JPEG, or BMP offers.
+- Fall back to one bounded local PNG, JPEG, or BMP file from a Windows
+  `CF_HDROP` clipboard item when no bitmap representation is available.
 - Normalize transport data to metadata-free RGBA8 PNG.
 - Limit canonical PNG payloads to 4 MiB and decoded images to 16,777,216 pixels.
 - Split PNGs into 16 KiB authenticated frames so input and control traffic can

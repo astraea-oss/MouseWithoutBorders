@@ -1003,6 +1003,7 @@ dependencies = [
  "edge-geometry",
  "edge-keymap",
  "edge-protocol",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "windows",
