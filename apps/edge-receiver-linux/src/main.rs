@@ -14,6 +14,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
+use edge_clipboard::{
+    ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
+    ImageTransferSchedule, IncomingImageTransfer, OutgoingImageTransfer,
+};
 use edge_common::{
     AppConfig, AudioLocalPlayback, Role, default_state_dir, detect_primary_local_ip, init_tracing,
     portable_config_path,
@@ -24,25 +28,29 @@ use edge_crypto::{
 };
 use edge_linux_input::{
     ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
-    hyprland_cursor_position, hyprland_screen_info, read_clipboard_text,
-    spawn_clipboard_change_watcher, write_clipboard_text,
+    hyprland_cursor_position, hyprland_screen_info, read_clipboard_item, read_clipboard_text,
+    spawn_clipboard_change_watcher, write_clipboard_image, write_clipboard_text,
 };
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStreamState, Capability, ClipboardChangeTracker, ClipboardEvent,
-    ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent, OutputInfo, PROTOCOL_VERSION,
-    ReleaseReason, RemoteError, ScreenInfo, decode_frame, encode_frame,
+    AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, Capability,
+    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent,
+    OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame,
+    encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
+#[cfg(target_os = "linux")]
 use socket2::SockRef;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
-    signal::unix::{SignalKind, signal},
     sync::mpsc,
     task::JoinHandle,
     time,
 };
 
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
 const CONTROLLER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const RETURN_EDGE_MARGIN: i32 = 12;
@@ -113,6 +121,7 @@ async fn main() -> Result<()> {
     result
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() -> Result<&'static str> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
@@ -193,7 +202,35 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
     match AppConfig::load(path).await {
-        Ok(config) => Ok(config),
+        Ok(mut config) => {
+            let text = tokio::fs::read_to_string(path).await.with_context(|| {
+                format!("failed to inspect receiver config at {}", path.display())
+            })?;
+            let has_image_setting = text
+                .lines()
+                .any(|line| line.trim_start().starts_with("images_enabled"));
+            let has_text_only = text
+                .lines()
+                .any(|line| line.trim_start().starts_with("text_only"));
+            if !has_image_setting {
+                config.clipboard.images_enabled = true;
+                config.clipboard.max_image_bytes = 4 * 1024 * 1024;
+            }
+            if !has_image_setting || has_text_only {
+                config.save(path).await.with_context(|| {
+                    format!(
+                        "failed to migrate receiver clipboard config at {}",
+                        path.display()
+                    )
+                })?;
+                tracing::info!(
+                    path = %path.display(),
+                    images_enabled = config.clipboard.images_enabled,
+                    "migrated legacy receiver clipboard config"
+                );
+            }
+            Ok(config)
+        }
         Err(edge_common::CommonError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -426,6 +463,10 @@ async fn run_receiver(
                 .await;
         }
         let controller_supports_audio = hello.capabilities.contains(&Capability::AudioV1);
+        let controller_supports_images = hello
+            .extensions
+            .iter()
+            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
 
         write_secure_frame(
             &mut session,
@@ -435,6 +476,7 @@ async fn run_receiver(
                 role: Role::Receiver,
                 public_key_fingerprint: identity.fingerprint(),
                 capabilities: vec![Capability::AudioV1],
+                extensions: vec![CLIPBOARD_IMAGE_EXTENSION.to_string()],
             }),
         )
         .await?;
@@ -474,6 +516,7 @@ async fn run_receiver(
             audio_socket,
             addr.ip(),
             controller_supports_audio,
+            controller_supports_images,
         )
         .await
         {
@@ -510,9 +553,12 @@ async fn run_receiver(
 }
 
 fn configure_controller_socket(stream: &TcpStream) -> Result<()> {
+    #[cfg(target_os = "linux")]
     SockRef::from(stream)
         .set_tcp_user_timeout(Some(CONTROLLER_STALL_TIMEOUT))
-        .context("failed to set TCP_USER_TIMEOUT")
+        .context("failed to set TCP_USER_TIMEOUT")?;
+    let _ = stream;
+    Ok(())
 }
 
 fn install_receiver_panic_log(log_path: PathBuf) {
@@ -605,6 +651,7 @@ async fn recv_clipboard_change(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
     config: &AppConfig,
@@ -617,15 +664,20 @@ async fn handle_controller(
     audio_socket: Arc<UdpSocket>,
     controller_ip: std::net::IpAddr,
     controller_supports_audio: bool,
+    controller_supports_images: bool,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let mut heartbeat = time::interval(Duration::from_millis(250));
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut stats = ReceiverInputStats::default();
-    let (reader, mut writer) = session.split();
+    let (reader, writer) = session.split();
+    let mut writer = ScheduledNoiseWriter::new(writer);
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
-    let mut clipboard_sync = ReceiverClipboardState::new(config).await?;
+    let mut clipboard_sync =
+        ReceiverClipboardState::new(config, controller_supports_images).await?;
+    let mut clipboard_send = time::interval(Duration::from_millis(2));
+    clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut clipboard_watcher = config
         .clipboard
         .enabled
@@ -637,8 +689,34 @@ async fn handle_controller(
     let mut audio_requested = config.audio.enabled;
 
     loop {
+        if writer.bulk_is_due() && clipboard_sync.outgoing.is_some() {
+            match clipboard_sync.send_next_image_frame(&mut writer).await {
+                Ok(true) => {
+                    tracing::info!("completed Linux clipboard image transfer to controller");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to send Linux clipboard image chunk");
+                    clipboard_sync.outgoing = None;
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
+            biased;
             _ = heartbeat.tick() => {
+                if let Some(transfer_id) = clipboard_sync.incoming.expire_transfer_id() {
+                    tracing::warn!(transfer_id, "expired incomplete controller clipboard image");
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Clipboard(ClipboardEvent::ImageCancel {
+                            transfer_id,
+                            reason: ClipboardCancelReason::TimedOut,
+                        }),
+                    )
+                    .await?;
+                }
                 heartbeat_sequence += 1;
                 write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
                 stats.heartbeats = stats.heartbeats.saturating_add(1);
@@ -801,6 +879,7 @@ async fn handle_controller(
             }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
+                writer.record_received(&frame);
                 match frame {
                     Frame::Input(InputEvent::AllKeysUp) => {
                         stats.all_keys_up = stats.all_keys_up.saturating_add(1);
@@ -833,32 +912,18 @@ async fn handle_controller(
                             tray.input_event().await;
                         }
                     }
-                    Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) => {
-                        stats.clipboard = stats.clipboard.saturating_add(1);
-                        match clipboard_sync.handle_text_offer(config, &mut writer, text).await {
-                            Ok(()) => {
+                    Frame::Clipboard(event) => {
+                        match clipboard_sync.handle_event(config, &mut writer, event).await {
+                            Ok(true) => {
+                                stats.clipboard = stats.clipboard.saturating_add(1);
                                 if let Some(tray) = tray {
                                     tray.clipboard_event().await;
                                 }
                             }
+                            Ok(false) => {}
                             Err(error) => {
-                                tracing::warn!(%error, "failed to apply controller clipboard");
-                                append_portable_log(log_path, format!("failed to apply controller clipboard: {error}"));
-                            }
-                        }
-                    }
-                    Frame::Clipboard(ClipboardEvent::TextRequest) => {
-                        stats.clipboard = stats.clipboard.saturating_add(1);
-                        match clipboard_sync.send_local_offer(config, &mut writer).await {
-                            Ok(Some(())) => {
-                                if let Some(tray) = tray {
-                                    tray.clipboard_event().await;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, "failed to answer controller clipboard request");
-                                append_portable_log(log_path, format!("failed to answer controller clipboard request: {error}"));
+                                tracing::warn!(%error, "failed to synchronize controller clipboard");
+                                append_portable_log(log_path, format!("failed to synchronize controller clipboard: {error}"));
                             }
                         }
                     }
@@ -1000,7 +1065,19 @@ async fn handle_controller(
                     Frame::Audio(AudioControl::State { .. } | AudioControl::Offer { .. }) => {}
                     Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
                 }
-            }
+            },
+            _ = clipboard_send.tick(), if clipboard_sync.outgoing.is_some() => {
+                match clipboard_sync.send_next_image_frame(&mut writer).await {
+                    Ok(true) => {
+                        tracing::info!("completed Linux clipboard image transfer to controller");
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to send Linux clipboard image chunk");
+                        clipboard_sync.outgoing = None;
+                    }
+                }
+            },
         }
     }
 }
@@ -1031,31 +1108,153 @@ async fn persist_receiver_audio_enabled(
 #[derive(Default)]
 struct ReceiverClipboardState {
     tracker: ClipboardChangeTracker,
+    outgoing: Option<OutgoingImageTransfer>,
+    incoming: IncomingImageTransfer,
+    next_transfer_id: u64,
+    peer_supports_images: bool,
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl+C")
 }
 
 impl ReceiverClipboardState {
-    async fn new(config: &AppConfig) -> Result<Self> {
-        let last_observed_text = read_clipboard_text(&config.clipboard).await?;
+    async fn new(config: &AppConfig, peer_supports_images: bool) -> Result<Self> {
+        let last_observed = match read_clipboard_item(&config.clipboard).await {
+            Ok(item) => item.as_ref().map(ClipboardItem::id),
+            Err(error) => {
+                tracing::debug!(%error, "skipped initial Linux clipboard observation");
+                None
+            }
+        };
         Ok(Self {
-            tracker: ClipboardChangeTracker::new(last_observed_text),
+            tracker: ClipboardChangeTracker::new(last_observed),
+            outgoing: None,
+            incoming: IncomingImageTransfer::default(),
+            next_transfer_id: 0,
+            peer_supports_images,
         })
+    }
+
+    async fn handle_event(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut ScheduledNoiseWriter,
+        event: ClipboardEvent,
+    ) -> Result<bool> {
+        match event {
+            ClipboardEvent::TextOffer { text, .. } => {
+                self.handle_text_offer(config, writer, text).await?;
+                Ok(true)
+            }
+            ClipboardEvent::TextRequest => self.send_local_text_offer(config, writer).await,
+            ClipboardEvent::ContentRequest => self.send_local_offer(config, writer).await,
+            event @ (ClipboardEvent::ImageStart { .. }
+            | ClipboardEvent::ImageChunk { .. }
+            | ClipboardEvent::ImageEnd { .. }
+            | ClipboardEvent::ImageCancel { .. }) => {
+                let transfer_id = event.image_transfer_id();
+                let is_cancel = matches!(&event, ClipboardEvent::ImageCancel { .. });
+                if is_cancel
+                    && self
+                        .outgoing
+                        .as_ref()
+                        .is_some_and(|active| Some(active.transfer_id()) == transfer_id)
+                {
+                    self.outgoing = None;
+                    tracing::info!("controller cancelled Linux clipboard image transfer");
+                    return Ok(false);
+                }
+                if !self.peer_supports_images || !config.clipboard.images_enabled {
+                    if let Some(transfer_id) = transfer_id.filter(|_| !is_cancel) {
+                        write_secure_frame_writer(
+                            writer,
+                            &Frame::Clipboard(ClipboardEvent::ImageCancel {
+                                transfer_id,
+                                reason: ClipboardCancelReason::Rejected,
+                            }),
+                        )
+                        .await?;
+                    }
+                    return Ok(false);
+                }
+                match self
+                    .incoming
+                    .handle(event, config.clipboard.max_image_bytes)
+                {
+                    Ok(Some(image)) => {
+                        let remote_id = ClipboardContentId::Image(image.content_sha256);
+                        let current = read_clipboard_item(&config.clipboard).await?;
+                        let current_id = current.as_ref().map(ClipboardItem::id);
+                        if current_id == Some(remote_id) {
+                            self.tracker.mark_observed(current_id);
+                            return Ok(false);
+                        }
+                        if current_id.is_some() && !self.tracker.is_observed(&current_id) {
+                            self.offer_item(config, writer, current, false).await?;
+                            return Ok(false);
+                        }
+                        write_clipboard_image(&config.clipboard, &image).await?;
+                        self.tracker.mark_observed(Some(remote_id));
+                        tracing::info!(
+                            width = image.width,
+                            height = image.height,
+                            bytes = image.png.len(),
+                            "updated Linux image clipboard from controller"
+                        );
+                        Ok(true)
+                    }
+                    Ok(None) => Ok(false),
+                    Err(error) => {
+                        self.incoming.clear();
+                        if let Some(transfer_id) = transfer_id.filter(|_| !is_cancel) {
+                            let reason = match &error {
+                                ClipboardError::EncodedTooLarge { .. }
+                                | ClipboardError::TooManyPixels { .. }
+                                | ClipboardError::InvalidDimensions => {
+                                    ClipboardCancelReason::Rejected
+                                }
+                                _ => ClipboardCancelReason::Invalid,
+                            };
+                            write_secure_frame_writer(
+                                writer,
+                                &Frame::Clipboard(ClipboardEvent::ImageCancel {
+                                    transfer_id,
+                                    reason,
+                                }),
+                            )
+                            .await?;
+                        }
+                        tracing::warn!(%error, "rejected controller clipboard image transfer");
+                        Ok(false)
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_text_offer(
         &mut self,
         config: &AppConfig,
-        writer: &mut NoiseWriter,
+        writer: &mut ScheduledNoiseWriter,
         remote_text: String,
     ) -> Result<()> {
-        if self
-            .prefer_newer_local_clipboard(config, writer, &remote_text)
-            .await?
-        {
+        let remote_item = ClipboardItem::Text(remote_text.clone());
+        let remote_id = remote_item.id();
+        let current = read_clipboard_item(&config.clipboard).await?;
+        let current_id = current.as_ref().map(ClipboardItem::id);
+        if current_id == Some(remote_id) {
+            self.tracker.mark_observed(current_id);
             return Ok(());
         }
-
+        if current_id.is_some() && !self.tracker.is_observed(&current_id) {
+            self.offer_item(config, writer, current, false).await?;
+            return Ok(());
+        }
         write_clipboard_text(&config.clipboard, &remote_text).await?;
-        self.tracker.mark_observed(Some(remote_text));
+        self.tracker.mark_observed(Some(remote_id));
         tracing::info!("updated Linux clipboard from controller");
         Ok(())
     }
@@ -1063,50 +1262,109 @@ impl ReceiverClipboardState {
     async fn send_local_offer(
         &mut self,
         config: &AppConfig,
-        writer: &mut NoiseWriter,
-    ) -> Result<Option<()>> {
-        let current = read_clipboard_text(&config.clipboard).await?;
-        let Some(event) = self.tracker.offer_current(current) else {
-            return Ok(None);
+        writer: &mut ScheduledNoiseWriter,
+    ) -> Result<bool> {
+        let current = read_clipboard_item(&config.clipboard).await?;
+        self.offer_item(config, writer, current, true).await
+    }
+
+    async fn send_local_text_offer(
+        &mut self,
+        config: &AppConfig,
+        writer: &mut ScheduledNoiseWriter,
+    ) -> Result<bool> {
+        let Some(text) = read_clipboard_text(&config.clipboard).await? else {
+            return Ok(false);
         };
-        write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
-        Ok(Some(()))
+        let item = ClipboardItem::Text(text.clone());
+        let Some(sequence) = self.tracker.offer_current(Some(item.id())) else {
+            return Ok(false);
+        };
+        write_secure_frame_writer(
+            writer,
+            &Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text }),
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn send_changed_offer(
         &mut self,
         config: &AppConfig,
-        writer: &mut NoiseWriter,
+        writer: &mut ScheduledNoiseWriter,
     ) -> Result<bool> {
-        let current = read_clipboard_text(&config.clipboard).await?;
-        let Some(event) = self.tracker.offer_if_changed(current) else {
-            return Ok(false);
-        };
-        write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
-        Ok(true)
+        let current = read_clipboard_item(&config.clipboard).await?;
+        self.offer_item(config, writer, current, false).await
     }
 
-    async fn prefer_newer_local_clipboard(
+    async fn offer_item(
         &mut self,
         config: &AppConfig,
-        writer: &mut NoiseWriter,
-        remote_text: &str,
+        writer: &mut ScheduledNoiseWriter,
+        current: Option<ClipboardItem>,
+        force: bool,
     ) -> Result<bool> {
-        let current = read_clipboard_text(&config.clipboard).await?;
-        if current.as_deref() == Some(remote_text) {
-            self.tracker.mark_observed(current);
-            return Ok(true);
-        }
-
-        if current.is_some() && !self.tracker.is_observed(&current) {
-            if let Some(event) = self.tracker.offer_current(current) {
-                write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
-                tracing::info!("kept newer Linux clipboard and sent it to controller");
-                return Ok(true);
+        let current_id = current.as_ref().map(ClipboardItem::id);
+        let sequence = if force {
+            self.tracker.offer_current(current_id)
+        } else {
+            self.tracker.offer_if_changed(current_id)
+        };
+        let Some(sequence) = sequence else {
+            return Ok(false);
+        };
+        match current {
+            Some(ClipboardItem::Text(text)) => {
+                if let Some(active) = self.outgoing.take() {
+                    write_secure_frame_writer(
+                        writer,
+                        &Frame::Clipboard(active.cancel_event(ClipboardCancelReason::Replaced)),
+                    )
+                    .await?;
+                }
+                write_secure_frame_writer(
+                    writer,
+                    &Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text }),
+                )
+                .await?;
+                Ok(true)
             }
+            Some(ClipboardItem::Image(image))
+                if self.peer_supports_images && config.clipboard.images_enabled =>
+            {
+                if let Some(active) = self.outgoing.take() {
+                    write_secure_frame_writer(
+                        writer,
+                        &Frame::Clipboard(active.cancel_event(ClipboardCancelReason::Replaced)),
+                    )
+                    .await?;
+                }
+                self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+                self.outgoing = Some(OutgoingImageTransfer::new(
+                    self.next_transfer_id,
+                    sequence,
+                    image,
+                ));
+                Ok(true)
+            }
+            _ => Ok(false),
         }
+    }
 
-        Ok(false)
+    async fn send_next_image_frame(&mut self, writer: &mut ScheduledNoiseWriter) -> Result<bool> {
+        let Some(transfer) = self.outgoing.as_mut() else {
+            return Ok(false);
+        };
+        let Some(event) = transfer.next_event() else {
+            self.outgoing = None;
+            return Ok(false);
+        };
+        let completed = matches!(event, ClipboardEvent::ImageEnd { .. });
+        write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
+        if completed {
+            self.outgoing = None;
+        }
+        Ok(completed)
     }
 }
 
@@ -1301,9 +1559,36 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
-async fn write_secure_frame_writer(writer: &mut NoiseWriter, frame: &Frame) -> Result<()> {
+struct ScheduledNoiseWriter {
+    inner: NoiseWriter,
+    image_schedule: ImageTransferSchedule,
+}
+
+impl ScheduledNoiseWriter {
+    fn new(inner: NoiseWriter) -> Self {
+        Self {
+            inner,
+            image_schedule: ImageTransferSchedule::default(),
+        }
+    }
+
+    fn bulk_is_due(&self) -> bool {
+        self.image_schedule.image_chunk_is_due()
+    }
+
+    fn record_sent(&mut self, frame: &Frame) {
+        self.image_schedule.record_sent_frame(frame);
+    }
+
+    fn record_received(&mut self, frame: &Frame) {
+        self.image_schedule.record_received_frame(frame);
+    }
+}
+
+async fn write_secure_frame_writer(writer: &mut ScheduledNoiseWriter, frame: &Frame) -> Result<()> {
     let payload = encode_frame(frame)?;
-    writer.write_packet(&payload).await?;
+    writer.inner.write_packet(&payload).await?;
+    writer.record_sent(frame);
     Ok(())
 }
 
@@ -1441,6 +1726,7 @@ impl ReceiverBackend {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn controller_socket_uses_bounded_tcp_user_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1457,5 +1743,59 @@ mod tests {
             SockRef::from(&server).tcp_user_timeout().unwrap(),
             Some(CONTROLLER_STALL_TIMEOUT)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_clipboard_config_is_migrated_with_images_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receiver.toml");
+        tokio::fs::write(
+            &path,
+            r#"device_name = "Lua"
+role = "receiver"
+listen = "0.0.0.0:42420"
+
+[clipboard]
+enabled = true
+text_only = true
+max_bytes = 1048576
+"#,
+        )
+        .await
+        .unwrap();
+
+        let config = load_or_create_config(&path).await.unwrap();
+        let migrated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(config.clipboard.images_enabled);
+        assert!(migrated.contains("images_enabled = true"));
+        assert!(!migrated.contains("text_only"));
+    }
+
+    #[tokio::test]
+    async fn obsolete_text_only_key_is_dropped_without_re_enabling_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receiver.toml");
+        tokio::fs::write(
+            &path,
+            r#"device_name = "Lua"
+role = "receiver"
+listen = "0.0.0.0:42420"
+
+[clipboard]
+enabled = true
+text_only = true
+images_enabled = false
+max_bytes = 1048576
+max_image_bytes = 4194304
+"#,
+        )
+        .await
+        .unwrap();
+
+        let config = load_or_create_config(&path).await.unwrap();
+        let migrated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!config.clipboard.images_enabled);
+        assert!(!migrated.contains("text_only"));
+        assert!(migrated.contains("images_enabled = false"));
     }
 }

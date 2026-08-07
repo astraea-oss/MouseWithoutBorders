@@ -11,6 +11,7 @@ libei = []
 
 [dependencies]
 edge-common = { path = "../edge-common" }
+edge-clipboard = { path = "../edge-clipboard" }
 edge-protocol = { path = "../edge-protocol" }
 serde.workspace = true
 serde_json.workspace = true

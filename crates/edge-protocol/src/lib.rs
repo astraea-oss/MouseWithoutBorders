@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_PORT: u16 = 42_420;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
+pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -40,6 +41,8 @@ pub struct Hello {
     pub public_key_fingerprint: String,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,49 +137,52 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardEvent {
-    TextOffer { sequence: u64, text: String },
+    TextOffer {
+        sequence: u64,
+        text: String,
+    },
     TextRequest,
+    ContentRequest,
+    ImageStart {
+        transfer_id: u64,
+        sequence: u64,
+        width: u32,
+        height: u32,
+        total_bytes: u32,
+        content_sha256: [u8; 32],
+    },
+    ImageChunk {
+        transfer_id: u64,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    ImageEnd {
+        transfer_id: u64,
+    },
+    ImageCancel {
+        transfer_id: u64,
+        reason: ClipboardCancelReason,
+    },
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ClipboardChangeTracker {
-    sequence: u64,
-    last_observed_text: Option<String>,
+impl ClipboardEvent {
+    pub fn image_transfer_id(&self) -> Option<u64> {
+        match self {
+            Self::ImageStart { transfer_id, .. }
+            | Self::ImageChunk { transfer_id, .. }
+            | Self::ImageEnd { transfer_id }
+            | Self::ImageCancel { transfer_id, .. } => Some(*transfer_id),
+            Self::TextOffer { .. } | Self::TextRequest | Self::ContentRequest => None,
+        }
+    }
 }
 
-impl ClipboardChangeTracker {
-    pub fn new(last_observed_text: Option<String>) -> Self {
-        Self {
-            sequence: 0,
-            last_observed_text,
-        }
-    }
-
-    pub fn is_observed(&self, current: &Option<String>) -> bool {
-        &self.last_observed_text == current
-    }
-
-    pub fn mark_observed(&mut self, current: Option<String>) {
-        self.last_observed_text = current;
-    }
-
-    pub fn offer_if_changed(&mut self, current: Option<String>) -> Option<ClipboardEvent> {
-        if self.is_observed(&current) {
-            return None;
-        }
-
-        self.offer_current(current)
-    }
-
-    pub fn offer_current(&mut self, current: Option<String>) -> Option<ClipboardEvent> {
-        self.last_observed_text = current.clone();
-        let text = current?;
-        self.sequence = self.sequence.saturating_add(1);
-        Some(ClipboardEvent::TextOffer {
-            sequence: self.sequence,
-            text,
-        })
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardCancelReason {
+    Replaced,
+    Rejected,
+    TimedOut,
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +260,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn messagepack_round_trip() {
@@ -283,44 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_tracker_only_offers_changed_text() {
-        let mut tracker = ClipboardChangeTracker::new(Some("initial".to_string()));
-
-        assert_eq!(tracker.offer_if_changed(Some("initial".to_string())), None);
-        assert_eq!(
-            tracker.offer_if_changed(Some("next".to_string())),
-            Some(ClipboardEvent::TextOffer {
-                sequence: 1,
-                text: "next".to_string(),
-            })
-        );
-        assert_eq!(tracker.offer_if_changed(Some("next".to_string())), None);
-    }
-
-    #[test]
-    fn clipboard_tracker_suppresses_remote_write_echo() {
-        let mut tracker = ClipboardChangeTracker::new(Some("local".to_string()));
-
-        tracker.mark_observed(Some("remote".to_string()));
-
-        assert_eq!(tracker.offer_if_changed(Some("remote".to_string())), None);
-    }
-
-    #[test]
-    fn clipboard_tracker_reset_allows_identical_text_to_be_copied_again() {
-        let mut tracker = ClipboardChangeTracker::new(Some("repeat".to_string()));
-
-        assert_eq!(tracker.offer_if_changed(None), None);
-        assert_eq!(
-            tracker.offer_if_changed(Some("repeat".to_string())),
-            Some(ClipboardEvent::TextOffer {
-                sequence: 1,
-                text: "repeat".to_string(),
-            })
-        );
-    }
-
-    #[test]
     fn clipboard_event_round_trip_preserves_multiline_unicode() {
         let frame = Frame::Clipboard(ClipboardEvent::TextOffer {
             sequence: 42,
@@ -328,5 +297,63 @@ mod tests {
         });
 
         assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn image_clipboard_events_round_trip_and_fit_secure_packets() {
+        let events = [
+            ClipboardEvent::ImageStart {
+                transfer_id: 7,
+                sequence: 3,
+                width: 1920,
+                height: 1080,
+                total_bytes: 32_768,
+                content_sha256: [9; 32],
+            },
+            ClipboardEvent::ImageChunk {
+                transfer_id: 7,
+                offset: 0,
+                bytes: vec![4; 16 * 1024],
+            },
+            ClipboardEvent::ImageEnd { transfer_id: 7 },
+            ClipboardEvent::ImageCancel {
+                transfer_id: 7,
+                reason: ClipboardCancelReason::Replaced,
+            },
+        ];
+        for event in events {
+            let frame = Frame::Clipboard(event);
+            let encoded = encode_frame(&frame).unwrap();
+            assert!(encoded.len() < 60 * 1024);
+            assert_eq!(decode_frame(&encoded).unwrap(), frame);
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyHello {
+        protocol_version: u16,
+        device_name: String,
+        role: Role,
+        public_key_fingerprint: String,
+        capabilities: Vec<Capability>,
+    }
+
+    #[test]
+    fn hello_extensions_are_backward_compatible() {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: "new".to_string(),
+            role: Role::Controller,
+            public_key_fingerprint: "fingerprint".to_string(),
+            capabilities: vec![Capability::AudioV1],
+            extensions: vec![CLIPBOARD_IMAGE_EXTENSION.to_string()],
+        };
+        let encoded = rmp_serde::to_vec_named(&hello).unwrap();
+        let legacy: LegacyHello = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(legacy.device_name, "new");
+
+        let encoded_legacy = rmp_serde::to_vec_named(&legacy).unwrap();
+        let decoded: Hello = rmp_serde::from_slice(&encoded_legacy).unwrap();
+        assert!(decoded.extensions.is_empty());
     }
 }

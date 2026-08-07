@@ -1,5 +1,8 @@
 # Bidirectional Clipboard Synchronization
 
+> This document records the original text-only milestone. Static image support
+> is specified in `clipboard-images.md`.
+
 ## Summary
 
 Make text clipboard synchronization work automatically in both directions:

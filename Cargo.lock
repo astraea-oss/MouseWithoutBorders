@@ -836,6 +836,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-clipboard"
+version = "0.1.0"
+dependencies = [
+ "edge-protocol",
+ "image",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "edge-common"
 version = "0.1.0"
 dependencies = [
@@ -854,6 +864,7 @@ dependencies = [
  "anyhow",
  "clap",
  "edge-audio",
+ "edge-clipboard",
  "edge-common",
  "edge-crypto",
  "edge-geometry",
@@ -912,6 +923,7 @@ dependencies = [
 name = "edge-linux-input"
 version = "0.1.0"
 dependencies = [
+ "edge-clipboard",
  "edge-common",
  "edge-protocol",
  "libc",
@@ -945,6 +957,7 @@ dependencies = [
  "anyhow",
  "clap",
  "edge-audio",
+ "edge-clipboard",
  "edge-common",
  "edge-crypto",
  "edge-linux-audio",
@@ -953,6 +966,7 @@ dependencies = [
  "edge-ui",
  "ksni",
  "socket2",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -983,11 +997,15 @@ dependencies = [
 name = "edge-windows-input"
 version = "0.1.0"
 dependencies = [
+ "arboard",
+ "edge-clipboard",
  "edge-common",
  "edge-geometry",
  "edge-keymap",
  "edge-protocol",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "windows",
  "windows-sys 0.61.2",
@@ -1742,6 +1760,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

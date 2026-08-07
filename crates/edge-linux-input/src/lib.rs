@@ -3,6 +3,7 @@ use std::{process::Stdio, sync::Arc, time::Duration};
 #[cfg(all(target_os = "linux", feature = "libei"))]
 use std::collections::BTreeSet;
 
+use edge_clipboard::{CanonicalImage, ClipboardItem};
 use edge_common::ClipboardConfig;
 #[cfg(all(target_os = "linux", feature = "libei"))]
 use edge_protocol::MouseButton;
@@ -811,6 +812,83 @@ pub async fn read_clipboard_text(config: &ClipboardConfig) -> Result<Option<Stri
     Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
 }
 
+pub async fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    if config.images_enabled {
+        let types = Command::new("wl-paste")
+            .arg("--list-types")
+            .output()
+            .await?;
+        if types.status.success() {
+            let offered = String::from_utf8_lossy(&types.stdout);
+            let supported = [
+                "image/png",
+                "image/jpeg",
+                "image/jpg",
+                "image/bmp",
+                "image/x-bmp",
+            ]
+            .into_iter()
+            .find(|mime| offered.lines().any(|line| line.trim() == *mime));
+            if let Some(mime) = supported {
+                let bytes = read_clipboard_bytes(mime, config.max_image_bytes).await?;
+                let image = CanonicalImage::from_encoded(&bytes, mime, config.max_image_bytes)
+                    .map_err(|error| LinuxInputError::CommandFailed {
+                        program: "wl-paste".to_string(),
+                        message: error.to_string(),
+                    })?;
+                return Ok(Some(ClipboardItem::Image(image)));
+            }
+            if offered
+                .lines()
+                .any(|line| line.trim().starts_with("image/"))
+            {
+                return Ok(None);
+            }
+        }
+    }
+
+    Ok(read_clipboard_text(config).await?.map(ClipboardItem::Text))
+}
+
+async fn read_clipboard_bytes(mime: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut child = Command::new("wl-paste")
+        .arg("--no-newline")
+        .arg("--type")
+        .arg(mime)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut bytes = Vec::new();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LinuxInputError::CommandFailed {
+            program: "wl-paste".to_string(),
+            message: "stdout pipe was unavailable".to_string(),
+        })?;
+    stdout
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes {
+        child.kill().await.ok();
+        return Err(LinuxInputError::ClipboardTooLarge { max_bytes });
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(LinuxInputError::CommandFailed {
+            program: "wl-paste".to_string(),
+            message: format!("exited with {status}"),
+        });
+    }
+    Ok(bytes)
+}
+
 pub struct ClipboardChangeWatcher {
     receiver: mpsc::Receiver<()>,
     task: JoinHandle<()>,
@@ -834,8 +912,6 @@ pub fn spawn_clipboard_change_watcher() -> ClipboardChangeWatcher {
         loop {
             let mut command = Command::new("wl-paste");
             command
-                .arg("--type")
-                .arg("text")
                 .arg("--watch")
                 .arg("sh")
                 .arg("-c")
@@ -913,6 +989,33 @@ pub async fn write_clipboard_text(config: &ClipboardConfig, text: &str) -> Resul
         .spawn()?;
     if let Some(stdin) = &mut child.stdin {
         stdin.write_all(text.as_bytes()).await?;
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(LinuxInputError::CommandFailed {
+            program: "wl-copy".to_string(),
+            message: format!("exited with {status}"),
+        });
+    }
+    Ok(())
+}
+
+pub async fn write_clipboard_image(config: &ClipboardConfig, image: &CanonicalImage) -> Result<()> {
+    if !config.enabled || !config.images_enabled {
+        return Ok(());
+    }
+    if image.png.len() > config.max_image_bytes {
+        return Err(LinuxInputError::ClipboardTooLarge {
+            max_bytes: config.max_image_bytes,
+        });
+    }
+    let mut child = Command::new("wl-copy")
+        .arg("--type")
+        .arg("image/png")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = &mut child.stdin {
+        stdin.write_all(&image.png).await?;
     }
     let status = child.wait().await?;
     if !status.success() {

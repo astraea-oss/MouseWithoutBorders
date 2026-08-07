@@ -1,6 +1,9 @@
 use std::sync::mpsc;
+#[cfg(windows)]
+use std::{fs::File, io::Read, path::Path};
 
-use edge_common::GameCompatibilityMode;
+use edge_clipboard::{CanonicalImage, ClipboardItem};
+use edge_common::{ClipboardConfig, GameCompatibilityMode};
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
 use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
@@ -203,8 +206,196 @@ pub fn write_clipboard_text(_text: &str, _max_bytes: usize) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn clipboard_sequence_number() -> u32 {
+    unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_sequence_number() -> u32 {
+    0
+}
+
+/// Reads the clipboard off the async runtime.
+///
+/// The Win32 clipboard is a blocking, contended resource: opening it can fail
+/// while another process holds it, and the retry loop below sleeps between
+/// attempts. Running that on a tokio worker stalls every other task on that
+/// thread, so the whole read happens on a blocking thread instead.
+pub async fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || read_clipboard_item_blocking(&config))
+        .await
+        .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?
+}
+
+#[cfg(windows)]
+pub fn read_clipboard_item_blocking(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    if config.images_enabled {
+        let mut last_error = None;
+        for attempt in 0..8 {
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+            match clipboard.get_image() {
+                Ok(image) => {
+                    let canonical = CanonicalImage::from_rgba(
+                        image.width as u32,
+                        image.height as u32,
+                        image.bytes.into_owned(),
+                        config.max_image_bytes,
+                    )
+                    .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+                    return Ok(Some(ClipboardItem::Image(canonical)));
+                }
+                Err(arboard::Error::ContentNotAvailable) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 7 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(WindowsInputError::Clipboard(error.to_string()));
+        }
+
+        match clipboard::read_file_drop()? {
+            clipboard::FileDrop::None => {}
+            clipboard::FileDrop::Unsupported => return Ok(None),
+            clipboard::FileDrop::Single(path) => {
+                return Ok(
+                    canonicalize_copied_image_file(&path, config.max_image_bytes)?
+                        .map(ClipboardItem::Image),
+                );
+            }
+        }
+    }
+    Ok(read_clipboard_text(config.max_bytes)?.map(ClipboardItem::Text))
+}
+
+#[cfg(windows)]
+fn canonicalize_copied_image_file(
+    path: &Path,
+    max_image_bytes: usize,
+) -> Result<Option<CanonicalImage>> {
+    let Some(mime) = copied_image_mime(path) else {
+        return Ok(None);
+    };
+    let file = File::open(path).map_err(|error| {
+        WindowsInputError::Clipboard(format!("failed to open copied image file: {error}"))
+    })?;
+    let source_bytes = file
+        .metadata()
+        .map_err(|error| {
+            WindowsInputError::Clipboard(format!("failed to inspect copied image file: {error}"))
+        })?
+        .len();
+    if source_bytes > max_image_bytes as u64 {
+        tracing::warn!(
+            bytes = source_bytes,
+            max_bytes = max_image_bytes,
+            "ignored oversized copied image file"
+        );
+        return Ok(None);
+    }
+
+    let read_limit = max_image_bytes.saturating_add(1) as u64;
+    let mut encoded = Vec::with_capacity(source_bytes as usize);
+    file.take(read_limit)
+        .read_to_end(&mut encoded)
+        .map_err(|error| {
+            WindowsInputError::Clipboard(format!("failed to read copied image file: {error}"))
+        })?;
+    if encoded.len() > max_image_bytes {
+        tracing::warn!(
+            bytes = encoded.len(),
+            max_bytes = max_image_bytes,
+            "ignored oversized copied image file"
+        );
+        return Ok(None);
+    }
+
+    match CanonicalImage::from_encoded(&encoded, mime, max_image_bytes) {
+        Ok(image) => Ok(Some(image)),
+        Err(error) => {
+            tracing::warn!(%error, "ignored invalid or oversized copied image file");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copied_image_mime(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("png") {
+        Some("image/png")
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some("image/jpeg")
+    } else if extension.eq_ignore_ascii_case("bmp") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_item_blocking(_config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+/// Writes an image to the clipboard off the async runtime. See
+/// [`read_clipboard_item`] for why this needs a blocking thread.
+pub async fn write_clipboard_image(image: CanonicalImage) -> Result<()> {
+    tokio::task::spawn_blocking(move || write_clipboard_image_blocking(&image))
+        .await
+        .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?
+}
+
+#[cfg(windows)]
+pub fn write_clipboard_image_blocking(image: &CanonicalImage) -> Result<()> {
+    use std::borrow::Cow;
+    let mut last_error = None;
+    for attempt in 0..8 {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?;
+        match clipboard.set_image(arboard::ImageData {
+            width: image.width as usize,
+            height: image.height as usize,
+            bytes: Cow::Borrowed(&image.rgba),
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 7 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+    Err(WindowsInputError::Clipboard(
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown image clipboard failure".to_string()),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_image_blocking(_image: &CanonicalImage) -> Result<()> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
 mod clipboard {
-    use std::{ptr::null_mut, slice, thread, time::Duration};
+    use std::{
+        ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf, ptr::null_mut, slice, thread,
+        time::Duration,
+    };
 
     use windows_sys::Win32::{
         Foundation::{GetLastError, GlobalFree},
@@ -214,11 +405,44 @@ mod clipboard {
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         },
+        UI::Shell::DragQueryFileW,
     };
 
     use crate::{Result, WindowsInputError};
 
     const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    const ALL_DROPPED_FILES: u32 = u32::MAX;
+
+    pub(super) enum FileDrop {
+        None,
+        Single(PathBuf),
+        Unsupported,
+    }
+
+    pub(super) fn read_file_drop() -> Result<FileDrop> {
+        let _clipboard = OpenClipboardGuard::open()?;
+        let handle = unsafe { GetClipboardData(CF_HDROP) };
+        if handle.is_null() {
+            return Ok(FileDrop::None);
+        }
+
+        let count = unsafe { DragQueryFileW(handle, ALL_DROPPED_FILES, null_mut(), 0) };
+        if count != 1 {
+            return Ok(FileDrop::Unsupported);
+        }
+        let path_len = unsafe { DragQueryFileW(handle, 0, null_mut(), 0) };
+        if path_len == 0 {
+            return Ok(FileDrop::Unsupported);
+        }
+        let mut path = vec![0_u16; path_len as usize + 1];
+        let copied = unsafe { DragQueryFileW(handle, 0, path.as_mut_ptr(), path.len() as u32) };
+        if copied != path_len {
+            return Err(last_error("DragQueryFileW"));
+        }
+        path.truncate(copied as usize);
+        Ok(FileDrop::Single(PathBuf::from(OsString::from_wide(&path))))
+    }
 
     pub fn read_text(max_bytes: usize) -> Result<Option<String>> {
         let _clipboard = OpenClipboardGuard::open()?;
@@ -2613,5 +2837,61 @@ mod tray {
         let dx = (x - cx) / rx;
         let dy = (y - cy) / ry;
         dx * dx + dy * dy <= 1.0
+    }
+}
+
+#[cfg(all(test, windows))]
+mod clipboard_file_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_supported_image_file_extensions_case_insensitively() {
+        assert_eq!(copied_image_mime(Path::new("image.PNG")), Some("image/png"));
+        assert_eq!(
+            copied_image_mime(Path::new("image.jpg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            copied_image_mime(Path::new("image.JPEG")),
+            Some("image/jpeg")
+        );
+        assert_eq!(copied_image_mime(Path::new("image.bmp")), Some("image/bmp"));
+        assert_eq!(copied_image_mime(Path::new("notes.txt")), None);
+    }
+
+    #[test]
+    fn canonicalizes_a_bounded_copied_png_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clipboard.png");
+        let original = CanonicalImage::from_rgba(1, 1, vec![10, 20, 30, 40], 1024).unwrap();
+        std::fs::write(&path, &original.png).unwrap();
+
+        let loaded = canonicalize_copied_image_file(&path, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.width, 1);
+        assert_eq!(loaded.height, 1);
+        assert_eq!(loaded.rgba, original.rgba);
+        assert_eq!(loaded.content_sha256, original.content_sha256);
+    }
+
+    #[test]
+    fn ignores_oversized_or_unsupported_copied_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("large.png");
+        std::fs::write(&oversized, vec![0_u8; 17]).unwrap();
+        assert!(
+            canonicalize_copied_image_file(&oversized, 16)
+                .unwrap()
+                .is_none()
+        );
+
+        let unsupported = directory.path().join("document.bin");
+        std::fs::write(&unsupported, b"not an image").unwrap();
+        assert!(
+            canonicalize_copied_image_file(&unsupported, 1024)
+                .unwrap()
+                .is_none()
+        );
     }
 }

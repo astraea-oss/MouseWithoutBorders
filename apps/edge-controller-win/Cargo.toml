@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 edge-common = { path = "../../crates/edge-common" }
+edge-clipboard = { path = "../../crates/edge-clipboard" }
 edge-audio = { path = "../../crates/edge-audio" }
 edge-crypto = { path = "../../crates/edge-crypto" }
 edge-geometry = { path = "../../crates/edge-geometry" }
