@@ -209,16 +209,25 @@ async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
             let has_image_setting = text
                 .lines()
                 .any(|line| line.trim_start().starts_with("images_enabled"));
+            let has_text_only = text
+                .lines()
+                .any(|line| line.trim_start().starts_with("text_only"));
             if !has_image_setting {
                 config.clipboard.images_enabled = true;
                 config.clipboard.max_image_bytes = 4 * 1024 * 1024;
+            }
+            if !has_image_setting || has_text_only {
                 config.save(path).await.with_context(|| {
                     format!(
                         "failed to migrate receiver clipboard config at {}",
                         path.display()
                     )
                 })?;
-                tracing::info!(path = %path.display(), "enabled clipboard images while migrating legacy receiver config");
+                tracing::info!(
+                    path = %path.display(),
+                    images_enabled = config.clipboard.images_enabled,
+                    "migrated legacy receiver clipboard config"
+                );
             }
             Ok(config)
         }
@@ -870,6 +879,7 @@ async fn handle_controller(
             }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
+                writer.record_received(&frame);
                 match frame {
                     Frame::Input(InputEvent::AllKeysUp) => {
                         stats.all_keys_up = stats.all_keys_up.saturating_add(1);
@@ -1056,7 +1066,7 @@ async fn handle_controller(
                     Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
                 }
             },
-            _ = clipboard_send.tick() => {
+            _ = clipboard_send.tick(), if clipboard_sync.outgoing.is_some() => {
                 match clipboard_sync.send_next_image_frame(&mut writer).await {
                     Ok(true) => {
                         tracing::info!("completed Linux clipboard image transfer to controller");
@@ -1567,11 +1577,11 @@ impl ScheduledNoiseWriter {
     }
 
     fn record_sent(&mut self, frame: &Frame) {
-        if matches!(frame, Frame::Clipboard(ClipboardEvent::ImageChunk { .. })) {
-            self.image_schedule.record_image_chunk();
-        } else {
-            self.image_schedule.record_high_priority_frame();
-        }
+        self.image_schedule.record_sent_frame(frame);
+    }
+
+    fn record_received(&mut self, frame: &Frame) {
+        self.image_schedule.record_received_frame(frame);
     }
 }
 
@@ -1759,5 +1769,33 @@ max_bytes = 1048576
         assert!(config.clipboard.images_enabled);
         assert!(migrated.contains("images_enabled = true"));
         assert!(!migrated.contains("text_only"));
+    }
+
+    #[tokio::test]
+    async fn obsolete_text_only_key_is_dropped_without_re_enabling_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receiver.toml");
+        tokio::fs::write(
+            &path,
+            r#"device_name = "Lua"
+role = "receiver"
+listen = "0.0.0.0:42420"
+
+[clipboard]
+enabled = true
+text_only = true
+images_enabled = false
+max_bytes = 1048576
+max_image_bytes = 4194304
+"#,
+        )
+        .await
+        .unwrap();
+
+        let config = load_or_create_config(&path).await.unwrap();
+        let migrated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!config.clipboard.images_enabled);
+        assert!(!migrated.contains("text_only"));
+        assert!(migrated.contains("images_enabled = false"));
     }
 }

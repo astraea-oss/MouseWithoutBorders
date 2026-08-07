@@ -12,6 +12,7 @@ edge-geometry = { path = "../edge-geometry" }
 edge-keymap = { path = "../edge-keymap" }
 edge-protocol = { path = "../edge-protocol" }
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -1,4 +1,6 @@
-use std::{fs::File, io::Read, path::Path, sync::mpsc};
+use std::sync::mpsc;
+#[cfg(windows)]
+use std::{fs::File, io::Read, path::Path};
 
 use edge_clipboard::{CanonicalImage, ClipboardItem};
 use edge_common::{ClipboardConfig, GameCompatibilityMode};
@@ -213,8 +215,21 @@ pub fn clipboard_sequence_number() -> u32 {
     0
 }
 
+/// Reads the clipboard off the async runtime.
+///
+/// The Win32 clipboard is a blocking, contended resource: opening it can fail
+/// while another process holds it, and the retry loop below sleeps between
+/// attempts. Running that on a tokio worker stalls every other task on that
+/// thread, so the whole read happens on a blocking thread instead.
+pub async fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || read_clipboard_item_blocking(&config))
+        .await
+        .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?
+}
+
 #[cfg(windows)]
-pub fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+pub fn read_clipboard_item_blocking(config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -264,6 +279,7 @@ pub fn read_clipboard_item(config: &ClipboardConfig) -> Result<Option<ClipboardI
     Ok(read_clipboard_text(config.max_bytes)?.map(ClipboardItem::Text))
 }
 
+#[cfg(windows)]
 fn canonicalize_copied_image_file(
     path: &Path,
     max_image_bytes: usize,
@@ -314,6 +330,7 @@ fn canonicalize_copied_image_file(
     }
 }
 
+#[cfg(windows)]
 fn copied_image_mime(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?;
     if extension.eq_ignore_ascii_case("png") {
@@ -328,12 +345,20 @@ fn copied_image_mime(path: &Path) -> Option<&'static str> {
 }
 
 #[cfg(not(windows))]
-pub fn read_clipboard_item(_config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
+pub fn read_clipboard_item_blocking(_config: &ClipboardConfig) -> Result<Option<ClipboardItem>> {
     Err(WindowsInputError::UnsupportedPlatform)
 }
 
+/// Writes an image to the clipboard off the async runtime. See
+/// [`read_clipboard_item`] for why this needs a blocking thread.
+pub async fn write_clipboard_image(image: CanonicalImage) -> Result<()> {
+    tokio::task::spawn_blocking(move || write_clipboard_image_blocking(&image))
+        .await
+        .map_err(|error| WindowsInputError::Clipboard(error.to_string()))?
+}
+
 #[cfg(windows)]
-pub fn write_clipboard_image(image: &CanonicalImage) -> Result<()> {
+pub fn write_clipboard_image_blocking(image: &CanonicalImage) -> Result<()> {
     use std::borrow::Cow;
     let mut last_error = None;
     for attempt in 0..8 {
@@ -361,7 +386,7 @@ pub fn write_clipboard_image(image: &CanonicalImage) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn write_clipboard_image(_image: &CanonicalImage) -> Result<()> {
+pub fn write_clipboard_image_blocking(_image: &CanonicalImage) -> Result<()> {
     Err(WindowsInputError::UnsupportedPlatform)
 }
 
@@ -2815,7 +2840,7 @@ mod tray {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod clipboard_file_tests {
     use super::*;
 

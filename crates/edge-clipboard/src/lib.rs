@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use edge_protocol::{ClipboardCancelReason, ClipboardEvent};
+use edge_protocol::{ClipboardCancelReason, ClipboardEvent, Frame};
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +29,29 @@ impl ImageTransferSchedule {
 
     pub fn image_chunk_is_due(&self) -> bool {
         self.high_priority_frames_since_chunk >= MAX_HIGH_PRIORITY_FRAMES_BEFORE_IMAGE_CHUNK
+    }
+
+    /// Records a frame this peer sent. Chunks reset the budget; everything else
+    /// spends it.
+    pub fn record_sent_frame(&mut self, frame: &Frame) {
+        if matches!(frame, Frame::Clipboard(ClipboardEvent::ImageChunk { .. })) {
+            self.record_image_chunk();
+        } else {
+            self.record_high_priority_frame();
+        }
+    }
+
+    /// Records a frame this peer received.
+    ///
+    /// A receiver under remote control sends almost nothing of its own, so a
+    /// budget spent only by outbound frames advances at the heartbeat rate and
+    /// leaves an outgoing image transfer starved behind inbound input. Inbound
+    /// work has to count too. Clipboard frames are excluded: they belong to the
+    /// transfer itself and must not spend its own starvation budget.
+    pub fn record_received_frame(&mut self, frame: &Frame) {
+        if !matches!(frame, Frame::Clipboard(_)) {
+            self.record_high_priority_frame();
+        }
     }
 }
 
@@ -578,6 +601,190 @@ mod tests {
             Err(ClipboardError::TransferExpired)
         ));
         assert!(incoming.active.is_none());
+    }
+
+    fn motion_frame() -> Frame {
+        Frame::Input(edge_protocol::InputEvent::PointerMotion { dx: 1.0, dy: 0.0 })
+    }
+
+    #[test]
+    fn sustained_inbound_input_still_schedules_image_chunks() {
+        // Regression: the receiver's biased select polls inbound controller
+        // frames ahead of the image-chunk timer, and its own outbound traffic
+        // during remote control is essentially just heartbeats. Spending the
+        // starvation budget on sent frames alone meant a chunk came due only
+        // every ~16s, past the peer's 10s transfer timeout.
+        let mut schedule = ImageTransferSchedule::default();
+        for _ in 0..MAX_HIGH_PRIORITY_FRAMES_BEFORE_IMAGE_CHUNK {
+            assert!(!schedule.image_chunk_is_due());
+            schedule.record_received_frame(&motion_frame());
+        }
+        assert!(schedule.image_chunk_is_due());
+
+        schedule.record_image_chunk();
+        assert!(!schedule.image_chunk_is_due());
+    }
+
+    #[test]
+    fn transfer_frames_do_not_spend_their_own_starvation_budget() {
+        let mut schedule = ImageTransferSchedule::default();
+        for _ in 0..MAX_HIGH_PRIORITY_FRAMES_BEFORE_IMAGE_CHUNK * 2 {
+            schedule.record_received_frame(&Frame::Clipboard(ClipboardEvent::ContentRequest));
+        }
+        assert!(!schedule.image_chunk_is_due());
+
+        let chunk = Frame::Clipboard(ClipboardEvent::ImageChunk {
+            transfer_id: 1,
+            offset: 0,
+            bytes: vec![0; 8],
+        });
+        schedule.record_sent_frame(&motion_frame());
+        schedule.record_sent_frame(&chunk);
+        assert!(!schedule.image_chunk_is_due());
+    }
+
+    #[test]
+    fn rejects_chunks_from_a_different_transfer() {
+        let image = sample_image();
+        let mut incoming = IncomingImageTransfer::default();
+        incoming
+            .handle(
+                ClipboardEvent::ImageStart {
+                    transfer_id: 1,
+                    sequence: 1,
+                    width: image.width,
+                    height: image.height,
+                    total_bytes: image.png.len() as u32,
+                    content_sha256: image.content_sha256,
+                },
+                1024,
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(
+                ClipboardEvent::ImageChunk {
+                    transfer_id: 2,
+                    offset: 0,
+                    bytes: vec![1],
+                },
+                1024
+            ),
+            Err(ClipboardError::InvalidTransfer)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_and_duplicated_transfers() {
+        let image = sample_image();
+        let start = ClipboardEvent::ImageStart {
+            transfer_id: 1,
+            sequence: 1,
+            width: image.width,
+            height: image.height,
+            total_bytes: image.png.len() as u32,
+            content_sha256: image.content_sha256,
+        };
+
+        // Ending early, with fewer bytes than promised, must not yield an image.
+        let mut incoming = IncomingImageTransfer::default();
+        incoming.handle(start.clone(), 1024).unwrap();
+        incoming
+            .handle(
+                ClipboardEvent::ImageChunk {
+                    transfer_id: 1,
+                    offset: 0,
+                    bytes: image.png[..4].to_vec(),
+                },
+                1024,
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, 1024),
+            Err(ClipboardError::InvalidTransfer)
+        ));
+
+        // Replaying a chunk that was already accepted is an offset mismatch.
+        let mut incoming = IncomingImageTransfer::default();
+        incoming.handle(start, 1024).unwrap();
+        let chunk = ClipboardEvent::ImageChunk {
+            transfer_id: 1,
+            offset: 0,
+            bytes: image.png[..4].to_vec(),
+        };
+        incoming.handle(chunk.clone(), 1024).unwrap();
+        assert!(matches!(
+            incoming.handle(chunk, 1024),
+            Err(ClipboardError::OffsetMismatch {
+                expected: 4,
+                actual: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_mismatched_hash_and_malformed_payload() {
+        let image = sample_image();
+
+        // Correct byte count and dimensions, but the promised hash is wrong.
+        let mut incoming = IncomingImageTransfer::default();
+        incoming
+            .handle(
+                ClipboardEvent::ImageStart {
+                    transfer_id: 1,
+                    sequence: 1,
+                    width: image.width,
+                    height: image.height,
+                    total_bytes: image.png.len() as u32,
+                    content_sha256: [0xAB; 32],
+                },
+                4096,
+            )
+            .unwrap();
+        incoming
+            .handle(
+                ClipboardEvent::ImageChunk {
+                    transfer_id: 1,
+                    offset: 0,
+                    bytes: image.png.clone(),
+                },
+                4096,
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, 4096),
+            Err(ClipboardError::HashMismatch)
+        ));
+
+        // Bytes that are not a decodable PNG at all.
+        let garbage = vec![0x7F_u8; 32];
+        let mut incoming = IncomingImageTransfer::default();
+        incoming
+            .handle(
+                ClipboardEvent::ImageStart {
+                    transfer_id: 2,
+                    sequence: 2,
+                    width: image.width,
+                    height: image.height,
+                    total_bytes: garbage.len() as u32,
+                    content_sha256: image.content_sha256,
+                },
+                4096,
+            )
+            .unwrap();
+        incoming
+            .handle(
+                ClipboardEvent::ImageChunk {
+                    transfer_id: 2,
+                    offset: 0,
+                    bytes: garbage,
+                },
+                4096,
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 2 }, 4096),
+            Err(ClipboardError::Image(_))
+        ));
     }
 
     #[test]

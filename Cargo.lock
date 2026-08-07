@@ -1005,6 +1005,7 @@ dependencies = [
  "edge-protocol",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "windows",
  "windows-sys 0.61.2",

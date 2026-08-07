@@ -23,7 +23,13 @@ remain out of scope.
 - Cancel replaced transfers and expire incomplete incoming transfers after ten
   seconds.
 - Hold a forwarded Windows-to-Linux paste behind an active image transfer for
-  at most five seconds.
+  at most five seconds. Pointer motion is exempt so the cursor stays live;
+  keys, buttons, and wheel stay queued because releasing those ahead of the
+  held paste could move focus and land it in the wrong window.
+- Keep image chunks scheduled against inbound traffic as well as outbound. A
+  receiver under remote control sends little besides heartbeats, so a budget
+  spent only by sent frames would starve its outgoing transfer past the peer's
+  ten-second timeout.
 - Keep text synchronization with peers that do not advertise the extension.
 - Never persist or log clipboard contents.
 
@@ -38,14 +44,19 @@ max_image_bytes = 4194304
 ```
 
 Legacy configs that lack `images_enabled` are rewritten beside the executable
-with image synchronization enabled. No AppData, installation-directory, or
-temporary clipboard storage is used.
+with image synchronization enabled. A config that still carries the obsolete
+`text_only` key is also rewritten to drop it, preserving any explicit
+`images_enabled` value. No AppData, installation-directory, or temporary
+clipboard storage is used.
 
 ## Validation
 
 - Unit tests cover PNG canonicalization, JPEG/BMP normalization, identity
   tracking, protocol compatibility, chunk size, reassembly, cancellation,
-  expiry, size limits, and config migration.
+  expiry, size limits, and config migration. Negative reassembly paths are
+  covered too: wrong transfer id, truncated transfer, replayed chunk,
+  mismatched hash, and undecodable payload.
+- A regression test pins chunk scheduling under sustained inbound input.
 - Windows and Linux application builds compile from the shared workspace.
 - Live acceptance should use generated fixtures or user-driven clipboard
   actions. Do not capture a screenshot of the user's computer without explicit

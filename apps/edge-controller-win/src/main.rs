@@ -707,7 +707,7 @@ async fn run_connected_inner(
     );
     let mut input_rx = start_live_input(config, screen_info)?;
     let mut runtime_config = config.clone();
-    let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images)?;
+    let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images).await?;
     let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
     clipboard_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut clipboard_send = time::interval(Duration::from_millis(2));
@@ -863,7 +863,7 @@ async fn run_connected_inner(
                 }
             },
             _ = clipboard_poll.tick() => {
-                match live_clipboard.local_change_offer(&runtime_config) {
+                match live_clipboard.local_change_offer(&runtime_config).await {
                     Ok(frames) => for frame in frames {
                         write_secure_frame_writer(&mut writer, &frame).await?;
                         stats.record_frame(&frame);
@@ -910,7 +910,7 @@ async fn run_connected_inner(
             },
             event = recv_live_input(&mut input_rx) => {
                 if let Some(frame) = event {
-                    for prepared in live_clipboard.prepare_input(frame, &runtime_config)? {
+                    for prepared in live_clipboard.prepare_input(frame, &runtime_config).await? {
                         write_secure_frame_writer(&mut writer, &prepared).await?;
                         stats.record_frame(&prepared);
                         live_clipboard.after_input_sent(&prepared, &runtime_config, &clipboard_tx);
@@ -1044,7 +1044,7 @@ async fn run_connected_inner(
                     other => tracing::debug!(?other, "receiver frame"),
                 }
             },
-            _ = clipboard_send.tick() => {
+            _ = clipboard_send.tick(), if live_clipboard.needs_send_tick() => {
                 if live_clipboard.paste_barrier_expired() {
                     if let Some(cancel) = live_clipboard.cancel_expired_paste_barrier() {
                         write_secure_frame_writer(&mut writer, &cancel).await?;
@@ -1205,11 +1205,11 @@ struct LiveClipboardState {
 }
 
 impl LiveClipboardState {
-    fn new(config: &AppConfig, peer_supports_images: bool) -> Result<Self> {
+    async fn new(config: &AppConfig, peer_supports_images: bool) -> Result<Self> {
         #[cfg(windows)]
         {
             let last_observed = if config.clipboard.enabled {
-                match edge_windows_input::read_clipboard_item(&config.clipboard) {
+                match edge_windows_input::read_clipboard_item(&config.clipboard).await {
                     Ok(item) => item.as_ref().map(ClipboardItem::id),
                     Err(error) => {
                         tracing::debug!(%error, "skipped initial Windows clipboard observation");
@@ -1241,10 +1241,17 @@ impl LiveClipboardState {
         }
     }
 
-    fn prepare_input(&mut self, frame: Frame, config: &AppConfig) -> Result<Vec<Frame>> {
+    async fn prepare_input(&mut self, frame: Frame, config: &AppConfig) -> Result<Vec<Frame>> {
         #[cfg(windows)]
         {
             if self.paste_barrier_deadline.is_some() {
+                // Pointer motion carries no clipboard ordering constraint, so let it
+                // through instead of freezing the cursor for the length of the
+                // transfer. Keys, buttons, and wheel stay queued: releasing those
+                // ahead of the held paste could move focus and land it elsewhere.
+                if matches!(frame, Frame::Input(InputEvent::PointerMotion { .. })) {
+                    return Ok(vec![frame]);
+                }
                 self.held_input.push_back(frame);
                 return Ok(Vec::new());
             }
@@ -1260,7 +1267,8 @@ impl LiveClipboardState {
                 })
             ) && self.ctrl_down
             {
-                let current = match edge_windows_input::read_clipboard_item(&config.clipboard) {
+                let current = match edge_windows_input::read_clipboard_item(&config.clipboard).await
+                {
                     Ok(current) => current,
                     Err(error) => {
                         tracing::debug!(%error, "could not prepare Windows clipboard before paste");
@@ -1383,7 +1391,7 @@ impl LiveClipboardState {
                     }
                 }
                 ClipboardEvent::ContentRequest => {
-                    for frame in self.local_clipboard_offer(config, true)? {
+                    for frame in self.local_clipboard_offer(config, true).await? {
                         write_secure_frame_writer(writer, &frame).await?;
                     }
                 }
@@ -1432,15 +1440,18 @@ impl LiveClipboardState {
                             {
                                 return Ok(());
                             }
-                            edge_windows_input::write_clipboard_image(&image)
+                            let (width, height, bytes) =
+                                (image.width, image.height, image.png.len());
+                            edge_windows_input::write_clipboard_image(image)
+                                .await
                                 .context("failed to write Windows image clipboard")?;
                             self.tracker.mark_observed(Some(remote_id));
                             self.last_clipboard_sequence =
                                 edge_windows_input::clipboard_sequence_number();
                             tracing::info!(
-                                width = image.width,
-                                height = image.height,
-                                bytes = image.png.len(),
+                                width,
+                                height,
+                                bytes,
                                 "updated Windows image clipboard from receiver"
                             );
                         }
@@ -1482,28 +1493,37 @@ impl LiveClipboardState {
     }
 
     #[cfg(windows)]
-    fn local_clipboard_offer(&mut self, config: &AppConfig, force: bool) -> Result<Vec<Frame>> {
+    async fn local_clipboard_offer(
+        &mut self,
+        config: &AppConfig,
+        force: bool,
+    ) -> Result<Vec<Frame>> {
         let current = edge_windows_input::read_clipboard_item(&config.clipboard)
+            .await
             .context("failed to read Windows clipboard")?;
         self.offer_item(config, current, force)
     }
 
     #[cfg(windows)]
-    fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
+    async fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
         if !config.clipboard.enabled {
             return Ok(Vec::new());
         }
+        // GetClipboardSequenceNumber returns 0 when the process has no clipboard
+        // access to the window station. Treating that as a real sequence would
+        // match `last_clipboard_sequence` forever and silently stop syncing, so
+        // fall back to reading the clipboard instead.
         let sequence = edge_windows_input::clipboard_sequence_number();
-        if sequence == self.last_clipboard_sequence {
+        if sequence != 0 && sequence == self.last_clipboard_sequence {
             return Ok(Vec::new());
         }
-        let frames = self.local_clipboard_offer(config, false)?;
+        let frames = self.local_clipboard_offer(config, false).await?;
         self.last_clipboard_sequence = sequence;
         Ok(frames)
     }
 
     #[cfg(not(windows))]
-    fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
+    async fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
         let _ = config;
         Ok(Vec::new())
     }
@@ -1516,6 +1536,7 @@ impl LiveClipboardState {
         writer: &mut ScheduledNoiseWriter,
     ) -> Result<bool> {
         let current = edge_windows_input::read_clipboard_item(&config.clipboard)
+            .await
             .context("failed to read Windows clipboard")?;
         let current_id = current.as_ref().map(ClipboardItem::id);
         if current_id == Some(remote_id) {
@@ -1616,6 +1637,18 @@ impl LiveClipboardState {
     fn paste_barrier_expired(&self) -> bool {
         self.paste_barrier_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Whether the 2 ms send tick has anything to do. Keeping it disabled while
+    /// idle avoids waking the runtime 500 times a second for a whole session.
+    #[cfg(windows)]
+    fn needs_send_tick(&self) -> bool {
+        self.outgoing.is_some() || self.paste_barrier_deadline.is_some()
+    }
+
+    #[cfg(not(windows))]
+    fn needs_send_tick(&self) -> bool {
+        false
     }
 }
 
@@ -1864,11 +1897,7 @@ impl ScheduledNoiseWriter {
     }
 
     fn record_sent(&mut self, frame: &Frame) {
-        if matches!(frame, Frame::Clipboard(ClipboardEvent::ImageChunk { .. })) {
-            self.image_schedule.record_image_chunk();
-        } else {
-            self.image_schedule.record_high_priority_frame();
-        }
+        self.image_schedule.record_sent_frame(frame);
     }
 }
 
@@ -1899,6 +1928,9 @@ async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
             let has_image_setting = text
                 .lines()
                 .any(|line| line.trim_start().starts_with("images_enabled"));
+            let has_text_only = text
+                .lines()
+                .any(|line| line.trim_start().starts_with("text_only"));
             let mut migrated = false;
             if !has_audio_table {
                 config.audio = AppConfig::controller_default().audio;
@@ -1910,6 +1942,10 @@ async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
                 config.clipboard.max_image_bytes = 4 * 1024 * 1024;
                 migrated = true;
                 tracing::info!(path = %path.display(), "enabled clipboard images while migrating legacy controller config");
+            }
+            if has_text_only {
+                migrated = true;
+                tracing::info!(path = %path.display(), "dropped obsolete text_only key from controller config");
             }
             if migrated {
                 config.save(path).await.with_context(|| {
@@ -2002,6 +2038,40 @@ max_bytes = 1048576
         assert!(config.clipboard.images_enabled);
         assert!(migrated.contains("images_enabled = true"));
         assert!(!migrated.contains("text_only"));
+    }
+
+    #[tokio::test]
+    async fn obsolete_text_only_key_is_dropped_without_re_enabling_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controller.toml");
+        tokio::fs::write(
+            &path,
+            r#"device_name = "Main PC"
+role = "controller"
+
+[clipboard]
+enabled = true
+text_only = true
+images_enabled = false
+max_bytes = 1048576
+max_image_bytes = 4194304
+
+[audio]
+enabled = false
+local_playback = "redirect"
+jitter_target_ms = 60
+"#,
+        )
+        .await
+        .unwrap();
+
+        // A complete [audio] table means `text_only` is the only thing that can
+        // trigger the rewrite.
+        let config = load_or_create_config(&path).await.unwrap();
+        let migrated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!config.clipboard.images_enabled);
+        assert!(!migrated.contains("text_only"));
+        assert!(migrated.contains("images_enabled = false"));
     }
 
     #[tokio::test]
