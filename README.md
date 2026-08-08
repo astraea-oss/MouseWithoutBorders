@@ -119,7 +119,9 @@ The tray icon opens Settings with a left-click and shows its menu with a
 right-click. `input.game_compatibility` controls edge switching while a game is
 focused: `always-enabled` (default), `borderless`, or `compatible`. Active
 remote mouse movement uses Windows Raw Input so games cannot distort the
-forwarded relative motion.
+forwarded relative motion. Uncheck `Forward mouse and keyboard` in either tray
+to pause input without stopping Linux audio or clipboard synchronization;
+either side can turn forwarding back on.
 
 On non-Windows hosts, use `--dry-run` to validate config and the initial protocol hello.
 

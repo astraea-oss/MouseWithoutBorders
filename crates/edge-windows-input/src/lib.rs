@@ -51,6 +51,7 @@ pub enum WindowsTrayCommand {
     ReleaseControl,
     Disconnect,
     Reconnect,
+    ToggleInputForwarding,
     ToggleAudio,
     Quit,
 }
@@ -148,6 +149,24 @@ pub fn update_tray_audio(enabled: bool, status: &str) -> Result<()> {
 pub fn update_tray_audio(_enabled: bool, _status: &str) -> Result<()> {
     Ok(())
 }
+
+#[cfg(windows)]
+pub fn update_tray_input_forwarding(enabled: bool) -> Result<()> {
+    tray::update_input_forwarding(enabled)
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_input_forwarding(_enabled: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_forwarding_enabled(enabled: bool) {
+    capture::set_enabled(enabled)
+}
+
+#[cfg(not(windows))]
+pub fn set_forwarding_enabled(_enabled: bool) {}
 
 #[cfg(windows)]
 pub fn force_release_to_local() {
@@ -717,14 +736,28 @@ mod capture {
     }
 
     pub fn disable() {
+        set_enabled_with_release_reason(false, ReleaseReason::PeerDisconnected);
+        tracing::info!("Windows edge capture disabled until the next connection");
+    }
+
+    pub fn set_enabled(enabled: bool) {
+        set_enabled_with_release_reason(enabled, ReleaseReason::UserRequest);
+    }
+
+    fn set_enabled_with_release_reason(enabled: bool, reason: ReleaseReason) {
         let Some(state) = STATE.get() else {
             return;
         };
         let mut state = state.lock().expect("capture state poisoned");
-        state.enabled = false;
-        state.release_to_local(ReleaseReason::PeerDisconnected);
+        if state.enabled == enabled {
+            return;
+        }
+        if !enabled {
+            state.release_to_local(reason);
+        }
+        state.enabled = enabled;
         state.show_source_cursor();
-        tracing::info!("Windows edge capture disabled until the next connection");
+        tracing::info!(enabled, "Windows input forwarding changed");
     }
 
     pub fn stats_snapshot() -> CaptureStatsSnapshot {
@@ -2409,6 +2442,7 @@ mod tray {
     const ID_QUIT: usize = 1003;
     const ID_AUDIO: usize = 1004;
     const ID_CONNECTION: usize = 1005;
+    const ID_INPUT_FORWARDING: usize = 1006;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
@@ -2417,6 +2451,7 @@ mod tray {
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
     static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
     static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
+    static TRAY_INPUT_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(true);
 
     pub fn run(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
         unsafe {
@@ -2494,6 +2529,11 @@ mod tray {
         Ok(())
     }
 
+    pub fn update_input_forwarding(enabled: bool) -> Result<()> {
+        TRAY_INPUT_FORWARDING_ENABLED.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         message: u32,
@@ -2543,6 +2583,7 @@ mod tray {
                     send_tray_command(WindowsTrayCommand::Reconnect);
                 }
             }
+            ID_INPUT_FORWARDING => send_tray_command(WindowsTrayCommand::ToggleInputForwarding),
             ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
             ID_QUIT => {
                 send_tray_command(WindowsTrayCommand::Quit);
@@ -2643,8 +2684,14 @@ mod tray {
             "Reconnect"
         });
         let audio = to_wide("Stream Linux audio");
+        let input_forwarding = to_wide("Forward mouse and keyboard");
         let quit = to_wide("Quit");
         let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let input_forwarding_flags = if TRAY_INPUT_FORWARDING_ENABLED.load(Ordering::Relaxed) {
             MF_STRING | MF_CHECKED
         } else {
             MF_STRING
@@ -2657,6 +2704,12 @@ mod tray {
             AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(
+                menu,
+                input_forwarding_flags,
+                ID_INPUT_FORWARDING,
+                input_forwarding.as_ptr(),
+            );
             AppendMenuW(menu, audio_flags, ID_AUDIO, audio.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
