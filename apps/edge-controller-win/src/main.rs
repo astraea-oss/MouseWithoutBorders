@@ -15,10 +15,11 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
+use edge_clipboard::ImageTransferSchedule;
 #[cfg(windows)]
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
-    ImageTransferSchedule, IncomingImageTransfer, OutgoingImageTransfer,
+    IncomingImageTransfer, OutgoingImageTransfer,
 };
 #[cfg(windows)]
 use edge_common::PeerPosition;
@@ -32,8 +33,9 @@ use edge_geometry::Size;
 use edge_protocol::Edge;
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Hello, InputEvent,
-    MouseButton, PROTOCOL_VERSION, ScreenInfo, decode_frame, encode_frame,
+    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Hello,
+    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PROTOCOL_VERSION, ScreenInfo, decode_frame,
+    encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput};
 use tokio::{
@@ -139,6 +141,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         if run_tray {
             let mut connection = connect_for_tray(&config, &identity, &controller_log).await;
             let mut connection_enabled = true;
+            let mut input_forwarding_enabled = true;
             let mut next_connect_attempt = if connection.is_some() {
                 Instant::now()
             } else {
@@ -178,6 +181,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                 },
                 &controller_log,
             );
+            update_windows_tray_input_forwarding(true, &controller_log);
 
             loop {
                 match handle_pending_windows_tray_commands(
@@ -185,6 +189,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                     &config_path,
                     &config,
                     &controller_log,
+                    input_forwarding_enabled,
                 )? {
                     TrayCommandOutcome::Quit => return Ok(()),
                     TrayCommandOutcome::Disconnect => {
@@ -206,6 +211,10 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         connection_enabled = true;
                         next_connect_attempt = Instant::now();
                         update_windows_tray_status("Connecting", &controller_log);
+                    }
+                    TrayCommandOutcome::InputForwardingChanged(enabled) => {
+                        input_forwarding_enabled = enabled;
+                        update_windows_tray_input_forwarding(enabled, &controller_log);
                     }
                     TrayCommandOutcome::AudioChanged(enabled) => {
                         config.audio.enabled = enabled;
@@ -234,7 +243,12 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         screen_info
                             .extensions
                             .iter()
+                            .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
+                        screen_info
+                            .extensions
+                            .iter()
                             .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+                        &mut input_forwarding_enabled,
                         &controller_log,
                         &config_path,
                         Some(&mut tray_command_rx),
@@ -324,6 +338,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
 
     #[cfg(windows)]
     {
+        let mut input_forwarding_enabled = true;
         run_connected(
             connection,
             &config,
@@ -332,7 +347,12 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             initial_receiver
                 .extensions
                 .iter()
+                .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
+            initial_receiver
+                .extensions
+                .iter()
                 .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+            &mut input_forwarding_enabled,
             &controller_log,
             &config_path,
             None,
@@ -411,11 +431,23 @@ fn update_windows_tray_audio(enabled: bool, status: &str, log_path: &Path) {
 }
 
 #[cfg(windows)]
+fn update_windows_tray_input_forwarding(enabled: bool, log_path: &Path) {
+    if let Err(err) = edge_windows_input::update_tray_input_forwarding(enabled) {
+        tracing::warn!(%err, enabled, "failed to update Windows tray input forwarding state");
+        append_portable_log(
+            log_path,
+            format!("failed to update Windows tray input forwarding state to {enabled}: {err}"),
+        );
+    }
+}
+
+#[cfg(windows)]
 enum TrayCommandOutcome {
     Continue,
     Quit,
     Disconnect,
     Reconnect,
+    InputForwardingChanged(bool),
     AudioChanged(bool),
 }
 
@@ -425,6 +457,7 @@ fn handle_pending_windows_tray_commands(
     config_path: &Path,
     config: &AppConfig,
     log_path: &Path,
+    input_forwarding_enabled: bool,
 ) -> Result<TrayCommandOutcome> {
     while let Ok(command) = commands.try_recv() {
         match command {
@@ -452,6 +485,11 @@ fn handle_pending_windows_tray_commands(
             edge_windows_input::WindowsTrayCommand::Reconnect => {
                 append_portable_log(log_path, "reconnect requested from tray");
                 return Ok(TrayCommandOutcome::Reconnect);
+            }
+            edge_windows_input::WindowsTrayCommand::ToggleInputForwarding => {
+                let enabled = !input_forwarding_enabled;
+                append_portable_log(log_path, format!("input forwarding toggled to {enabled}"));
+                return Ok(TrayCommandOutcome::InputForwardingChanged(enabled));
             }
             edge_windows_input::WindowsTrayCommand::ToggleAudio => {
                 let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
@@ -540,7 +578,10 @@ async fn connect_session(
             role: Role::Controller,
             public_key_fingerprint: identity.fingerprint(),
             capabilities: vec![Capability::AudioV1],
-            extensions: vec![CLIPBOARD_IMAGE_EXTENSION.to_string()],
+            extensions: vec![
+                CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                INPUT_TOGGLE_EXTENSION.to_string(),
+            ],
         }),
     )
     .await?;
@@ -668,7 +709,9 @@ async fn run_connected(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
     peer_supports_audio: bool,
+    peer_supports_input_toggle: bool,
     peer_supports_images: bool,
+    input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
     tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
@@ -678,7 +721,9 @@ async fn run_connected(
         config,
         screen_info,
         peer_supports_audio,
+        peer_supports_input_toggle,
         peer_supports_images,
+        input_forwarding_enabled,
         log_path,
         config_path,
         tray_commands,
@@ -695,7 +740,9 @@ async fn run_connected_inner(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
     peer_supports_audio: bool,
+    peer_supports_input_toggle: bool,
     peer_supports_images: bool,
+    input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
     mut tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
@@ -706,6 +753,8 @@ async fn run_connected_inner(
         format!("connected session started: {}", connection.status()),
     );
     let mut input_rx = start_live_input(config, screen_info)?;
+    edge_windows_input::set_forwarding_enabled(*input_forwarding_enabled);
+    update_windows_tray_input_forwarding(*input_forwarding_enabled, log_path);
     let mut runtime_config = config.clone();
     let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images).await?;
     let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
@@ -751,6 +800,15 @@ async fn run_connected_inner(
     } else {
         append_portable_log(log_path, "receiver does not advertise AudioV1");
         update_windows_tray_audio(audio_enabled, "Audio: Unsupported by receiver", log_path);
+    }
+    if peer_supports_input_toggle {
+        write_secure_frame_writer(
+            &mut writer,
+            &Frame::Control(ControlEvent::SetInputForwarding {
+                enabled: *input_forwarding_enabled,
+            }),
+        )
+        .await?;
     }
 
     loop {
@@ -876,7 +934,13 @@ async fn run_connected_inner(
             },
             _ = tray_command_poll.tick(), if tray_commands.is_some() => {
                 if let Some(commands) = tray_commands.as_deref_mut() {
-                    match handle_pending_windows_tray_commands(commands, config_path, config, log_path)? {
+                    match handle_pending_windows_tray_commands(
+                        commands,
+                        config_path,
+                        config,
+                        log_path,
+                        *input_forwarding_enabled,
+                    )? {
                         TrayCommandOutcome::Quit => {
                             write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
                             if peer_supports_audio {
@@ -894,6 +958,25 @@ async fn run_connected_inner(
                             return Ok(ConnectedSessionExit::Disconnect);
                         }
                         TrayCommandOutcome::Reconnect => {}
+                        TrayCommandOutcome::InputForwardingChanged(enabled) => {
+                            if !enabled {
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Input(InputEvent::AllKeysUp),
+                                )
+                                .await?;
+                            }
+                            *input_forwarding_enabled = enabled;
+                            edge_windows_input::set_forwarding_enabled(enabled);
+                            update_windows_tray_input_forwarding(enabled, log_path);
+                            if peer_supports_input_toggle {
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Control(ControlEvent::SetInputForwarding { enabled }),
+                                )
+                                .await?;
+                            }
+                        }
                         TrayCommandOutcome::AudioChanged(enabled) => {
                             audio_enabled = enabled;
                             audio_restart_attempted = false;
@@ -909,7 +992,7 @@ async fn run_connected_inner(
                 }
             },
             event = recv_live_input(&mut input_rx) => {
-                if let Some(frame) = event {
+                if *input_forwarding_enabled && let Some(frame) = event {
                     for prepared in live_clipboard.prepare_input(frame, &runtime_config).await? {
                         write_secure_frame_writer(&mut writer, &prepared).await?;
                         stats.record_frame(&prepared);
@@ -950,6 +1033,17 @@ async fn run_connected_inner(
                         } else {
                             tracing::warn!(?reason, "ignored stale or implausible receiver release");
                             append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
+                        }
+                    }
+                    Frame::Control(ControlEvent::SetInputForwarding { enabled }) => {
+                        if peer_supports_input_toggle {
+                            *input_forwarding_enabled = enabled;
+                            edge_windows_input::set_forwarding_enabled(enabled);
+                            update_windows_tray_input_forwarding(enabled, log_path);
+                            append_portable_log(
+                                log_path,
+                                format!("receiver set input forwarding to {enabled}"),
+                            );
                         }
                     }
                     Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),

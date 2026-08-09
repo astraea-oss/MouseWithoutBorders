@@ -33,9 +33,9 @@ use edge_linux_input::{
 };
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, Capability,
-    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, InputEvent,
-    OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError, ScreenInfo, decode_frame,
-    encode_frame,
+    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
+    INPUT_TOGGLE_EXTENSION, InputEvent, OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError,
+    ScreenInfo, decode_frame, encode_frame,
 };
 use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
 #[cfg(target_os = "linux")]
@@ -378,6 +378,11 @@ async fn run_receiver(
                     TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
                         tracing::info!("audio toggle ignored while no controller is connected");
                     }
+                    TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
+                        tracing::info!(
+                            "input forwarding toggle ignored while no controller is connected"
+                        );
+                    }
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing without tray commands");
                         append_portable_log(
@@ -463,6 +468,10 @@ async fn run_receiver(
                 .await;
         }
         let controller_supports_audio = hello.capabilities.contains(&Capability::AudioV1);
+        let controller_supports_input_toggle = hello
+            .extensions
+            .iter()
+            .any(|extension| extension == INPUT_TOGGLE_EXTENSION);
         let controller_supports_images = hello
             .extensions
             .iter()
@@ -476,7 +485,10 @@ async fn run_receiver(
                 role: Role::Receiver,
                 public_key_fingerprint: identity.fingerprint(),
                 capabilities: vec![Capability::AudioV1],
-                extensions: vec![CLIPBOARD_IMAGE_EXTENSION.to_string()],
+                extensions: vec![
+                    CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                    INPUT_TOGGLE_EXTENSION.to_string(),
+                ],
             }),
         )
         .await?;
@@ -516,6 +528,7 @@ async fn run_receiver(
             audio_socket,
             addr.ip(),
             controller_supports_audio,
+            controller_supports_input_toggle,
             controller_supports_images,
         )
         .await
@@ -664,6 +677,7 @@ async fn handle_controller(
     audio_socket: Arc<UdpSocket>,
     controller_ip: std::net::IpAddr,
     controller_supports_audio: bool,
+    controller_supports_input_toggle: bool,
     controller_supports_images: bool,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
@@ -687,6 +701,10 @@ async fn handle_controller(
     let mut audio_start_task: Option<AbortOnDropTask> = None;
     let mut audio_start_generation = 0_u64;
     let mut audio_requested = config.audio.enabled;
+    let mut input_forwarding_enabled = true;
+    if let Some(tray) = tray {
+        tray.input_forwarding(true).await;
+    }
 
     loop {
         if writer.bulk_is_due() && clipboard_sync.outgoing.is_some() {
@@ -811,6 +829,41 @@ async fn handle_controller(
                         return Ok(ControllerSessionExit::DisconnectRequested);
                     }
                     TrayCommandEvent::Command(TrayCommand::Reconnect) => {}
+                    TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
+                        input_forwarding_enabled = !input_forwarding_enabled;
+                        if !input_forwarding_enabled {
+                            backend.all_keys_up().await.ok();
+                            return_watcher.record_control(
+                                &ControlEvent::SetInputForwarding { enabled: false },
+                            );
+                        }
+                        if let Some(tray) = tray {
+                            tray.input_forwarding(input_forwarding_enabled).await;
+                        }
+                        append_portable_log(
+                            log_path,
+                            format!(
+                                "input forwarding toggled to {input_forwarding_enabled} from receiver"
+                            ),
+                        );
+                        if controller_supports_input_toggle {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Control(ControlEvent::SetInputForwarding {
+                                    enabled: input_forwarding_enabled,
+                                }),
+                            )
+                            .await?;
+                        } else if !input_forwarding_enabled {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Control(ControlEvent::ReleaseToLocal {
+                                    reason: ReleaseReason::BackendFailure,
+                                }),
+                            )
+                            .await?;
+                        }
+                    }
                     TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
                         if !controller_supports_audio {
                             tracing::warn!("audio toggle ignored because controller lacks AudioV1");
@@ -889,6 +942,10 @@ async fn handle_controller(
                         }
                     }
                     Frame::Input(event) => {
+                        if !input_forwarding_enabled {
+                            tracing::trace!(?event, "ignored input while forwarding is disabled");
+                            continue;
+                        }
                         stats.record_input(&event);
                         let is_motion = matches!(event, InputEvent::PointerMotion { .. });
                         backend.inject(event).await?;
@@ -928,10 +985,45 @@ async fn handle_controller(
                         }
                     }
                     Frame::Heartbeat(_) => {}
+                    Frame::Control(ControlEvent::SetInputForwarding { enabled }) => {
+                        if controller_supports_input_toggle {
+                            input_forwarding_enabled = enabled;
+                            if !enabled {
+                                backend.all_keys_up().await.ok();
+                            }
+                            return_watcher.record_control(
+                                &ControlEvent::SetInputForwarding { enabled },
+                            );
+                            if let Some(tray) = tray {
+                                tray.input_forwarding(enabled).await;
+                            }
+                            stats.control = stats.control.saturating_add(1);
+                            append_portable_log(
+                                log_path,
+                                format!("controller set input forwarding to {enabled}"),
+                            );
+                        }
+                    }
                     Frame::Control(control) => {
                         stats.control = stats.control.saturating_add(1);
                         return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
+                        if should_release_legacy_controller(
+                            input_forwarding_enabled,
+                            controller_supports_input_toggle,
+                            &control,
+                        ) {
+                            tracing::info!(
+                                "releasing legacy controller that entered while input forwarding is disabled"
+                            );
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Control(ControlEvent::ReleaseToLocal {
+                                    reason: ReleaseReason::BackendFailure,
+                                }),
+                            )
+                            .await?;
+                        }
                     }
                     Frame::Audio(AudioControl::Start {
                         udp_port,
@@ -1421,6 +1513,16 @@ impl ReceiverInputStats {
     }
 }
 
+fn should_release_legacy_controller(
+    input_forwarding_enabled: bool,
+    controller_supports_input_toggle: bool,
+    control: &ControlEvent,
+) -> bool {
+    !input_forwarding_enabled
+        && !controller_supports_input_toggle
+        && matches!(control, ControlEvent::EnterRemote { .. })
+}
+
 struct RemoteReturnWatcher {
     output: Option<OutputInfo>,
     edge: Option<Edge>,
@@ -1461,6 +1563,12 @@ impl RemoteReturnWatcher {
                 self.entered_at = None;
                 self.consecutive_edge_polls = 0;
             }
+            ControlEvent::SetInputForwarding { enabled: false } => {
+                self.edge = None;
+                self.entered_at = None;
+                self.consecutive_edge_polls = 0;
+            }
+            ControlEvent::SetInputForwarding { enabled: true } => {}
         }
     }
 
@@ -1725,6 +1833,25 @@ impl ReceiverBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_input_releases_a_legacy_controller_on_each_remote_entry() {
+        let enter = ControlEvent::EnterRemote {
+            edge: Edge::Left,
+            normalized_y: 0.5,
+        };
+
+        assert!(should_release_legacy_controller(false, false, &enter));
+        assert!(!should_release_legacy_controller(true, false, &enter));
+        assert!(!should_release_legacy_controller(false, true, &enter));
+        assert!(!should_release_legacy_controller(
+            false,
+            false,
+            &ControlEvent::ReleaseToLocal {
+                reason: ReleaseReason::UserRequest,
+            },
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

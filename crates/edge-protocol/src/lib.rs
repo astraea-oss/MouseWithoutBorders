@@ -6,6 +6,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_PORT: u16 = 42_420;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
+pub const INPUT_TOGGLE_EXTENSION: &str = "input-toggle-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -190,6 +191,7 @@ pub enum ControlEvent {
     EnterRemote { edge: Edge, normalized_y: f32 },
     LeaveRemote { edge: Edge, normalized_y: f32 },
     ReleaseToLocal { reason: ReleaseReason },
+    SetInputForwarding { enabled: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +289,14 @@ mod tests {
             jitter_target_ms: 60,
         });
         assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn input_forwarding_control_round_trip() {
+        for enabled in [false, true] {
+            let frame = Frame::Control(ControlEvent::SetInputForwarding { enabled });
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
     }
 
     #[test]

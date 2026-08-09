@@ -64,8 +64,9 @@ which Waybar's tray module can display. The tray shows:
 - connection, input, and clipboard counters;
 - last receiver error when one occurs.
 
-The tray menu includes a `Quit receiver` action. Use `--no-tray` for diagnostic
-or headless runs:
+The tray menu can toggle mouse and keyboard forwarding without disconnecting,
+so audio and clipboard synchronization remain active. It also includes a
+`Quit receiver` action. Use `--no-tray` for diagnostic or headless runs:
 
 ```bash
 cargo run -p edge-receiver-linux -- --pair --no-tray

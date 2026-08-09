@@ -16,6 +16,7 @@ pub enum TrayCommand {
     OpenSettings,
     Disconnect,
     Reconnect,
+    ToggleInputForwarding,
     ToggleAudio,
     Quit,
 }
@@ -43,6 +44,7 @@ impl ReceiverTrayHandle {
             connections: 0,
             input_events: 0,
             clipboard_events: 0,
+            input_forwarding_enabled: true,
             last_error: None,
             command_tx,
         };
@@ -125,6 +127,11 @@ impl ReceiverTrayHandle {
         .await;
     }
 
+    pub async fn input_forwarding(&self, enabled: bool) {
+        self.update(move |tray| tray.input_forwarding_enabled = enabled)
+            .await;
+    }
+
     pub async fn error(&self, error: String) {
         self.update(|tray| {
             tray.state = TrayState::Error;
@@ -174,6 +181,7 @@ pub struct ReceiverTray {
     connections: u64,
     input_events: u64,
     clipboard_events: u64,
+    input_forwarding_enabled: bool,
     last_error: Option<String>,
     command_tx: mpsc::UnboundedSender<TrayCommand>,
 }
@@ -252,6 +260,19 @@ impl ksni::Tray for ReceiverTray {
 
         items.push(MenuItem::Separator);
         items.push(self.connection_item());
+        items.push(
+            CheckmarkItem {
+                label: "Forward mouse and keyboard".to_string(),
+                icon_name: "input-mouse".to_string(),
+                enabled: self.state == TrayState::Connected,
+                checked: self.input_forwarding_enabled,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::ToggleInputForwarding);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(
             StandardItem {
                 label: "Toggle audio streaming".to_string(),
@@ -450,6 +471,7 @@ mod tests {
             connections: 1,
             input_events: 2,
             clipboard_events: 3,
+            input_forwarding_enabled: true,
             last_error: last_error.map(str::to_string),
             command_tx,
         }
@@ -483,7 +505,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 14);
+        assert_eq!(expected.len(), 15);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);
@@ -509,5 +531,25 @@ mod tests {
             menu_label(&test_tray(TrayState::Error, Some("failed")), 10),
             "Stop listening"
         );
+    }
+
+    #[test]
+    fn input_forwarding_action_reflects_runtime_state() {
+        let mut connected = test_tray(TrayState::Connected, None);
+        connected.input_forwarding_enabled = false;
+        let menu = connected.menu();
+        let ksni::MenuItem::Checkmark(toggle) = &menu[11] else {
+            panic!("input forwarding action is not a checkmark");
+        };
+        assert_eq!(toggle.label, "Forward mouse and keyboard");
+        assert!(toggle.enabled);
+        assert!(!toggle.checked);
+
+        let listening = test_tray(TrayState::Listening, None);
+        let menu = listening.menu();
+        let ksni::MenuItem::Checkmark(toggle) = &menu[11] else {
+            panic!("input forwarding action is not a checkmark");
+        };
+        assert!(!toggle.enabled);
     }
 }
