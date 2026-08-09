@@ -1008,6 +1008,22 @@ async fn handle_controller(
                         stats.control = stats.control.saturating_add(1);
                         return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
+                        if should_release_legacy_controller(
+                            input_forwarding_enabled,
+                            controller_supports_input_toggle,
+                            &control,
+                        ) {
+                            tracing::info!(
+                                "releasing legacy controller that entered while input forwarding is disabled"
+                            );
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Control(ControlEvent::ReleaseToLocal {
+                                    reason: ReleaseReason::BackendFailure,
+                                }),
+                            )
+                            .await?;
+                        }
                     }
                     Frame::Audio(AudioControl::Start {
                         udp_port,
@@ -1497,6 +1513,16 @@ impl ReceiverInputStats {
     }
 }
 
+fn should_release_legacy_controller(
+    input_forwarding_enabled: bool,
+    controller_supports_input_toggle: bool,
+    control: &ControlEvent,
+) -> bool {
+    !input_forwarding_enabled
+        && !controller_supports_input_toggle
+        && matches!(control, ControlEvent::EnterRemote { .. })
+}
+
 struct RemoteReturnWatcher {
     output: Option<OutputInfo>,
     edge: Option<Edge>,
@@ -1807,6 +1833,25 @@ impl ReceiverBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_input_releases_a_legacy_controller_on_each_remote_entry() {
+        let enter = ControlEvent::EnterRemote {
+            edge: Edge::Left,
+            normalized_y: 0.5,
+        };
+
+        assert!(should_release_legacy_controller(false, false, &enter));
+        assert!(!should_release_legacy_controller(true, false, &enter));
+        assert!(!should_release_legacy_controller(false, true, &enter));
+        assert!(!should_release_legacy_controller(
+            false,
+            false,
+            &ControlEvent::ReleaseToLocal {
+                reason: ReleaseReason::UserRequest,
+            },
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
