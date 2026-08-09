@@ -26,7 +26,9 @@ use edge_common::PeerPosition;
 use edge_common::{
     AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
 };
-use edge_crypto::{IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session};
+use edge_crypto::{
+    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session, pairing_code,
+};
 #[cfg(windows)]
 use edge_geometry::Size;
 #[cfg(windows)]
@@ -34,10 +36,10 @@ use edge_protocol::Edge;
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
     Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Hello,
-    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PROTOCOL_VERSION, ScreenInfo, decode_frame,
-    encode_frame,
+    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PAIRING_CONFIRMATION_EXTENSION,
+    PROTOCOL_VERSION, PairingEvent, ScreenInfo, decode_frame, encode_frame,
 };
-use edge_ui::{PairingUiState, SettingsUiInput};
+use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput};
 use tokio::{
     net::{TcpStream, UdpSocket},
     sync::mpsc,
@@ -67,6 +69,8 @@ struct Args {
     dry_run: bool,
     #[arg(long, help = "Run the Windows tray shell after connecting")]
     tray: bool,
+    #[arg(long, help = "Confirm and replace an unknown or changed laptop key")]
+    pair: bool,
     #[arg(long, help = "Send one test input event over the encrypted session")]
     test_input: Option<TestInput>,
     #[arg(
@@ -139,7 +143,18 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     #[cfg(windows)]
     {
         if run_tray {
-            let mut connection = connect_for_tray(&config, &identity, &controller_log).await;
+            let mut pairing_armed = args.pair;
+            let (mut connection, pairing_consumed, connect_status) = connect_for_tray(
+                &config,
+                &identity,
+                &config_path,
+                &controller_log,
+                pairing_armed,
+            )
+            .await;
+            if connection.is_some() || pairing_consumed {
+                pairing_armed = false;
+            }
             let mut connection_enabled = true;
             let mut input_forwarding_enabled = true;
             let mut next_connect_attempt = if connection.is_some() {
@@ -159,7 +174,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             let status = connection
                 .as_ref()
                 .map(|(connection, _)| connection.status())
-                .unwrap_or_else(|| "Disconnected".to_string());
+                .unwrap_or(connect_status);
             tracing::info!(%status, "starting tray loop");
             append_portable_log(&controller_log, format!("starting tray loop: {status}"));
             let tray_log = controller_log.clone();
@@ -211,6 +226,16 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         connection_enabled = true;
                         next_connect_attempt = Instant::now();
                         update_windows_tray_status("Connecting", &controller_log);
+                    }
+                    TrayCommandOutcome::Pair => {
+                        pairing_armed = true;
+                        connection_enabled = true;
+                        connection = None;
+                        next_connect_attempt = Instant::now();
+                        update_windows_tray_status(
+                            "Pairing: enable pairing on the laptop",
+                            &controller_log,
+                        );
                     }
                     TrayCommandOutcome::InputForwardingChanged(enabled) => {
                         input_forwarding_enabled = enabled;
@@ -269,6 +294,15 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                                 &controller_log,
                             );
                         }
+                        Ok(ConnectedSessionExit::Pair) => {
+                            pairing_armed = true;
+                            connection_enabled = true;
+                            next_connect_attempt = Instant::now();
+                            update_windows_tray_status(
+                                "Pairing: enable pairing on the laptop",
+                                &controller_log,
+                            );
+                        }
                         Err(err) => {
                             tracing::warn!(%err, "connected session ended; reconnecting");
                             append_portable_log(
@@ -299,21 +333,40 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                     continue;
                 }
                 config = load_or_create_config(&config_path).await?;
-                connection = connect_for_tray(&config, &identity, &controller_log).await;
+                let (next_connection, pairing_consumed, connect_status) = connect_for_tray(
+                    &config,
+                    &identity,
+                    &config_path,
+                    &controller_log,
+                    pairing_armed,
+                )
+                .await;
+                connection = next_connection;
+                if connection.is_some() || pairing_consumed {
+                    pairing_armed = false;
+                }
                 if connection.is_none() {
                     next_connect_attempt = Instant::now() + Duration::from_secs(2);
                 }
                 let status = connection
                     .as_ref()
                     .map(|(connection, _)| connection.status())
-                    .unwrap_or_else(|| "Disconnected".to_string());
+                    .unwrap_or(connect_status);
                 update_windows_tray_status(&status, &controller_log);
             }
         }
     }
 
-    let mut connection = connect_session(&config, &identity).await?;
-    let initial_receiver = read_initial_frames(&mut connection.session).await?;
+    let mut pairing_consumed = false;
+    let (mut connection, initial_receiver) = connect_and_initialize(
+        &config,
+        &identity,
+        &config_path,
+        &controller_log,
+        args.pair,
+        &mut pairing_consumed,
+    )
+    .await?;
 
     if let Some(test) = args.test_input {
         send_test_input(&mut connection.session, test).await?;
@@ -376,24 +429,41 @@ fn should_run_tray(args: &Args) -> bool {
 async fn connect_for_tray(
     config: &AppConfig,
     identity: &IdentityKey,
+    config_path: &Path,
     log_path: &Path,
-) -> Option<(ControllerConnection, InitialReceiverState)> {
-    match connect_session(config, identity).await {
-        Ok(mut connection) => match read_initial_frames(&mut connection.session).await {
-            Ok(screen_info) => Some((connection, screen_info)),
-            Err(err) => {
-                tracing::warn!(%err, "failed to initialize receiver session");
-                append_portable_log(
-                    log_path,
-                    format!("failed to initialize receiver session: {err:#}"),
-                );
-                None
-            }
-        },
+    pairing_armed: bool,
+) -> (
+    Option<(ControllerConnection, InitialReceiverState)>,
+    bool,
+    String,
+) {
+    let mut pairing_consumed = false;
+    match connect_and_initialize(
+        config,
+        identity,
+        config_path,
+        log_path,
+        pairing_armed,
+        &mut pairing_consumed,
+    )
+    .await
+    {
+        Ok(connection) => {
+            let status = connection.0.status();
+            (Some(connection), pairing_consumed, status)
+        }
         Err(err) => {
             tracing::warn!(%err, "tray connection attempt failed");
             append_portable_log(log_path, format!("tray connection attempt failed: {err:#}"));
-            None
+            let message = format!("{err:#}");
+            let status = if message.contains("fingerprint mismatch") {
+                "Identity changed — pair again".to_string()
+            } else if message.contains("pairing") || message.contains("not paired") {
+                "Pairing required on both computers".to_string()
+            } else {
+                "Disconnected".to_string()
+            };
+            (None, pairing_consumed, status)
         }
     }
 }
@@ -447,6 +517,7 @@ enum TrayCommandOutcome {
     Quit,
     Disconnect,
     Reconnect,
+    Pair,
     InputForwardingChanged(bool),
     AudioChanged(bool),
 }
@@ -474,6 +545,10 @@ fn handle_pending_windows_tray_commands(
                     pairing: controller_pairing_state(&config),
                     config,
                 });
+            }
+            edge_windows_input::WindowsTrayCommand::Pair => {
+                append_portable_log(log_path, "pairing requested from tray");
+                return Ok(TrayCommandOutcome::Pair);
             }
             edge_windows_input::WindowsTrayCommand::ReleaseControl => {
                 edge_windows_input::release_to_local(edge_protocol::ReleaseReason::UserRequest);
@@ -541,6 +616,8 @@ struct ControllerConnection {
     addr: String,
     peer_addr: std::net::SocketAddr,
     peer_fingerprint: String,
+    peer_trusted: bool,
+    pairing_armed: bool,
 }
 
 impl ControllerConnection {
@@ -549,9 +626,177 @@ impl ControllerConnection {
     }
 }
 
+async fn connect_and_initialize(
+    config: &AppConfig,
+    identity: &IdentityKey,
+    config_path: &Path,
+    log_path: &Path,
+    pairing_armed: bool,
+    pairing_consumed: &mut bool,
+) -> Result<(ControllerConnection, InitialReceiverState)> {
+    let mut connection = connect_session(config, identity, pairing_armed).await?;
+    let hello = time::timeout(Duration::from_secs(15), async {
+        loop {
+            match read_secure_frame(&mut connection.session).await? {
+                Frame::Hello(hello) => break Ok(hello),
+                Frame::Error(error) => {
+                    anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+                }
+                frame => tracing::debug!(?frame, "waiting for receiver hello"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for receiver hello")??;
+    validate_receiver_hello(&hello, &connection.peer_fingerprint)?;
+
+    let mut initial = InitialReceiverState {
+        screen_info: None,
+        capabilities: hello.capabilities.clone(),
+        extensions: hello.extensions.clone(),
+    };
+    let supports_confirmation = hello
+        .extensions
+        .iter()
+        .any(|extension| extension == PAIRING_CONFIRMATION_EXTENSION);
+
+    if supports_confirmation {
+        write_secure_frame(
+            &mut connection.session,
+            &Frame::Pairing(PairingEvent::Status {
+                trusted: connection.peer_trusted,
+                armed: connection.pairing_armed,
+            }),
+        )
+        .await?;
+        let (peer_trusted, peer_armed) = read_pairing_status(&mut connection.session).await?;
+        if !connection.peer_trusted || !peer_trusted {
+            if !connection.pairing_armed || !peer_armed {
+                write_secure_frame(
+                    &mut connection.session,
+                    &Frame::Pairing(PairingEvent::Decision { accepted: false }),
+                )
+                .await
+                .ok();
+                anyhow::bail!(
+                    "pairing needs approval on both computers; choose the pairing action in both tray menus"
+                );
+            }
+
+            #[cfg(windows)]
+            update_windows_tray_status("Pairing: compare the code on both computers", log_path);
+            let peer = config
+                .peer
+                .laptop
+                .as_ref()
+                .context("missing [peer.laptop] config")?;
+            let previous_peer_fingerprint = (!peer.pinned_fingerprint.is_empty()
+                && peer.pinned_fingerprint != connection.peer_fingerprint)
+                .then(|| peer.pinned_fingerprint.clone());
+            let confirmation = PairingConfirmationInput {
+                peer_name: hello.device_name.clone(),
+                peer_addr: Some(connection.peer_addr.to_string()),
+                local_fingerprint: identity.fingerprint(),
+                peer_fingerprint: connection.peer_fingerprint.clone(),
+                verification_code: pairing_code(
+                    &identity.fingerprint(),
+                    &connection.peer_fingerprint,
+                ),
+                previous_peer_fingerprint,
+            };
+            *pairing_consumed = true;
+            let accepted = tokio::task::spawn_blocking(move || {
+                edge_ui::run_pairing_confirmation(confirmation)
+            })
+            .await
+            .context("controller pairing confirmation task failed")??;
+            write_secure_frame(
+                &mut connection.session,
+                &Frame::Pairing(PairingEvent::Decision { accepted }),
+            )
+            .await?;
+            if !accepted {
+                anyhow::bail!("pairing was cancelled on this computer");
+            }
+            if !read_pairing_decision(&mut connection.session).await? {
+                anyhow::bail!("pairing was declined on the laptop");
+            }
+
+            let mut updated = AppConfig::load(config_path).await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to reload controller config before saving pin");
+                config.clone()
+            });
+            let peer = updated
+                .peer
+                .laptop
+                .as_mut()
+                .context("missing [peer.laptop] config")?;
+            peer.pinned_fingerprint = connection.peer_fingerprint.clone();
+            updated.save(config_path).await?;
+            connection.peer_trusted = true;
+            append_portable_log(
+                log_path,
+                format!(
+                    "paired laptop {} ({}) after confirmation on both computers",
+                    hello.device_name, connection.peer_fingerprint
+                ),
+            );
+        }
+    } else if !connection.peer_trusted {
+        anyhow::bail!(
+            "the laptop does not support two-sided pairing confirmation; update it before replacing its key"
+        );
+    }
+
+    read_initial_frames(&mut connection.session, &mut initial).await?;
+    Ok((connection, initial))
+}
+
+fn validate_receiver_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
+    if hello.protocol_version != PROTOCOL_VERSION {
+        anyhow::bail!(
+            "receiver protocol version {} is incompatible with {}",
+            hello.protocol_version,
+            PROTOCOL_VERSION
+        );
+    }
+    if hello.role != Role::Receiver {
+        anyhow::bail!("connected peer did not identify itself as a receiver");
+    }
+    if hello.public_key_fingerprint != noise_fingerprint {
+        anyhow::bail!("receiver hello fingerprint does not match its encrypted identity");
+    }
+    Ok(())
+}
+
+async fn read_pairing_status(session: &mut NoiseSession<TcpStream>) -> Result<(bool, bool)> {
+    match time::timeout(Duration::from_secs(15), read_secure_frame(session)).await {
+        Ok(Ok(Frame::Pairing(PairingEvent::Status { trusted, armed }))) => Ok((trusted, armed)),
+        Ok(Ok(Frame::Error(error))) => {
+            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+        }
+        Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing status, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read receiver pairing status"),
+        Err(_) => anyhow::bail!("timed out waiting for receiver pairing status"),
+    }
+}
+
+async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<bool> {
+    match time::timeout(Duration::from_secs(120), read_secure_frame(session)).await {
+        Ok(Ok(Frame::Pairing(PairingEvent::Decision { accepted }))) => Ok(accepted),
+        Ok(Ok(Frame::Error(error))) => {
+            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+        }
+        Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing decision, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read receiver pairing decision"),
+        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the laptop"),
+    }
+}
+
 async fn connect_session(
     config: &AppConfig,
     identity: &IdentityKey,
+    pairing_armed: bool,
 ) -> Result<ControllerConnection> {
     let peer = config
         .peer
@@ -559,16 +804,32 @@ async fn connect_session(
         .as_ref()
         .context("missing [peer.laptop] config")?;
     let addr = format!("{}:{}", peer.host, peer.port);
-    let stream = TcpStream::connect(&addr)
+    let stream = time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
+        .with_context(|| format!("connection to {addr} timed out"))?
         .with_context(|| format!("failed to connect to {addr}"))?;
     let peer_addr = stream
         .peer_addr()
         .context("failed to query receiver address")?;
-    let (mut session, peer_fingerprint) =
-        initiate_noise_session(stream, identity, Some(&peer.pinned_fingerprint))
-            .await
-            .with_context(|| format!("failed encrypted handshake with {addr}"))?;
+    let expected_fingerprint = (!pairing_armed).then_some(peer.pinned_fingerprint.as_str());
+    let (mut session, peer_fingerprint) = time::timeout(
+        Duration::from_secs(15),
+        initiate_noise_session(stream, identity, expected_fingerprint),
+    )
+    .await
+    .context("encrypted handshake timed out")?
+            .with_context(|| {
+                format!(
+                    "failed encrypted handshake with {addr}; if this laptop was reset, choose 'Pair or replace laptop...' from the tray on both computers"
+                )
+            })?;
+    let peer_trusted =
+        !peer.pinned_fingerprint.is_empty() && peer.pinned_fingerprint == peer_fingerprint;
+    if !peer_trusted && !pairing_armed {
+        anyhow::bail!(
+            "the laptop at {addr} is not paired; choose 'Pair or replace laptop...' from both tray menus"
+        );
+    }
 
     write_secure_frame(
         &mut session,
@@ -581,6 +842,7 @@ async fn connect_session(
             extensions: vec![
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
+                PAIRING_CONFIRMATION_EXTENSION.to_string(),
             ],
         }),
     )
@@ -592,6 +854,8 @@ async fn connect_session(
         addr,
         peer_addr,
         peer_fingerprint,
+        peer_trusted,
+        pairing_armed,
     })
 }
 
@@ -604,8 +868,8 @@ struct InitialReceiverState {
 
 async fn read_initial_frames(
     session: &mut NoiseSession<TcpStream>,
-) -> Result<InitialReceiverState> {
-    let mut initial = InitialReceiverState::default();
+    initial: &mut InitialReceiverState,
+) -> Result<()> {
     loop {
         match read_secure_frame(session).await {
             Ok(Frame::Hello(hello)) => {
@@ -624,9 +888,9 @@ async fn read_initial_frames(
                     "receiver screen info"
                 );
                 initial.screen_info = Some(info);
-                return Ok(initial);
+                return Ok(());
             }
-            Ok(Frame::Heartbeat(_)) => return Ok(initial),
+            Ok(Frame::Heartbeat(_)) => return Ok(()),
             Ok(Frame::Error(err)) => {
                 anyhow::bail!("receiver error: {}: {}", err.code, err.message)
             }
@@ -700,6 +964,7 @@ async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput)
 enum ConnectedSessionExit {
     Quit,
     Disconnect,
+    Pair,
 }
 
 #[cfg(windows)]
@@ -958,6 +1223,11 @@ async fn run_connected_inner(
                             return Ok(ConnectedSessionExit::Disconnect);
                         }
                         TrayCommandOutcome::Reconnect => {}
+                        TrayCommandOutcome::Pair => {
+                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            edge_windows_input::force_release_to_local();
+                            return Ok(ConnectedSessionExit::Pair);
+                        }
                         TrayCommandOutcome::InputForwardingChanged(enabled) => {
                             if !enabled {
                                 write_secure_frame_writer(
@@ -2069,6 +2339,20 @@ fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn receiver_hello_must_match_noise_identity() {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: "Laptop".to_string(),
+            role: Role::Receiver,
+            public_key_fingerprint: "actual".to_string(),
+            capabilities: Vec::new(),
+            extensions: Vec::new(),
+        };
+        assert!(validate_receiver_hello(&hello, "actual").is_ok());
+        assert!(validate_receiver_hello(&hello, "different").is_err());
+    }
 
     #[tokio::test]
     async fn legacy_controller_config_is_migrated_with_audio_enabled() {

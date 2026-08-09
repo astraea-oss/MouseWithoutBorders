@@ -24,7 +24,7 @@ cargo test --workspace
 For development:
 
 ```bash
-cargo run -p edge-receiver-linux -- --pair
+cargo run -p edge-receiver-linux
 ```
 
 For portable use, build and copy the binary to a folder you control:
@@ -34,7 +34,7 @@ cargo build -p edge-receiver-linux --release
 mkdir -p ./portable-linux
 cp target/release/edge-receiver-linux ./portable-linux/
 cd ./portable-linux
-./edge-receiver-linux --pair
+./edge-receiver-linux
 ```
 
 On first run it creates:
@@ -123,6 +123,20 @@ forwarded relative motion. Uncheck `Forward mouse and keyboard` in either tray
 to pause input without stopping Linux audio or clipboard synchronization;
 either side can turn forwarding back on.
 
+### Pairing and changed keys
+
+Normal reconnects use the saved identity keys automatically. For a first
+connection, or after intentionally resetting either computer's `state` folder:
+
+1. Choose `Pair or replace controller...` from the Linux tray.
+2. Choose `Pair or replace laptop...` from the Windows tray.
+3. Compare the six-digit code shown on both computers.
+4. Select `Pair` on both only when the codes match.
+
+Neither saved key is replaced until both computers approve. A changed key is
+shown with an additional warning. For scripted startup, `--pair` arms the same
+one-shot confirmation flow; it no longer trusts the next key automatically.
+
 On non-Windows hosts, use `--dry-run` to validate config and the initial protocol hello.
 
 To verify Windows playback without Linux, run:
@@ -143,7 +157,7 @@ initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
 Start the Linux receiver:
 
 ```bash
-./edge-receiver-linux --pair
+./edge-receiver-linux
 ```
 
 From Windows, send test events:

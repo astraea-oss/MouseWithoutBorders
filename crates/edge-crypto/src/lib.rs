@@ -28,14 +28,6 @@ pub enum CryptoError {
     TomlDecode(#[from] toml::de::Error),
     #[error("toml encode error: {0}")]
     TomlEncode(#[from] toml::ser::Error),
-    #[error("unknown peer key for {peer}; run pairing first")]
-    UnknownPeer { peer: String },
-    #[error("peer key changed for {peer}: pinned {expected}, got {actual}")]
-    ChangedPeerKey {
-        peer: String,
-        expected: String,
-        actual: String,
-    },
     #[error("noise packet too large: {0} bytes")]
     PacketTooLarge(u32),
     #[error("peer fingerprint mismatch: expected {expected}, got {actual}")]
@@ -135,40 +127,37 @@ impl PinStore {
         Ok(())
     }
 
-    pub fn verify_or_pin(
-        &mut self,
-        peer: impl Into<String>,
-        fingerprint: impl Into<String>,
-        allow_pairing: bool,
-    ) -> Result<PinDecision> {
-        let peer = peer.into();
-        let fingerprint = fingerprint.into();
-
-        match self.peers.get(&peer) {
-            Some(pinned) if pinned.fingerprint == fingerprint => Ok(PinDecision::Accepted),
-            Some(pinned) => Err(CryptoError::ChangedPeerKey {
-                peer,
+    pub fn status(&self, peer: &str, fingerprint: &str) -> PinStatus {
+        match self.peers.get(peer) {
+            Some(pinned) if pinned.fingerprint == fingerprint => PinStatus::Trusted,
+            Some(pinned) => PinStatus::Changed {
                 expected: pinned.fingerprint.clone(),
-                actual: fingerprint,
-            }),
-            None if allow_pairing => {
-                self.peers.insert(
-                    peer,
-                    PinnedPeer {
-                        fingerprint: fingerprint.clone(),
-                    },
-                );
-                Ok(PinDecision::PinnedNewPeer { fingerprint })
-            }
-            None => Err(CryptoError::UnknownPeer { peer }),
+            },
+            None => PinStatus::Unknown,
         }
+    }
+
+    pub fn pin(&mut self, peer: impl Into<String>, fingerprint: impl Into<String>) {
+        self.peers.insert(
+            peer.into(),
+            PinnedPeer {
+                fingerprint: fingerprint.into(),
+            },
+        );
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PinDecision {
-    Accepted,
-    PinnedNewPeer { fingerprint: String },
+pub enum PinStatus {
+    Trusted,
+    Unknown,
+    Changed { expected: String },
+}
+
+impl PinStatus {
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, Self::Trusted)
+    }
 }
 
 pub fn fingerprint(public_key: &[u8]) -> String {
@@ -181,6 +170,21 @@ pub fn fingerprint(public_key: &[u8]) -> String {
         &hex[16..24],
         &hex[24..32]
     )
+}
+
+pub fn pairing_code(first_fingerprint: &str, second_fingerprint: &str) -> String {
+    let (first, second) = if first_fingerprint <= second_fingerprint {
+        (first_fingerprint, second_fingerprint)
+    } else {
+        (second_fingerprint, first_fingerprint)
+    };
+    let digest = Sha256::digest(format!("edge-kvm-pairing-v1\0{first}\0{second}").as_bytes());
+    let value = u32::from_be_bytes(
+        digest[0..4]
+            .try_into()
+            .expect("SHA-256 prefix is four bytes"),
+    ) % 1_000_000;
+    format!("{value:06}")
 }
 
 pub fn noise_params() -> Result<NoiseParams> {
@@ -391,21 +395,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pin_store_rejects_changed_peer_key() {
-        let mut store = PinStore::default();
+    fn pairing_code_is_symmetric_and_six_digits() {
+        let code = pairing_code("aa:bb", "cc:dd");
+        assert_eq!(code, pairing_code("cc:dd", "aa:bb"));
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_ne!(code, pairing_code("aa:bb", "ee:ff"));
+    }
 
+    #[test]
+    fn pin_status_does_not_mutate_until_confirmed() {
+        let mut store = PinStore::default();
+        assert_eq!(store.status("controller", "new"), PinStatus::Unknown);
+        store.pin("controller", "old");
         assert_eq!(
-            store
-                .verify_or_pin("controller", "aa:bb:cc:dd", true)
-                .unwrap(),
-            PinDecision::PinnedNewPeer {
-                fingerprint: "aa:bb:cc:dd".to_string()
+            store.status("controller", "new"),
+            PinStatus::Changed {
+                expected: "old".to_string()
             }
         );
-        assert!(matches!(
-            store.verify_or_pin("controller", "11:22:33:44", false),
-            Err(CryptoError::ChangedPeerKey { .. })
-        ));
+        assert_eq!(store.status("controller", "old"), PinStatus::Trusted);
     }
 
     #[tokio::test]
