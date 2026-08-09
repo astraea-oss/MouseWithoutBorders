@@ -25,6 +25,104 @@ pub struct SettingsUiInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct PairingConfirmationInput {
+    pub peer_name: String,
+    pub peer_addr: Option<String>,
+    pub local_fingerprint: String,
+    pub peer_fingerprint: String,
+    pub verification_code: String,
+    pub previous_peer_fingerprint: Option<String>,
+}
+
+pub fn run_pairing_confirmation(input: PairingConfirmationInput) -> Result<bool> {
+    let accepted = Arc::new(Mutex::new(false));
+    let app_accepted = Arc::clone(&accepted);
+    let mut options = eframe::NativeOptions {
+        persist_window: false,
+        persistence_path: None,
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([520.0, 420.0])
+            .with_resizable(false),
+        ..Default::default()
+    };
+    configure_event_loop(&mut options);
+
+    eframe::run_native(
+        "Confirm edge-kvm pairing",
+        options,
+        Box::new(move |cc| {
+            cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            Ok(Box::new(PairingConfirmationApp {
+                input,
+                accepted: app_accepted,
+            }))
+        }),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to run pairing confirmation: {err}"))?;
+
+    Ok(*accepted
+        .lock()
+        .map_err(|_| anyhow::anyhow!("pairing confirmation lock poisoned"))?)
+}
+
+struct PairingConfirmationApp {
+    input: PairingConfirmationInput,
+    accepted: Arc<Mutex<bool>>,
+}
+
+impl eframe::App for PairingConfirmationApp {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        use eframe::egui::{self, Align, Layout, RichText};
+
+        ui.heading("Confirm this connection");
+        ui.add_space(8.0);
+        ui.label(format!("Pair with {}?", self.input.peer_name));
+        if let Some(addr) = &self.input.peer_addr {
+            ui.label(format!("Network address: {addr}"));
+        }
+        if self.input.previous_peer_fingerprint.is_some() {
+            ui.add_space(8.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(248, 180, 80),
+                "The saved identity key changed. Only continue if you intentionally reset or reinstalled the other computer.",
+            );
+        }
+        ui.add_space(12.0);
+        ui.label("Verify that this code is identical on both computers:");
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(&self.input.verification_code)
+                    .monospace()
+                    .size(38.0),
+            );
+        });
+        ui.add_space(8.0);
+        ui.collapsing("Identity details", |ui| {
+            ui.label("This computer:");
+            ui.monospace(&self.input.local_fingerprint);
+            ui.label("Other computer:");
+            ui.monospace(&self.input.peer_fingerprint);
+            if let Some(previous) = &self.input.previous_peer_fingerprint {
+                ui.label("Previously saved identity:");
+                ui.monospace(previous);
+            }
+        });
+        ui.add_space(16.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Pair").clicked() {
+                if let Ok(mut accepted) = self.accepted.lock() {
+                    *accepted = true;
+                }
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if ui.button("Cancel").clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum SettingsUiResult {
     Saved(Box<AppConfig>),
     Cancelled,
@@ -118,23 +216,7 @@ pub fn run_settings_window(input: SettingsUiInput) -> Result<SettingsUiResult> {
         persistence_path: None,
         ..Default::default()
     };
-    #[cfg(windows)]
-    {
-        use winit::platform::windows::EventLoopBuilderExtWindows;
-
-        options.event_loop_builder = Some(Box::new(|builder| {
-            builder.with_any_thread(true);
-        }));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
-
-        options.event_loop_builder = Some(Box::new(|builder| {
-            EventLoopBuilderExtWayland::with_any_thread(builder, true);
-            EventLoopBuilderExtX11::with_any_thread(builder, true);
-        }));
-    }
+    configure_event_loop(&mut options);
 
     eframe::run_native(
         "edge-kvm Settings",
@@ -154,6 +236,26 @@ pub fn run_settings_window(input: SettingsUiInput) -> Result<SettingsUiResult> {
         .map_err(|_| anyhow::anyhow!("settings result lock poisoned"))?
         .clone();
     Ok(result)
+}
+
+fn configure_event_loop(options: &mut eframe::NativeOptions) {
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        }));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
+
+        options.event_loop_builder = Some(Box::new(|builder| {
+            EventLoopBuilderExtWayland::with_any_thread(builder, true);
+            EventLoopBuilderExtX11::with_any_thread(builder, true);
+        }));
+    }
 }
 
 struct SettingsApp {

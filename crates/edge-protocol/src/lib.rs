@@ -7,6 +7,7 @@ pub const DEFAULT_PORT: u16 = 42_420;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
 pub const INPUT_TOGGLE_EXTENSION: &str = "input-toggle-v1";
+pub const PAIRING_CONFIRMATION_EXTENSION: &str = "pairing-confirmation-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -32,6 +33,13 @@ pub enum Frame {
     Heartbeat(Heartbeat),
     Error(RemoteError),
     Audio(AudioControl),
+    Pairing(PairingEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingEvent {
+    Status { trusted: bool, armed: bool },
+    Decision { accepted: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +308,20 @@ mod tests {
     }
 
     #[test]
+    fn pairing_events_round_trip() {
+        for event in [
+            PairingEvent::Status {
+                trusted: false,
+                armed: true,
+            },
+            PairingEvent::Decision { accepted: true },
+        ] {
+            let frame = Frame::Pairing(event);
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
+    }
+
+    #[test]
     fn clipboard_event_round_trip_preserves_multiline_unicode() {
         let frame = Frame::Clipboard(ClipboardEvent::TextOffer {
             sequence: 42,
@@ -356,7 +378,10 @@ mod tests {
             role: Role::Controller,
             public_key_fingerprint: "fingerprint".to_string(),
             capabilities: vec![Capability::AudioV1],
-            extensions: vec![CLIPBOARD_IMAGE_EXTENSION.to_string()],
+            extensions: vec![
+                CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                PAIRING_CONFIRMATION_EXTENSION.to_string(),
+            ],
         };
         let encoded = rmp_serde::to_vec_named(&hello).unwrap();
         let legacy: LegacyHello = rmp_serde::from_slice(&encoded).unwrap();

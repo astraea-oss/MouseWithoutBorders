@@ -14,6 +14,7 @@ const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub enum TrayCommand {
     OpenSettings,
+    ArmPairing,
     Disconnect,
     Reconnect,
     ToggleInputForwarding,
@@ -32,14 +33,14 @@ impl ReceiverTrayHandle {
     pub async fn spawn(
         listen: String,
         backend: String,
-        allow_pairing: bool,
+        pairing_armed: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<TrayCommand>), ksni::Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let tray = ReceiverTray {
             state: TrayState::Starting,
             listen,
             backend,
-            allow_pairing,
+            pairing_armed,
             connected_peer: None,
             connections: 0,
             input_events: 0,
@@ -66,6 +67,10 @@ impl ReceiverTrayHandle {
             tray.last_error = None;
         })
         .await;
+    }
+
+    pub async fn pairing_armed(&self, armed: bool) {
+        self.update(move |tray| tray.pairing_armed = armed).await;
     }
 
     pub async fn connected(&self, peer: String) {
@@ -176,7 +181,7 @@ pub struct ReceiverTray {
     state: TrayState,
     listen: String,
     backend: String,
-    allow_pairing: bool,
+    pairing_armed: bool,
     connected_peer: Option<String>,
     connections: u64,
     input_events: u64,
@@ -239,10 +244,10 @@ impl ksni::Tray for ReceiverTray {
             disabled_item(format!("Input backend: {}", self.backend)),
             disabled_item(format!(
                 "Pairing: {}",
-                if self.allow_pairing {
-                    "enabled"
+                if self.pairing_armed {
+                    "waiting for confirmation"
                 } else {
-                    "disabled"
+                    "not armed"
                 }
             )),
             disabled_item(format!(
@@ -259,6 +264,22 @@ impl ksni::Tray for ReceiverTray {
         ];
 
         items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: if self.pairing_armed {
+                    "Pairing enabled for next connection".to_string()
+                } else {
+                    "Pair or replace controller...".to_string()
+                },
+                icon_name: "network-connect".to_string(),
+                enabled: !self.pairing_armed && self.state != TrayState::Connected,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::ArmPairing);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(self.connection_item());
         items.push(
             CheckmarkItem {
@@ -466,7 +487,7 @@ mod tests {
             state,
             listen: "0.0.0.0:42420".to_string(),
             backend: "hyprland".to_string(),
-            allow_pairing: true,
+            pairing_armed: true,
             connected_peer: (state == TrayState::Connected).then(|| "controller".to_string()),
             connections: 1,
             input_events: 2,
@@ -505,7 +526,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 15);
+        assert_eq!(expected.len(), 16);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);
@@ -516,21 +537,49 @@ mod tests {
     #[test]
     fn connection_action_matches_tray_state() {
         assert_eq!(
-            menu_label(&test_tray(TrayState::Connected, None), 10),
+            menu_label(&test_tray(TrayState::Connected, None), 11),
             "Disconnect"
         );
         assert_eq!(
-            menu_label(&test_tray(TrayState::Paused, None), 10),
+            menu_label(&test_tray(TrayState::Paused, None), 11),
             "Reconnect"
         );
         assert_eq!(
-            menu_label(&test_tray(TrayState::Listening, None), 10),
+            menu_label(&test_tray(TrayState::Listening, None), 11),
             "Stop listening"
         );
         assert_eq!(
-            menu_label(&test_tray(TrayState::Error, Some("failed")), 10),
+            menu_label(&test_tray(TrayState::Error, Some("failed")), 11),
             "Stop listening"
         );
+    }
+
+    #[test]
+    fn pairing_action_is_only_available_while_unarmed_and_disconnected() {
+        let listening = test_tray(TrayState::Listening, None);
+        let menu = listening.menu();
+        let ksni::MenuItem::Standard(pairing) = &menu[10] else {
+            panic!("pairing action is not a standard item");
+        };
+        assert_eq!(pairing.label, "Pairing enabled for next connection");
+        assert!(!pairing.enabled);
+
+        let mut listening = test_tray(TrayState::Listening, None);
+        listening.pairing_armed = false;
+        let menu = listening.menu();
+        let ksni::MenuItem::Standard(pairing) = &menu[10] else {
+            panic!("pairing action is not a standard item");
+        };
+        assert_eq!(pairing.label, "Pair or replace controller...");
+        assert!(pairing.enabled);
+
+        let mut connected = test_tray(TrayState::Connected, None);
+        connected.pairing_armed = false;
+        let menu = connected.menu();
+        let ksni::MenuItem::Standard(pairing) = &menu[10] else {
+            panic!("pairing action is not a standard item");
+        };
+        assert!(!pairing.enabled);
     }
 
     #[test]
@@ -538,7 +587,7 @@ mod tests {
         let mut connected = test_tray(TrayState::Connected, None);
         connected.input_forwarding_enabled = false;
         let menu = connected.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[11] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert_eq!(toggle.label, "Forward mouse and keyboard");
@@ -547,7 +596,7 @@ mod tests {
 
         let listening = test_tray(TrayState::Listening, None);
         let menu = listening.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[11] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert!(!toggle.enabled);

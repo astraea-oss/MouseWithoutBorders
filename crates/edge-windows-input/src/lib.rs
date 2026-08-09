@@ -48,6 +48,7 @@ pub enum CapturedInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsTrayCommand {
     OpenSettings,
+    Pair,
     ReleaseControl,
     Disconnect,
     Reconnect,
@@ -2443,6 +2444,7 @@ mod tray {
     const ID_AUDIO: usize = 1004;
     const ID_CONNECTION: usize = 1005;
     const ID_INPUT_FORWARDING: usize = 1006;
+    const ID_PAIR: usize = 1007;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
@@ -2572,6 +2574,7 @@ mod tray {
     unsafe fn dispatch_menu_command(hwnd: HWND, command: usize) {
         match command {
             ID_SETTINGS => send_tray_command(WindowsTrayCommand::OpenSettings),
+            ID_PAIR => send_tray_command(WindowsTrayCommand::Pair),
             ID_RELEASE => {
                 tracing::info!("release requested from tray");
                 send_tray_command(WindowsTrayCommand::ReleaseControl);
@@ -2677,6 +2680,7 @@ mod tray {
         let status = current_tray_status();
         let audio_status = current_audio_status();
         let settings = to_wide("Settings...");
+        let pair = to_wide("Pair or replace laptop...");
         let release = to_wide("Release control");
         let connection = to_wide(if TRAY_CONNECTED.load(Ordering::Relaxed) {
             "Disconnect"
@@ -2696,12 +2700,18 @@ mod tray {
         } else {
             MF_STRING
         };
+        let pair_flags = if TRAY_CONNECTED.load(Ordering::Relaxed) {
+            MF_STRING | MF_DISABLED
+        } else {
+            MF_STRING
+        };
 
         unsafe {
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
+            AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(

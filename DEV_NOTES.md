@@ -66,10 +66,11 @@ which Waybar's tray module can display. The tray shows:
 
 The tray menu can toggle mouse and keyboard forwarding without disconnecting,
 so audio and clipboard synchronization remain active. It also includes a
-`Quit receiver` action. Use `--no-tray` for diagnostic or headless runs:
+`Pair or replace controller...` and `Quit receiver` actions. Use `--no-tray`
+for diagnostic or headless runs:
 
 ```bash
-cargo run -p edge-receiver-linux -- --pair --no-tray
+cargo run -p edge-receiver-linux -- --no-tray
 ```
 
 Verified on Lua's Waybar session:

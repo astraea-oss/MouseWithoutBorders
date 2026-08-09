@@ -23,8 +23,8 @@ use edge_common::{
     portable_config_path,
 };
 use edge_crypto::{
-    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinDecision, PinStore,
-    accept_noise_session,
+    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinStatus, PinStore, accept_noise_session,
+    pairing_code,
 };
 use edge_linux_input::{
     ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
@@ -34,10 +34,11 @@ use edge_linux_input::{
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, Capability,
     ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
-    INPUT_TOGGLE_EXTENSION, InputEvent, OutputInfo, PROTOCOL_VERSION, ReleaseReason, RemoteError,
-    ScreenInfo, decode_frame, encode_frame,
+    INPUT_TOGGLE_EXTENSION, InputEvent, OutputInfo, PAIRING_CONFIRMATION_EXTENSION,
+    PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError, ScreenInfo, decode_frame,
+    encode_frame,
 };
-use edge_ui::{PairingUiState, SettingsUiInput, run_settings_window};
+use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput, run_settings_window};
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
 #[cfg(unix)]
@@ -66,7 +67,7 @@ use tray::{ReceiverTrayHandle, TrayCommand};
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long, help = "Allow one unpinned controller to pair")]
+    #[arg(long, help = "Arm two-sided confirmation for the next pairing")]
     pair: bool,
     #[arg(long)]
     test_input: Option<TestInput>,
@@ -292,7 +293,7 @@ async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()
 async fn run_receiver(
     config: AppConfig,
     config_path: PathBuf,
-    allow_pairing: bool,
+    initial_pairing_armed: bool,
     backend: ReceiverBackend,
     enable_tray: bool,
     log_path: PathBuf,
@@ -314,8 +315,12 @@ async fn run_receiver(
         .with_context(|| format!("failed to bind {listen}"))?;
 
     let (tray, mut tray_commands) = if enable_tray {
-        match ReceiverTrayHandle::spawn(listen.clone(), backend.label().to_string(), allow_pairing)
-            .await
+        match ReceiverTrayHandle::spawn(
+            listen.clone(),
+            backend.label().to_string(),
+            initial_pairing_armed,
+        )
+        .await
         {
             Ok((tray, commands)) => {
                 tray.listening().await;
@@ -337,24 +342,37 @@ async fn run_receiver(
     tracing::info!(
         listen,
         fingerprint = %identity.fingerprint(),
-        allow_pairing,
+        pairing_armed = initial_pairing_armed,
         "receiver listening"
     );
     append_portable_log(
         &log_path,
         format!(
-            "receiver listening on {listen}; fingerprint={}; allow_pairing={allow_pairing}",
-            identity.fingerprint()
+            "receiver listening on {listen}; fingerprint={}; pairing_armed={initial_pairing_armed}",
+            identity.fingerprint(),
         ),
     );
 
     let mut connection_enabled = true;
+    let mut pairing_armed = initial_pairing_armed;
     loop {
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                         open_receiver_settings(&config_path, &log_path);
+                    }
+                    TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
+                        pairing_armed = true;
+                        if let Some(tray) = &tray {
+                            tray.pairing_armed(true).await;
+                            tray.listening().await;
+                        }
+                        tracing::info!("pairing armed from tray");
+                        append_portable_log(
+                            &log_path,
+                            "pairing armed; waiting for confirmation on both computers",
+                        );
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         tracing::info!("quit requested from tray");
@@ -405,9 +423,14 @@ async fn run_receiver(
         tracing::info!(%addr, "controller connected");
         append_portable_log(&log_path, format!("controller connected: {addr}"));
 
-        let (mut session, peer_fingerprint) = match accept_noise_session(stream, &identity).await {
-            Ok(session) => session,
-            Err(err) => {
+        let (mut session, peer_fingerprint) = match time::timeout(
+            Duration::from_secs(15),
+            accept_noise_session(stream, &identity),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(err)) => {
                 if let Some(tray) = &tray {
                     tray.error(format!("Noise handshake failed: {err}")).await;
                 }
@@ -415,51 +438,189 @@ async fn run_receiver(
                 append_portable_log(&log_path, format!("Noise handshake failed: {err:#}"));
                 continue;
             }
-        };
-
-        let hello = match read_secure_frame(&mut session).await {
-            Ok(Frame::Hello(hello)) => hello,
-            Ok(other) => {
-                tracing::warn!(?other, "first frame was not Hello");
-                continue;
-            }
-            Err(err) => {
+            Err(_) => {
+                let message = "Noise handshake timed out";
                 if let Some(tray) = &tray {
-                    tray.error(format!("failed to read Hello: {err}")).await;
+                    tray.error(message.to_string()).await;
                 }
-                tracing::warn!(%err, "failed to read Hello");
-                append_portable_log(&log_path, format!("failed to read Hello: {err:#}"));
+                tracing::warn!(message);
+                append_portable_log(&log_path, message);
                 continue;
             }
         };
 
-        match pins.verify_or_pin(
-            hello.device_name.clone(),
-            peer_fingerprint.clone(),
-            allow_pairing,
-        ) {
-            Ok(PinDecision::PinnedNewPeer { fingerprint }) => {
-                pins.save(state_dir.join("pins.toml")).await?;
-                tracing::info!(%fingerprint, "paired new controller");
-                append_portable_log(&log_path, format!("paired new controller: {fingerprint}"));
+        let hello =
+            match time::timeout(Duration::from_secs(15), read_secure_frame(&mut session)).await {
+                Ok(Ok(Frame::Hello(hello))) => hello,
+                Ok(Ok(other)) => {
+                    tracing::warn!(?other, "first frame was not Hello");
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    if let Some(tray) = &tray {
+                        tray.error(format!("failed to read Hello: {err}")).await;
+                    }
+                    tracing::warn!(%err, "failed to read Hello");
+                    append_portable_log(&log_path, format!("failed to read Hello: {err:#}"));
+                    continue;
+                }
+                Err(_) => {
+                    let message = "timed out waiting for controller hello";
+                    if let Some(tray) = &tray {
+                        tray.error(message.to_string()).await;
+                    }
+                    tracing::warn!(message);
+                    append_portable_log(&log_path, message);
+                    continue;
+                }
+            };
+
+        if let Err(error) = validate_controller_hello(&hello, &peer_fingerprint) {
+            reject_pairing(&mut session, "invalid_hello", &error.to_string()).await;
+            if let Some(tray) = &tray {
+                tray.error(error.to_string()).await;
             }
-            Ok(PinDecision::Accepted) => {}
-            Err(err) => {
+            append_portable_log(&log_path, format!("rejected controller hello: {error:#}"));
+            continue;
+        }
+
+        let pin_status = pins.status(&hello.device_name, &peer_fingerprint);
+        let controller_trusted = pin_status.is_trusted();
+        let controller_supports_pairing_confirmation = hello
+            .extensions
+            .iter()
+            .any(|extension| extension == PAIRING_CONFIRMATION_EXTENSION);
+
+        write_secure_frame(
+            &mut session,
+            &Frame::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: config.device_name.clone(),
+                role: Role::Receiver,
+                public_key_fingerprint: identity.fingerprint(),
+                capabilities: vec![Capability::AudioV1],
+                extensions: vec![
+                    CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                    INPUT_TOGGLE_EXTENSION.to_string(),
+                    PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                ],
+            }),
+        )
+        .await?;
+
+        if controller_supports_pairing_confirmation {
+            write_secure_frame(
+                &mut session,
+                &Frame::Pairing(PairingEvent::Status {
+                    trusted: controller_trusted,
+                    armed: pairing_armed,
+                }),
+            )
+            .await?;
+            let (peer_trusted, peer_armed) = match read_pairing_status(&mut session).await {
+                Ok(status) => status,
+                Err(error) => {
+                    if let Some(tray) = &tray {
+                        tray.error(error.to_string()).await;
+                    }
+                    append_portable_log(
+                        &log_path,
+                        format!("failed pairing status exchange: {error:#}"),
+                    );
+                    continue;
+                }
+            };
+            if !controller_trusted || !peer_trusted {
+                if !pairing_armed || !peer_armed {
+                    let message =
+                        "pairing must be enabled from the tray on both computers before connecting";
+                    reject_pairing(&mut session, "pairing_not_armed", message).await;
+                    if let Some(tray) = &tray {
+                        tray.error(message.to_string()).await;
+                    }
+                    append_portable_log(&log_path, message);
+                    continue;
+                }
+
+                let confirmation = PairingConfirmationInput {
+                    peer_name: hello.device_name.clone(),
+                    peer_addr: Some(addr.to_string()),
+                    local_fingerprint: identity.fingerprint(),
+                    peer_fingerprint: peer_fingerprint.clone(),
+                    verification_code: pairing_code(&identity.fingerprint(), &peer_fingerprint),
+                    previous_peer_fingerprint: match &pin_status {
+                        PinStatus::Changed { expected } => Some(expected.clone()),
+                        PinStatus::Trusted | PinStatus::Unknown => None,
+                    },
+                };
+                let accepted = match tokio::task::spawn_blocking(move || {
+                    edge_ui::run_pairing_confirmation(confirmation)
+                })
+                .await
+                {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "pairing confirmation window failed");
+                        false
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "pairing confirmation task failed");
+                        false
+                    }
+                };
                 write_secure_frame(
                     &mut session,
-                    &Frame::Error(RemoteError {
-                        code: "pin_mismatch".to_string(),
-                        message: err.to_string(),
-                    }),
+                    &Frame::Pairing(PairingEvent::Decision { accepted }),
                 )
-                .await
-                .ok();
+                .await?;
+                let peer_accepted = if accepted {
+                    read_pairing_decision(&mut session).await.unwrap_or(false)
+                } else {
+                    false
+                };
+                pairing_armed = false;
                 if let Some(tray) = &tray {
-                    tray.error(err.to_string()).await;
+                    tray.pairing_armed(false).await;
                 }
-                tracing::warn!(%err, "rejected controller");
-                append_portable_log(&log_path, format!("rejected controller: {err:#}"));
-                continue;
+                if !accepted || !peer_accepted {
+                    let message = if accepted {
+                        "pairing was declined on the controller"
+                    } else {
+                        "pairing was cancelled on this computer"
+                    };
+                    if let Some(tray) = &tray {
+                        tray.error(message.to_string()).await;
+                    }
+                    append_portable_log(&log_path, message);
+                    continue;
+                }
+
+                pins.pin(hello.device_name.clone(), peer_fingerprint.clone());
+                pins.save(state_dir.join("pins.toml")).await?;
+                tracing::info!(fingerprint = %peer_fingerprint, "paired controller after two-sided confirmation");
+                append_portable_log(
+                    &log_path,
+                    format!(
+                        "paired controller {} ({peer_fingerprint}) after confirmation on both computers",
+                        hello.device_name
+                    ),
+                );
+            }
+        } else if !controller_trusted {
+            let message =
+                "controller does not support two-sided pairing confirmation; update it first";
+            reject_pairing(&mut session, "pairing_update_required", message).await;
+            if let Some(tray) = &tray {
+                tray.error(message.to_string()).await;
+            }
+            append_portable_log(&log_path, message);
+            continue;
+        }
+
+        if pairing_armed {
+            pairing_armed = false;
+            if let Some(tray) = &tray {
+                tray.pairing_armed(false).await;
             }
         }
 
@@ -476,22 +637,6 @@ async fn run_receiver(
             .extensions
             .iter()
             .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
-
-        write_secure_frame(
-            &mut session,
-            &Frame::Hello(Hello {
-                protocol_version: PROTOCOL_VERSION,
-                device_name: config.device_name.clone(),
-                role: Role::Receiver,
-                public_key_fingerprint: identity.fingerprint(),
-                capabilities: vec![Capability::AudioV1],
-                extensions: vec![
-                    CLIPBOARD_IMAGE_EXTENSION.to_string(),
-                    INPUT_TOGGLE_EXTENSION.to_string(),
-                ],
-            }),
-        )
-        .await?;
 
         let requested_monitor = config.monitor.as_deref().unwrap_or_default();
         let screen_info = match hyprland_screen_info(requested_monitor).await {
@@ -664,6 +809,59 @@ async fn recv_clipboard_change(
     }
 }
 
+fn validate_controller_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
+    if hello.protocol_version != PROTOCOL_VERSION {
+        anyhow::bail!(
+            "controller protocol version {} is incompatible with {}",
+            hello.protocol_version,
+            PROTOCOL_VERSION
+        );
+    }
+    if hello.role != Role::Controller {
+        anyhow::bail!("connected peer did not identify itself as a controller");
+    }
+    if hello.public_key_fingerprint != noise_fingerprint {
+        anyhow::bail!("controller hello fingerprint does not match its encrypted identity");
+    }
+    Ok(())
+}
+
+async fn reject_pairing(session: &mut NoiseSession<TcpStream>, code: &str, message: &str) {
+    write_secure_frame(
+        session,
+        &Frame::Error(RemoteError {
+            code: code.to_string(),
+            message: message.to_string(),
+        }),
+    )
+    .await
+    .ok();
+}
+
+async fn read_pairing_status(session: &mut NoiseSession<TcpStream>) -> Result<(bool, bool)> {
+    match time::timeout(Duration::from_secs(15), read_secure_frame(session)).await {
+        Ok(Ok(Frame::Pairing(PairingEvent::Status { trusted, armed }))) => Ok((trusted, armed)),
+        Ok(Ok(Frame::Error(error))) => {
+            anyhow::bail!("controller error: {}: {}", error.code, error.message)
+        }
+        Ok(Ok(frame)) => anyhow::bail!("expected controller pairing status, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read controller pairing status"),
+        Err(_) => anyhow::bail!("timed out waiting for controller pairing status"),
+    }
+}
+
+async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<bool> {
+    match time::timeout(Duration::from_secs(120), read_secure_frame(session)).await {
+        Ok(Ok(Frame::Pairing(PairingEvent::Decision { accepted }))) => Ok(accepted),
+        Ok(Ok(Frame::Error(error))) => {
+            anyhow::bail!("controller error: {}: {}", error.code, error.message)
+        }
+        Ok(Ok(frame)) => anyhow::bail!("expected controller pairing decision, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read controller pairing decision"),
+        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the controller"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_controller(
     session: NoiseSession<TcpStream>,
@@ -804,6 +1002,9 @@ async fn handle_controller(
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                         open_receiver_settings(config_path, log_path);
+                    }
+                    TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
+                        tracing::debug!("ignored pairing request while connected");
                     }
                     TrayCommandEvent::Command(TrayCommand::Quit) => {
                         drop(audio_start_task.take());
@@ -1155,7 +1356,10 @@ async fn handle_controller(
                         .await?;
                     }
                     Frame::Audio(AudioControl::State { .. } | AudioControl::Offer { .. }) => {}
-                    Frame::Hello(_) | Frame::ScreenInfo(_) | Frame::Error(_) => {}
+                    Frame::Hello(_)
+                    | Frame::ScreenInfo(_)
+                    | Frame::Error(_)
+                    | Frame::Pairing(_) => {}
                 }
             },
             _ = clipboard_send.tick(), if clipboard_sync.outgoing.is_some() => {
@@ -1833,6 +2037,20 @@ impl ReceiverBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_hello_must_match_noise_identity() {
+        let hello = Hello {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: "Main PC".to_string(),
+            role: Role::Controller,
+            public_key_fingerprint: "actual".to_string(),
+            capabilities: Vec::new(),
+            extensions: Vec::new(),
+        };
+        assert!(validate_controller_hello(&hello, "actual").is_ok());
+        assert!(validate_controller_hello(&hello, "different").is_err());
+    }
 
     #[test]
     fn disabled_input_releases_a_legacy_controller_on_each_remote_entry() {
