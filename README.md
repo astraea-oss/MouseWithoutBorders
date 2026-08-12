@@ -9,9 +9,9 @@ This workspace follows `PLAN.md` and is intentionally narrow:
 - Protocol frames are length-prefixed MessagePack.
 - Pairing uses persistent device identities and pinned peer fingerprints.
 - Portable by default: configs and state live beside the running executable.
-- Linux input tries the optional `libei-1.0` backend first and then Hyprland's
-  virtual input protocols. `backend = "auto"` exits if neither real input path
-  can initialize, instead of accepting events that cannot affect the desktop.
+- Linux input uses a kernel `uinput` device on Niri so compositor shortcuts work,
+  otherwise trying the optional `libei-1.0` backend before Hyprland's virtual
+  input protocols. `backend = "auto"` exits if no real input path initializes.
 
 ## Build
 
@@ -83,10 +83,11 @@ max_image_bytes = 4194304
 Multiple copied files, arbitrary files, and file paths themselves are
 intentionally not transferred.
 
-With `input.backend = "auto"`, `--test-input` uses the first real input backend
-that initializes. On this Hyprland setup that is normally the Wayland virtual
-input backend. Set `input.backend = "log"` explicitly when testing only the
-encrypted protocol without injecting local input.
+With `input.backend = "auto"`, `--test-input` uses `uinput` in a Niri session so
+synthetic keys pass through Niri's normal compositor-shortcut path. On Hyprland
+this is normally the Wayland virtual input backend. Set the backend to `uinput`
+to require `/dev/uinput`, or to `log` when testing only the encrypted protocol
+without injecting local input.
 
 ## Windows controller
 

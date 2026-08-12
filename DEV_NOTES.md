@@ -18,6 +18,13 @@ extra/libei 1.6.0-1
 
 Current behavior:
 
+- In a Niri session, `input.backend = "auto"` first uses `/dev/uinput`. Niri's
+  `zwp_virtual_keyboard_v1` implementation forwards events directly to the
+  focused client, bypassing compositor shortcuts; the kernel input path lets
+  remote `Super` combinations use Niri's normal shortcut processing.
+- `input.backend = "uinput"` requires the kernel device explicitly. The session
+  user needs read/write access to `/dev/uinput`, normally granted by a udev
+  `uaccess` rule.
 - `input.backend = "auto"` detects `libei-1.0`.
 - The libei sender path is wired through `liboeffis-1.0`, but this laptop's
   current Hyprland portal does not expose `org.freedesktop.portal.RemoteDesktop`
