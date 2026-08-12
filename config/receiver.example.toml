@@ -4,6 +4,7 @@ listen = "0.0.0.0:42420"
 monitor = "eDP-1"
 
 [input]
+# auto selects uinput on Niri so compositor shortcuts receive remote keys.
 backend = "auto"
 
 [clipboard]

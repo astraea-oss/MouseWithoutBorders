@@ -19,6 +19,8 @@ use tokio::{
 };
 
 #[cfg(target_os = "linux")]
+mod uinput;
+#[cfg(target_os = "linux")]
 mod wayland_virtual_input;
 
 pub const LIBEI_PKG_CONFIG: &str = "libei-1.0";
@@ -44,6 +46,12 @@ pub enum LinuxInputError {
     HyprlandVirtualInputUnsupportedPlatform,
     #[error("Hyprland virtual input backend lock was poisoned")]
     HyprlandVirtualInputLockPoisoned,
+    #[error("failed to initialize uinput backend: {0}")]
+    UinputInit(String),
+    #[error("uinput backend lock was poisoned")]
+    UinputLockPoisoned,
+    #[error("evdev key code {0} is outside the uinput device's supported range")]
+    UinputUnsupportedKey(u16),
     #[error("command `{program}` failed: {message}")]
     CommandFailed { program: String, message: String },
     #[error("io error: {0}")]
@@ -56,6 +64,8 @@ pub enum LinuxInputError {
 
 pub type Result<T> = std::result::Result<T, LinuxInputError>;
 
+#[cfg(target_os = "linux")]
+pub use uinput::UinputBackend;
 #[cfg(target_os = "linux")]
 pub use wayland_virtual_input::HyprlandVirtualInputBackend;
 
@@ -75,6 +85,29 @@ impl HyprlandVirtualInputBackend {
 
     pub async fn all_keys_up(&self) -> Result<()> {
         Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub struct UinputBackend;
+
+#[cfg(not(target_os = "linux"))]
+impl UinputBackend {
+    pub fn connect() -> Result<Self> {
+        Err(LinuxInputError::UinputInit(
+            "uinput is unavailable on this platform".to_string(),
+        ))
+    }
+
+    pub async fn inject(&self, _event: InputEvent) -> Result<()> {
+        Err(LinuxInputError::UinputInit(
+            "uinput is unavailable on this platform".to_string(),
+        ))
+    }
+
+    pub async fn all_keys_up(&self) -> Result<()> {
+        self.inject(InputEvent::AllKeysUp).await
     }
 }
 

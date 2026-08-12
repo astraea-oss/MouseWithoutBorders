@@ -28,8 +28,9 @@ use edge_crypto::{
 };
 use edge_linux_input::{
     ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
-    hyprland_cursor_position, hyprland_screen_info, read_clipboard_item, read_clipboard_text,
-    spawn_clipboard_change_watcher, write_clipboard_image, write_clipboard_text,
+    UinputBackend, hyprland_cursor_position, hyprland_screen_info, read_clipboard_item,
+    read_clipboard_text, spawn_clipboard_change_watcher, write_clipboard_image,
+    write_clipboard_text,
 };
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, Capability,
@@ -1921,6 +1922,7 @@ fn default_config_path() -> PathBuf {
 #[derive(Debug, Clone)]
 enum ReceiverBackend {
     Libei(LibeiBackend),
+    Uinput(UinputBackend),
     Hyprland(HyprlandVirtualInputBackend),
     LogOnly,
 }
@@ -1929,6 +1931,7 @@ impl ReceiverBackend {
     fn label(&self) -> &'static str {
         match self {
             Self::Libei(_) => "libei",
+            Self::Uinput(_) => "uinput",
             Self::Hyprland(_) => "hyprland",
             Self::LogOnly => "log",
         }
@@ -1940,6 +1943,21 @@ impl ReceiverBackend {
 
         match requested.as_str() {
             "auto" => {
+                if is_niri_session() {
+                    match UinputBackend::connect() {
+                        Ok(backend) => {
+                            tracing::info!("using uinput input backend for Niri session");
+                            return Ok(Self::Uinput(backend));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                "failed to initialize Niri-compatible uinput backend; trying other input backends"
+                            );
+                        }
+                    }
+                }
+
                 if libei.is_available() {
                     match LibeiBackend::connect() {
                         Ok(backend) => {
@@ -1985,6 +2003,13 @@ impl ReceiverBackend {
                 tracing::info!("using Hyprland virtual input backend");
                 Ok(Self::Hyprland(backend))
             }
+            "uinput" => {
+                let backend = UinputBackend::connect().context(
+                    "input.backend is \"uinput\", but /dev/uinput initialization failed",
+                )?;
+                tracing::info!("using Linux uinput backend");
+                Ok(Self::Uinput(backend))
+            }
             "libei" if libei.is_available() => {
                 let backend = LibeiBackend::connect()
                     .context("input.backend is \"libei\", but libei initialization failed")?;
@@ -2005,7 +2030,7 @@ impl ReceiverBackend {
             }
             other => {
                 anyhow::bail!(
-                    "unsupported input.backend \"{other}\"; expected auto, hyprland, libei, or log"
+                    "unsupported input.backend \"{other}\"; expected auto, uinput, hyprland, libei, or log"
                 )
             }
         }
@@ -2014,6 +2039,7 @@ impl ReceiverBackend {
     async fn inject(&self, event: InputEvent) -> Result<()> {
         match self {
             Self::Libei(backend) => backend.inject(event).await.map_err(Into::into),
+            Self::Uinput(backend) => backend.inject(event).await.map_err(Into::into),
             Self::Hyprland(backend) => backend.inject(event).await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!(?event, "received input event");
@@ -2025,6 +2051,7 @@ impl ReceiverBackend {
     async fn all_keys_up(&self) -> Result<()> {
         match self {
             Self::Libei(backend) => backend.all_keys_up().await.map_err(Into::into),
+            Self::Uinput(backend) => backend.all_keys_up().await.map_err(Into::into),
             Self::Hyprland(backend) => backend.all_keys_up().await.map_err(Into::into),
             Self::LogOnly => {
                 tracing::info!("received all-keys-up");
@@ -2034,9 +2061,32 @@ impl ReceiverBackend {
     }
 }
 
+fn is_niri_session() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|value| value.into_string().ok())
+        .any(|value| desktop_names_include_niri(&value))
+        || std::env::var_os("NIRI_SOCKET").is_some()
+}
+
+fn desktop_names_include_niri(value: &str) -> bool {
+    value
+        .split([':', ';'])
+        .any(|desktop| desktop.eq_ignore_ascii_case("niri"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_niri_in_desktop_name_lists() {
+        assert!(desktop_names_include_niri("niri"));
+        assert!(desktop_names_include_niri("NIRI"));
+        assert!(desktop_names_include_niri("niri:GNOME"));
+        assert!(!desktop_names_include_niri("Hyprland"));
+    }
 
     #[test]
     fn controller_hello_must_match_noise_identity() {
