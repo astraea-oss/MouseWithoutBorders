@@ -416,6 +416,34 @@ listen = "0.0.0.0:42420"
     }
 
     #[test]
+    fn phase_zero_v1_controller_config_fixture_loads() {
+        let config: AppConfig =
+            toml::from_str(include_str!("../fixtures/controller-v1.toml")).unwrap();
+        let peer = config.peer.laptop.as_ref().unwrap();
+
+        assert_eq!(config.role, Role::Controller);
+        assert_eq!(config.release_hotkey.as_deref(), Some("Ctrl+Alt+Pause"));
+        assert_eq!(peer.host, "192.168.0.11");
+        assert_eq!(peer.position, PeerPosition::Left);
+        assert!(config.clipboard.enabled);
+        assert!(config.clipboard.images_enabled);
+        assert!(config.audio.enabled);
+    }
+
+    #[test]
+    fn phase_zero_v1_receiver_config_fixture_loads() {
+        let config: AppConfig =
+            toml::from_str(include_str!("../fixtures/receiver-v1.toml")).unwrap();
+
+        assert_eq!(config.role, Role::Receiver);
+        assert_eq!(config.listen.as_deref(), Some("0.0.0.0:42420"));
+        assert_eq!(config.monitor.as_deref(), Some("eDP-1"));
+        assert!(config.clipboard.enabled);
+        assert!(config.clipboard.images_enabled);
+        assert!(!config.audio.enabled);
+    }
+
+    #[test]
     fn update_listen_port_preserves_host() {
         assert_eq!(
             update_listen_port(Some("127.0.0.1:42420"), 42421),

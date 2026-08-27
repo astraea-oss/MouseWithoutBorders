@@ -370,6 +370,23 @@ mod tests {
         capabilities: Vec<Capability>,
     }
 
+    #[derive(Debug, Serialize)]
+    struct ProspectiveV2Hello {
+        protocol_version: u16,
+        device_name: String,
+        role: Role,
+        public_key_fingerprint: String,
+        capabilities: Vec<Capability>,
+        extensions: Vec<String>,
+        node_capabilities: Vec<ProspectiveV2Capability>,
+    }
+
+    #[derive(Debug, Serialize)]
+    enum ProspectiveV2Capability {
+        InputCaptureV1,
+        InputInjectV1,
+    }
+
     #[test]
     fn hello_extensions_are_backward_compatible() {
         let hello = Hello {
@@ -390,5 +407,75 @@ mod tests {
         let encoded_legacy = rmp_serde::to_vec_named(&legacy).unwrap();
         let decoded: Hello = rmp_serde::from_slice(&encoded_legacy).unwrap();
         assert!(decoded.extensions.is_empty());
+    }
+
+    #[test]
+    fn prospective_v2_hello_reaches_version_check_in_v1_decoder() {
+        let encoded = rmp_serde::to_vec_named(&ProspectiveV2Hello {
+            protocol_version: 2,
+            device_name: "future-peer".to_string(),
+            role: Role::Controller,
+            public_key_fingerprint: "future-fingerprint".to_string(),
+            // A v2 hello deliberately keeps this v1-known enum free of new
+            // variants so an old peer can diagnose the version mismatch.
+            capabilities: Vec::new(),
+            extensions: Vec::new(),
+            node_capabilities: vec![
+                ProspectiveV2Capability::InputCaptureV1,
+                ProspectiveV2Capability::InputInjectV1,
+            ],
+        })
+        .unwrap();
+
+        let legacy: LegacyHello = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(legacy.protocol_version, 2);
+        assert!(legacy.capabilities.is_empty());
+    }
+
+    fn decode_hex_fixture(source: &str) -> Vec<u8> {
+        let compact = source.split_whitespace().collect::<String>();
+        assert_eq!(compact.len() % 2, 0, "hex fixture must contain byte pairs");
+        compact
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(text, 16).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn protocol_v1_wire_fixtures_remain_stable() {
+        let fixtures = [
+            (
+                Frame::Hello(Hello {
+                    protocol_version: 1,
+                    device_name: "fixture-peer".to_string(),
+                    role: Role::Controller,
+                    public_key_fingerprint: "fixture-fingerprint".to_string(),
+                    capabilities: vec![Capability::AudioV1],
+                    extensions: vec![INPUT_TOGGLE_EXTENSION.to_string()],
+                }),
+                include_str!("../fixtures/v1-hello.hex"),
+            ),
+            (
+                Frame::Control(ControlEvent::EnterRemote {
+                    edge: Edge::Left,
+                    normalized_y: 0.25,
+                }),
+                include_str!("../fixtures/v1-enter-remote.hex"),
+            ),
+            (
+                Frame::Control(ControlEvent::SetInputForwarding { enabled: false }),
+                include_str!("../fixtures/v1-input-forwarding.hex"),
+            ),
+        ];
+
+        for (expected, fixture) in fixtures {
+            let fixture = decode_hex_fixture(fixture);
+            assert_eq!(decode_frame(&fixture).unwrap(), expected);
+            assert_eq!(encode_frame(&expected).unwrap(), fixture);
+        }
     }
 }
