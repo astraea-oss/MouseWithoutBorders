@@ -630,7 +630,10 @@ mod capture {
         CaptureConfig, CaptureStatsSnapshot, CapturedInput, ControlEvent, InputEvent, Result,
         WindowsInputError, map_key,
     };
-    use edge_geometry::{Point, Size, apply_remote_motion, clamp};
+    use edge_geometry::{
+        Point, Rect, Size, apply_remote_motion, clamp, edge_anchor, local_restore_point,
+        normalized_perpendicular, point_is_at_edge, remote_entry_point, remote_return_edge_reached,
+    };
     use edge_protocol::{MouseButton, ReleaseReason};
 
     const SM_XVIRTUALSCREEN: i32 = 76;
@@ -1575,12 +1578,14 @@ mod capture {
 
     impl CaptureState {
         fn at_activation_edge(&self, point: POINT) -> bool {
-            match self.config.edge {
-                Edge::Left => point.x <= self.local_bounds.left,
-                Edge::Right => point.x >= self.local_bounds.right(),
-                Edge::Top => point.y <= self.local_bounds.top,
-                Edge::Bottom => point.y >= self.local_bounds.bottom(),
-            }
+            point_is_at_edge(
+                self.config.edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                },
+                self.local_bounds.rect(),
+            )
         }
 
         fn game_guard_blocks_capture(&mut self) -> bool {
@@ -1832,28 +1837,12 @@ mod capture {
         }
 
         fn remote_start(&self, point: POINT) -> Point {
-            let normalized = f64::from(self.normalized_perpendicular(point));
-            let remote = self.config.remote_size;
-            let x_padding = remote_entry_padding(remote.width);
-            let y_padding = remote_entry_padding(remote.height);
-            match self.config.edge {
-                Edge::Left => Point {
-                    x: f64::from(remote.width.saturating_sub(1)) - x_padding,
-                    y: normalized * f64::from(remote.height.saturating_sub(1)),
-                },
-                Edge::Right => Point {
-                    x: x_padding,
-                    y: normalized * f64::from(remote.height.saturating_sub(1)),
-                },
-                Edge::Top => Point {
-                    x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: f64::from(remote.height.saturating_sub(1)) - y_padding,
-                },
-                Edge::Bottom => Point {
-                    x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: y_padding,
-                },
-            }
+            remote_entry_point(
+                self.config.edge,
+                self.normalized_perpendicular(point),
+                self.config.remote_size,
+                REMOTE_ENTRY_PADDING,
+            )
         }
 
         fn local_restore(&self) -> POINT {
@@ -1862,18 +1851,28 @@ mod capture {
         }
 
         fn normalized_perpendicular(&self, point: POINT) -> f32 {
-            match self.config.edge {
-                Edge::Left | Edge::Right => self.local_bounds.normalized_y(f64::from(point.y)),
-                Edge::Top | Edge::Bottom => self.local_bounds.normalized_x(f64::from(point.x)),
-            }
+            normalized_perpendicular(
+                self.config.edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                },
+                self.local_bounds.rect(),
+            )
         }
 
         fn remote_normalized_perpendicular(&self) -> f32 {
             let remote = self.config.remote_size;
-            match self.config.edge {
-                Edge::Left | Edge::Right => normalized_axis(self.remote_cursor.y, remote.height),
-                Edge::Top | Edge::Bottom => normalized_axis(self.remote_cursor.x, remote.width),
-            }
+            normalized_perpendicular(
+                self.config.edge,
+                self.remote_cursor,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: remote.width,
+                    height: remote.height,
+                },
+            )
         }
 
         fn send_input(&self, event: InputEvent) {
@@ -1894,16 +1893,7 @@ mod capture {
     }
 
     fn remote_cursor_at_return_edge(edge: Edge, cursor: Point, remote: Size) -> bool {
-        match edge {
-            Edge::Left => {
-                cursor.x >= f64::from(remote.width.saturating_sub(1)) - REMOTE_RETURN_MARGIN
-            }
-            Edge::Right => cursor.x <= REMOTE_RETURN_MARGIN,
-            Edge::Top => {
-                cursor.y >= f64::from(remote.height.saturating_sub(1)) - REMOTE_RETURN_MARGIN
-            }
-            Edge::Bottom => cursor.y <= REMOTE_RETURN_MARGIN,
-        }
+        remote_return_edge_reached(edge, cursor, remote, REMOTE_RETURN_MARGIN)
     }
 
     struct CaptureStats {
@@ -2190,80 +2180,38 @@ mod capture {
             }
         }
 
+        fn rect(&self) -> Rect {
+            Rect {
+                x: f64::from(self.left),
+                y: f64::from(self.top),
+                width: self.width.max(1) as u32,
+                height: self.height.max(1) as u32,
+            }
+        }
+
         fn anchor_for(&self, edge: Edge, point: POINT) -> POINT {
-            match edge {
-                Edge::Left => POINT {
-                    x: self.left + 2,
-                    y: point.y.clamp(self.top, self.bottom()),
+            let anchor = edge_anchor(
+                edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
                 },
-                Edge::Right => POINT {
-                    x: self.right() - 2,
-                    y: point.y.clamp(self.top, self.bottom()),
-                },
-                Edge::Top => POINT {
-                    x: point.x.clamp(self.left, self.right()),
-                    y: self.top + 2,
-                },
-                Edge::Bottom => POINT {
-                    x: point.x.clamp(self.left, self.right()),
-                    y: self.bottom() - 2,
-                },
+                self.rect(),
+                2.0,
+            );
+            POINT {
+                x: anchor.x.round() as i32,
+                y: anchor.y.round() as i32,
             }
         }
 
         fn restore_for(&self, edge: Edge, normalized: f32) -> POINT {
-            match edge {
-                Edge::Left => POINT {
-                    x: self.left + 3,
-                    y: self.y_at(normalized),
-                },
-                Edge::Right => POINT {
-                    x: self.right() - 3,
-                    y: self.y_at(normalized),
-                },
-                Edge::Top => POINT {
-                    x: self.x_at(normalized),
-                    y: self.top + 3,
-                },
-                Edge::Bottom => POINT {
-                    x: self.x_at(normalized),
-                    y: self.bottom() - 3,
-                },
+            let restore = local_restore_point(edge, normalized, self.rect(), 3.0);
+            POINT {
+                x: restore.x.round() as i32,
+                y: restore.y.round() as i32,
             }
         }
-
-        fn normalized_x(&self, x: f64) -> f32 {
-            normalized_axis(x - f64::from(self.left), self.width.max(1) as u32)
-        }
-
-        fn normalized_y(&self, y: f64) -> f32 {
-            normalized_axis(y - f64::from(self.top), self.height.max(1) as u32)
-        }
-
-        fn x_at(&self, normalized: f32) -> i32 {
-            let x = f64::from(self.left)
-                + f64::from(self.width.saturating_sub(1)) * f64::from(normalized);
-            clamp(x, f64::from(self.left), f64::from(self.right())).round() as i32
-        }
-
-        fn y_at(&self, normalized: f32) -> i32 {
-            let y = f64::from(self.top)
-                + f64::from(self.height.saturating_sub(1)) * f64::from(normalized);
-            clamp(y, f64::from(self.top), f64::from(self.bottom())).round() as i32
-        }
-    }
-
-    fn normalized_axis(pos: f64, extent: u32) -> f32 {
-        if extent <= 1 {
-            return 0.0;
-        }
-        let max = f64::from(extent - 1);
-        (clamp(pos, 0.0, max) / max) as f32
-    }
-
-    fn remote_entry_padding(extent: u32) -> f64 {
-        let max = f64::from(extent.saturating_sub(1));
-        clamp(REMOTE_ENTRY_PADDING, 1.0, max)
     }
 
     fn foreground_is_fullscreen() -> bool {

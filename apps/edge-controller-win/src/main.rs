@@ -15,7 +15,6 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
-use edge_clipboard::ImageTransferSchedule;
 #[cfg(windows)]
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
@@ -26,25 +25,31 @@ use edge_common::PeerPosition;
 use edge_common::{
     AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
 };
-use edge_crypto::{
-    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session, pairing_code,
-};
+use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session, pairing_code};
 #[cfg(windows)]
 use edge_geometry::Size;
 #[cfg(windows)]
 use edge_protocol::Edge;
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Hello,
+    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello,
     INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PAIRING_CONFIRMATION_EXTENSION,
     PROTOCOL_VERSION, PairingEvent, ScreenInfo, decode_frame, encode_frame,
 };
+use edge_runtime::{
+    LivenessConfig, LivenessEvent, LivenessTracker, SecureFrameReader, SecureFrameSession,
+    SecureFrameWriter,
+};
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput};
 use tokio::{
+    io::{ReadHalf, WriteHalf},
     net::{TcpStream, UdpSocket},
     sync::mpsc,
     time,
 };
+
+type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
+type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
 
 #[cfg(windows)]
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
@@ -58,7 +63,6 @@ const FALLBACK_REMOTE_SIZE: Size = Size {
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIPBOARD_PASTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
-const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]
@@ -1031,12 +1035,16 @@ async fn run_connected_inner(
     let mut config_refresh = time::interval(Duration::from_millis(500));
     let mut audio_watch = time::interval(Duration::from_millis(500));
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
-    let (reader, writer) = connection.session.split();
-    let mut writer = ScheduledNoiseWriter::new(writer);
+    let (reader, mut writer) = SecureFrameSession::new(connection.session).split();
     let mut receiver_rx = spawn_receiver_reader(reader);
     let mut tray_command_poll = time::interval(Duration::from_millis(200));
-    let mut connection_watchdog = time::interval(Duration::from_secs(1));
-    let mut last_receiver_activity = Instant::now();
+    let liveness_config = LivenessConfig::default();
+    let mut heartbeat = time::interval(liveness_config.heartbeat_interval(true));
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut heartbeat_sequence = 0_u64;
+    let mut connection_watchdog = time::interval(Duration::from_millis(250));
+    connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut receiver_liveness = LivenessTracker::new(liveness_config, tokio::time::Instant::now());
     let peer_ip = connection.peer_addr.ip();
     let mut _audio_receiver: Option<edge_windows_audio::WindowsAudioReceiver> = None;
     let mut audio_restart_attempted = false;
@@ -1178,12 +1186,28 @@ async fn run_connected_inner(
                     )
                     .await?;
                 }
-                if last_receiver_activity.elapsed() > RECEIVER_STALL_TIMEOUT {
-                    anyhow::bail!(
-                        "receiver stopped responding for {:?}; reconnecting",
-                        last_receiver_activity.elapsed()
-                    );
+                match receiver_liveness.poll(tokio::time::Instant::now()) {
+                    Some(LivenessEvent::SoftInputTimeout) => {
+                        edge_windows_input::force_release_to_local();
+                        tracing::warn!("receiver was silent for one second; released local capture while keeping the session available");
+                        append_portable_log(log_path, "receiver liveness soft timeout; released local capture");
+                    }
+                    Some(LivenessEvent::HardSessionTimeout) => {
+                        anyhow::bail!(
+                            "receiver stopped responding for {:?}; reconnecting",
+                            receiver_liveness.elapsed(tokio::time::Instant::now())
+                        );
+                    }
+                    None => {}
                 }
+            },
+            _ = heartbeat.tick() => {
+                heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                )
+                .await?;
             },
             _ = clipboard_poll.tick() => {
                 match live_clipboard.local_change_offer(&runtime_config).await {
@@ -1278,7 +1302,7 @@ async fn run_connected_inner(
             },
             frame = receiver_rx.recv() => {
                 let frame = frame.context("receiver frame reader ended")??;
-                last_receiver_activity = Instant::now();
+                receiver_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
                     Frame::Clipboard(event) => {
@@ -1525,7 +1549,7 @@ impl ControllerInputStats {
 }
 
 fn spawn_receiver_reader(
-    mut reader: NoiseReader,
+    mut reader: TcpFrameReader,
 ) -> tokio::sync::mpsc::UnboundedReceiver<Result<Frame>> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -2243,32 +2267,8 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
-struct ScheduledNoiseWriter {
-    inner: NoiseWriter,
-    image_schedule: ImageTransferSchedule,
-}
-
-impl ScheduledNoiseWriter {
-    fn new(inner: NoiseWriter) -> Self {
-        Self {
-            inner,
-            image_schedule: ImageTransferSchedule::default(),
-        }
-    }
-
-    fn bulk_is_due(&self) -> bool {
-        self.image_schedule.image_chunk_is_due()
-    }
-
-    fn record_sent(&mut self, frame: &Frame) {
-        self.image_schedule.record_sent_frame(frame);
-    }
-}
-
 async fn write_secure_frame_writer(writer: &mut ScheduledNoiseWriter, frame: &Frame) -> Result<()> {
-    let payload = encode_frame(frame)?;
-    writer.inner.write_packet(&payload).await?;
-    writer.record_sent(frame);
+    writer.write(frame).await?;
     Ok(())
 }
 
@@ -2277,9 +2277,8 @@ async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Fram
     Ok(decode_frame(&payload)?)
 }
 
-async fn read_secure_frame_reader(reader: &mut NoiseReader) -> Result<Frame> {
-    let payload = reader.read_packet().await?;
-    Ok(decode_frame(&payload)?)
+async fn read_secure_frame_reader(reader: &mut TcpFrameReader) -> Result<Frame> {
+    Ok(reader.read().await?)
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {

@@ -882,6 +882,7 @@ dependencies = [
  "edge-geometry",
  "edge-keymap",
  "edge-protocol",
+ "edge-runtime",
  "edge-ui",
  "edge-windows-audio",
  "edge-windows-input",
@@ -976,12 +977,26 @@ dependencies = [
  "edge-linux-audio",
  "edge-linux-input",
  "edge-protocol",
+ "edge-runtime",
  "edge-ui",
  "ksni",
  "socket2",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "edge-runtime"
+version = "0.1.0"
+dependencies = [
+ "edge-clipboard",
+ "edge-common",
+ "edge-crypto",
+ "edge-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

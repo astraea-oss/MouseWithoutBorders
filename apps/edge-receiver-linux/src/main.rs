@@ -16,15 +16,14 @@ use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
-    ImageTransferSchedule, IncomingImageTransfer, OutgoingImageTransfer,
+    IncomingImageTransfer, OutgoingImageTransfer,
 };
 use edge_common::{
     AppConfig, AudioLocalPlayback, Role, default_state_dir, detect_primary_local_ip, init_tracing,
     portable_config_path,
 };
 use edge_crypto::{
-    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, PinStatus, PinStore, accept_noise_session,
-    pairing_code,
+    IdentityKey, NoiseSession, PinStatus, PinStore, accept_noise_session, pairing_code,
 };
 use edge_linux_input::{
     ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
@@ -39,17 +38,25 @@ use edge_protocol::{
     PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError, ScreenInfo, decode_frame,
     encode_frame,
 };
+use edge_runtime::{
+    InputEpochGate, LivenessConfig, LivenessEvent, LivenessTracker, SecureFrameReader,
+    SecureFrameSession, SecureFrameWriter,
+};
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput, run_settings_window};
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
+    io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
     task::JoinHandle,
     time,
 };
+
+type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
+type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
 
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
@@ -880,11 +887,17 @@ async fn handle_controller(
     controller_supports_images: bool,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
-    let mut heartbeat = time::interval(Duration::from_millis(250));
+    let liveness_config = LivenessConfig::default();
+    let mut heartbeat = time::interval(liveness_config.heartbeat_interval(true));
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut connection_watchdog = time::interval(Duration::from_millis(250));
+    connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut controller_liveness =
+        LivenessTracker::new(liveness_config, tokio::time::Instant::now());
+    let mut input_epoch = InputEpochGate::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut stats = ReceiverInputStats::default();
-    let (reader, writer) = session.split();
-    let mut writer = ScheduledNoiseWriter::new(writer);
+    let (reader, mut writer) = SecureFrameSession::new(session).split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info);
     let mut clipboard_sync =
@@ -922,6 +935,31 @@ async fn handle_controller(
 
         tokio::select! {
             biased;
+            _ = connection_watchdog.tick() => {
+                match controller_liveness.poll(tokio::time::Instant::now()) {
+                    Some(LivenessEvent::SoftInputTimeout) => {
+                        input_epoch.suspend();
+                        backend.all_keys_up().await.ok();
+                        tracing::warn!("controller was silent for one second; released injected input and suspended its input epoch");
+                        append_portable_log(log_path, "controller liveness soft timeout; released injected input and suspended stale frames");
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Control(ControlEvent::ReleaseToLocal {
+                                reason: ReleaseReason::HeartbeatTimeout,
+                            }),
+                        )
+                        .await
+                        .ok();
+                    }
+                    Some(LivenessEvent::HardSessionTimeout) => {
+                        anyhow::bail!(
+                            "controller stopped responding for {:?}; closing session",
+                            controller_liveness.elapsed(tokio::time::Instant::now())
+                        );
+                    }
+                    None => {}
+                }
+            }
             _ = heartbeat.tick() => {
                 if let Some(transfer_id) = clipboard_sync.incoming.expire_transfer_id() {
                     tracing::warn!(transfer_id, "expired incomplete controller clipboard image");
@@ -1134,6 +1172,7 @@ async fn handle_controller(
             }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
+                controller_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 writer.record_received(&frame);
                 match frame {
                     Frame::Input(InputEvent::AllKeysUp) => {
@@ -1146,6 +1185,10 @@ async fn handle_controller(
                     Frame::Input(event) => {
                         if !input_forwarding_enabled {
                             tracing::trace!(?event, "ignored input while forwarding is disabled");
+                            continue;
+                        }
+                        if !input_epoch.accepts_input() {
+                            tracing::trace!(?event, "ignored stale input from a suspended input epoch");
                             continue;
                         }
                         stats.record_input(&event);
@@ -1207,6 +1250,7 @@ async fn handle_controller(
                         }
                     }
                     Frame::Control(control) => {
+                        input_epoch.observe_control(&control);
                         stats.control = stats.control.saturating_add(1);
                         return_watcher.record_control(&control);
                         tracing::info!(?control, "control event");
@@ -1829,7 +1873,7 @@ fn real_cursor_at_return_edge(cursor: HyprCursorPosition, output: &OutputInfo, e
     }
 }
 
-fn spawn_controller_reader(mut reader: NoiseReader) -> mpsc::UnboundedReceiver<Result<Frame>> {
+fn spawn_controller_reader(mut reader: TcpFrameReader) -> mpsc::UnboundedReceiver<Result<Frame>> {
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
@@ -1872,36 +1916,8 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
-struct ScheduledNoiseWriter {
-    inner: NoiseWriter,
-    image_schedule: ImageTransferSchedule,
-}
-
-impl ScheduledNoiseWriter {
-    fn new(inner: NoiseWriter) -> Self {
-        Self {
-            inner,
-            image_schedule: ImageTransferSchedule::default(),
-        }
-    }
-
-    fn bulk_is_due(&self) -> bool {
-        self.image_schedule.image_chunk_is_due()
-    }
-
-    fn record_sent(&mut self, frame: &Frame) {
-        self.image_schedule.record_sent_frame(frame);
-    }
-
-    fn record_received(&mut self, frame: &Frame) {
-        self.image_schedule.record_received_frame(frame);
-    }
-}
-
 async fn write_secure_frame_writer(writer: &mut ScheduledNoiseWriter, frame: &Frame) -> Result<()> {
-    let payload = encode_frame(frame)?;
-    writer.inner.write_packet(&payload).await?;
-    writer.record_sent(frame);
+    writer.write(frame).await?;
     Ok(())
 }
 
@@ -1910,9 +1926,8 @@ async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Fram
     Ok(decode_frame(&payload)?)
 }
 
-async fn read_secure_frame_reader(reader: &mut NoiseReader) -> Result<Frame> {
-    let payload = reader.read_packet().await?;
-    Ok(decode_frame(&payload)?)
+async fn read_secure_frame_reader(reader: &mut TcpFrameReader) -> Result<Frame> {
+    Ok(reader.read().await?)
 }
 
 fn default_config_path() -> PathBuf {
