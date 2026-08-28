@@ -466,15 +466,15 @@ impl eframe::App for SettingsApp {
                 );
                 ui.end_row();
 
-                ui.label("Stream Linux audio");
+                ui.label("Audio streaming");
                 ui.checkbox(&mut self.audio_enabled, "Enabled on connection");
                 ui.end_row();
 
-                ui.label("Peer playback");
+                ui.label("Local playback");
                 ui.checkbox(&mut self.audio_play_local, "Keep playing locally");
                 ui.end_row();
 
-                ui.label("Windows output");
+                ui.label("Playback output");
                 let mut output = "Follow system default".to_string();
                 ui.add_enabled(false, egui::TextEdit::singleline(&mut output));
                 ui.end_row();

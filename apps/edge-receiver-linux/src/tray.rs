@@ -376,7 +376,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: if self.audio_available {
-                    "Toggle audio streaming".to_string()
+                    "Audio streaming".to_string()
                 } else {
                     "Audio unavailable for this direction".to_string()
                 },

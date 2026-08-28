@@ -71,6 +71,14 @@ pub enum WindowsControllerChoice {
     Peer,
 }
 
+#[derive(Debug, Clone)]
+pub struct WindowsTrayContext {
+    pub transport: String,
+    pub input_backend: String,
+    pub local_device_name: String,
+    pub peer_device_name: String,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureStatsSnapshot {
     pub active: bool,
@@ -151,14 +159,38 @@ pub fn install_hooks() -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn run_tray(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
-    tray::run(status, commands)
+pub fn run_tray(
+    status: &str,
+    commands: mpsc::Sender<WindowsTrayCommand>,
+    context: WindowsTrayContext,
+) -> Result<()> {
+    tray::run(status, commands, context)
 }
 
 #[cfg(not(windows))]
-pub fn run_tray(_status: &str, _commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
+pub fn run_tray(
+    _status: &str,
+    _commands: mpsc::Sender<WindowsTrayCommand>,
+    _context: WindowsTrayContext,
+) -> Result<()> {
     Err(WindowsInputError::UnsupportedPlatform)
 }
+
+#[cfg(windows)]
+pub fn record_tray_injected_input() {
+    tray::record_injected_input();
+}
+
+#[cfg(not(windows))]
+pub fn record_tray_injected_input() {}
+
+#[cfg(windows)]
+pub fn record_tray_clipboard_event() {
+    tray::record_clipboard_event();
+}
+
+#[cfg(not(windows))]
+pub fn record_tray_clipboard_event() {}
 
 #[cfg(windows)]
 pub fn update_tray_status(status: &str) -> Result<()> {
@@ -2464,7 +2496,7 @@ mod tray {
         ptr::null_mut,
         sync::{
             Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             mpsc,
         },
     };
@@ -2479,19 +2511,20 @@ mod tray {
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateIcon, CreatePopupMenu,
-                CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
-                DispatchMessageW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW,
-                MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG,
-                PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN,
-                TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-                WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-                WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
+                DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_DISABLED,
+                MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+                TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
+                WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
 
-    use crate::{Result, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand};
+    use crate::{
+        Result, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand, WindowsTrayContext,
+    };
 
     const TRAY_ID: u32 = 1;
     const WM_TRAY_ICON: u32 = WM_APP + 1;
@@ -2513,8 +2546,34 @@ mod tray {
     static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
     static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
     static TRAY_INPUT_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(true);
+    static TRAY_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_INJECTED_INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_CLIPBOARD_EVENTS: AtomicU64 = AtomicU64::new(0);
     static TRAY_ROLE: Mutex<TrayRole> = Mutex::new(TrayRole::new());
+    static TRAY_CONTEXT: Mutex<TrayContext> = Mutex::new(TrayContext::new());
 
+    #[derive(Clone)]
+    struct TrayContext {
+        transport: String,
+        input_backend: String,
+        local_device_name: String,
+        peer_device_name: String,
+        last_error: String,
+    }
+
+    impl TrayContext {
+        const fn new() -> Self {
+            Self {
+                transport: String::new(),
+                input_backend: String::new(),
+                local_device_name: String::new(),
+                peer_device_name: String::new(),
+                last_error: String::new(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct TrayRole {
         local_name: String,
         peer_name: String,
@@ -2535,8 +2594,13 @@ mod tray {
         }
     }
 
-    pub fn run(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
+    pub fn run(
+        status: &str,
+        commands: mpsc::Sender<WindowsTrayCommand>,
+        context: WindowsTrayContext,
+    ) -> Result<()> {
         unsafe {
+            set_tray_context(context);
             set_tray_status(status);
             set_tray_commands(commands);
 
@@ -2614,6 +2678,14 @@ mod tray {
     pub fn update_input_forwarding(enabled: bool) -> Result<()> {
         TRAY_INPUT_FORWARDING_ENABLED.store(enabled, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub fn record_injected_input() {
+        TRAY_INJECTED_INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_clipboard_event() {
+        TRAY_CLIPBOARD_EVENTS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn update_role(
@@ -2780,7 +2852,20 @@ mod tray {
         }
 
         let status = current_tray_status();
+        let status_text = wide_to_string(&status);
+        let status_label = to_wide(&format!("Status: {}", status_summary(&status_text)));
         let audio_status = current_audio_status();
+        let context = TRAY_CONTEXT.lock().expect("tray context poisoned").clone();
+        let transport = to_wide(&format!("Transport: {}", context.transport));
+        let input_backend = to_wide(&format!("Input backend: {}", context.input_backend));
+        let pairing = to_wide(&format!(
+            "Pairing: {}",
+            if status_text.starts_with("Pairing") {
+                "waiting for confirmation"
+            } else {
+                "not armed"
+            }
+        ));
         let settings = to_wide("Settings...");
         let pair = to_wide("Pair or replace peer...");
         let release = to_wide("Release control");
@@ -2789,32 +2874,75 @@ mod tray {
         } else {
             "Reconnect"
         });
-        let audio = to_wide("Stream Linux audio");
+        let audio = to_wide("Audio streaming");
         let input_forwarding = to_wide("Forward mouse and keyboard");
-        let quit = to_wide("Quit");
-        let role = TRAY_ROLE.lock().expect("tray role poisoned");
+        let quit = to_wide("Quit edge-kvm");
+        let role = TRAY_ROLE.lock().expect("tray role poisoned").clone();
+        let peer_name = if role.peer_name.is_empty() {
+            &context.peer_device_name
+        } else {
+            &role.peer_name
+        };
+        let peer = to_wide(&format!(
+            "Peer: {}",
+            if peer_name.is_empty() {
+                "none"
+            } else {
+                peer_name
+            }
+        ));
+        let connections = to_wide(&format!(
+            "Connections: {}",
+            TRAY_CONNECTIONS.load(Ordering::Relaxed)
+        ));
+        let input_events = to_wide(&format!(
+            "Input events: {}",
+            crate::capture_stats()
+                .input_events
+                .saturating_add(TRAY_INJECTED_INPUT_EVENTS.load(Ordering::Relaxed))
+        ));
+        let clipboard_events = to_wide(&format!(
+            "Clipboard events: {}",
+            TRAY_CLIPBOARD_EVENTS.load(Ordering::Relaxed)
+        ));
+        let last_error = to_wide(&format!(
+            "Last error: {}",
+            if context.last_error.is_empty() {
+                "None"
+            } else {
+                &context.last_error
+            }
+        ));
         let local_controller = to_wide(&format!(
             "{} controls {}",
             if role.local_name.is_empty() {
-                "This computer"
+                if context.local_device_name.is_empty() {
+                    "This computer"
+                } else {
+                    &context.local_device_name
+                }
             } else {
                 &role.local_name
             },
-            if role.peer_name.is_empty() {
+            if peer_name.is_empty() {
                 "Peer"
             } else {
-                &role.peer_name
+                peer_name
             }
         ));
         let peer_controller = to_wide(&format!(
             "{} controls {}",
-            if role.peer_name.is_empty() {
+            if peer_name.is_empty() {
                 "Peer"
             } else {
-                &role.peer_name
+                peer_name
             },
             if role.local_name.is_empty() {
-                "this computer"
+                if context.local_device_name.is_empty() {
+                    "this computer"
+                } else {
+                    &context.local_device_name
+                }
             } else {
                 &role.local_name
             }
@@ -2822,8 +2950,20 @@ mod tray {
         let role_enabled =
             role.available && !role.switching && TRAY_CONNECTED.load(Ordering::Relaxed);
         let role_disabled_flag = if role_enabled { 0 } else { MF_DISABLED };
-        let local_role_flags = MF_STRING | role_disabled_flag;
-        let peer_role_flags = MF_STRING | role_disabled_flag;
+        let local_role_flags = MF_STRING
+            | role_disabled_flag
+            | if role.local_is_controller {
+                MF_CHECKED
+            } else {
+                0
+            };
+        let peer_role_flags = MF_STRING
+            | role_disabled_flag
+            | if role.local_is_controller {
+                0
+            } else {
+                MF_CHECKED
+            };
         let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
             MF_STRING | MF_CHECKED
         } else {
@@ -2841,9 +2981,19 @@ mod tray {
         };
 
         unsafe {
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status_label.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, transport.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_backend.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, pairing.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, peer.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, connections.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_events.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, clipboard_events.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, last_error.as_ptr());
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(
                 menu,
                 local_role_flags,
@@ -2856,22 +3006,7 @@ mod tray {
                 ID_PEER_CONTROLLER,
                 peer_controller.as_ptr(),
             );
-            CheckMenuRadioItem(
-                menu,
-                ID_LOCAL_CONTROLLER as u32,
-                ID_PEER_CONTROLLER as u32,
-                if role.local_is_controller {
-                    ID_LOCAL_CONTROLLER as u32
-                } else {
-                    ID_PEER_CONTROLLER as u32
-                },
-                MF_BYCOMMAND,
-            );
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
-            AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(
                 menu,
                 input_forwarding_flags,
@@ -2879,6 +3014,8 @@ mod tray {
                 input_forwarding.as_ptr(),
             );
             AppendMenuW(menu, audio_flags, ID_AUDIO, audio.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
             let mut point = POINT::default();
@@ -2903,9 +3040,43 @@ mod tray {
     }
 
     fn set_tray_status(status: &str) {
-        TRAY_CONNECTED.store(status.starts_with("Connected"), Ordering::Relaxed);
+        let connected = status.starts_with("Connected");
+        let was_connected = TRAY_CONNECTED.swap(connected, Ordering::Relaxed);
+        if connected && !was_connected {
+            TRAY_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut context = TRAY_CONTEXT.lock().expect("tray context poisoned");
+        if connected
+            || status == "Connecting"
+            || status.starts_with("Pairing")
+            || status == "Disconnected by user"
+        {
+            context.last_error.clear();
+        } else if status == "Disconnected" {
+            context.last_error = "Connection lost".to_string();
+        } else if !matches!(status, "Starting" | "Listening") {
+            context.last_error = status.to_string();
+        }
+        drop(context);
         let mut tray_status = TRAY_STATUS.lock().expect("tray status poisoned");
         *tray_status = to_wide(status);
+    }
+
+    fn set_tray_context(context: WindowsTrayContext) {
+        let mut tray_context = TRAY_CONTEXT.lock().expect("tray context poisoned");
+        tray_context.transport = context.transport;
+        tray_context.input_backend = context.input_backend;
+        tray_context.local_device_name = context.local_device_name.clone();
+        tray_context.peer_device_name = context.peer_device_name.clone();
+        drop(tray_context);
+
+        let mut role = TRAY_ROLE.lock().expect("tray role poisoned");
+        if role.local_name.is_empty() {
+            role.local_name = context.local_device_name;
+        }
+        if role.peer_name.is_empty() {
+            role.peer_name = context.peer_device_name;
+        }
     }
 
     fn set_tray_commands(commands: mpsc::Sender<WindowsTrayCommand>) {
@@ -2937,6 +3108,28 @@ mod tray {
             to_wide("Audio: Off")
         } else {
             audio_status.clone()
+        }
+    }
+
+    fn wide_to_string(value: &[u16]) -> String {
+        let length = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        String::from_utf16_lossy(&value[..length])
+    }
+
+    fn status_summary(status: &str) -> &str {
+        if status.starts_with("Connected") {
+            "Connected"
+        } else if status.starts_with("Pairing") {
+            "Pairing"
+        } else if status.starts_with("Connecting") {
+            "Connecting"
+        } else if status.starts_with("Disconnected") {
+            "Disconnected"
+        } else {
+            status
         }
     }
 

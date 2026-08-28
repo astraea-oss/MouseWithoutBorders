@@ -200,8 +200,14 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             tracing::info!(%status, "starting tray loop");
             append_portable_log(&controller_log, format!("starting tray loop: {status}"));
             let tray_log = controller_log.clone();
+            let tray_context = edge_windows_input::WindowsTrayContext {
+                transport: format!("Connect: {}:{}", config.peer.host, config.peer.port),
+                input_backend: "Windows hooks / SendInput".to_string(),
+                local_device_name: config.device_name.clone(),
+                peer_device_name: config.peer.name.clone(),
+            };
             std::thread::spawn(move || {
-                if let Err(err) = edge_windows_input::run_tray(&status, win_tray_tx) {
+                if let Err(err) = edge_windows_input::run_tray(&status, win_tray_tx, tray_context) {
                     tracing::warn!(%err, "Windows tray exited with error");
                     append_portable_log(
                         &tray_log,
@@ -1664,6 +1670,7 @@ async fn run_connected_inner(
                         }
                         if input.event == InputEvent::AllKeysUp {
                             injector.all_keys_up()?;
+                            edge_windows_input::record_tray_injected_input();
                             input_epoch.suspend();
                             continue;
                         }
@@ -1672,6 +1679,7 @@ async fn run_connected_inner(
                         }
                         let is_motion = matches!(input.event, InputEvent::PointerMotion { .. });
                         injector.inject(input.event)?;
+                        edge_windows_input::record_tray_injected_input();
                         if is_motion
                             && let Some(control) = return_watcher.release_if_at_edge()?
                         {
@@ -1688,6 +1696,10 @@ async fn run_connected_inner(
                         if session_paused {
                             continue;
                         }
+                        let records_clipboard_event = matches!(
+                            &event,
+                            ClipboardEvent::TextOffer { .. } | ClipboardEvent::ImageStart { .. }
+                        );
                         if let Err(error) = live_clipboard
                             .handle_remote_event(
                                 event,
@@ -1699,6 +1711,8 @@ async fn run_connected_inner(
                         {
                             tracing::warn!(%error, "failed to synchronize receiver clipboard");
                             append_portable_log(log_path, format!("failed to synchronize receiver clipboard: {error}"));
+                        } else if records_clipboard_event {
+                            edge_windows_input::record_tray_clipboard_event();
                         }
                     }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
@@ -2221,6 +2235,14 @@ impl ControllerInputStats {
             }
             None if matches!(frame, Frame::Clipboard(_)) => {
                 self.clipboard = self.clipboard.saturating_add(1);
+                if matches!(
+                    frame,
+                    Frame::Clipboard(
+                        ClipboardEvent::TextOffer { .. } | ClipboardEvent::ImageStart { .. }
+                    )
+                ) {
+                    edge_windows_input::record_tray_clipboard_event();
+                }
             }
             None if matches!(frame, Frame::Control(_)) => {
                 self.control = self.control.saturating_add(1);

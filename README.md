@@ -205,7 +205,7 @@ To verify Windows playback without Linux, run:
 Linux system-audio streaming is enabled by default for new Windows node
 configs. Legacy Windows configs without an `[audio]` section are migrated on
 startup; an explicit existing preference is preserved. Use Settings or the
-checked `Stream Linux audio` tray action to change it while connected. The
+checked `Audio streaming` tray action to change it while connected. The
 initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
 1.54 Mbps.
 
