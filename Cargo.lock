@@ -992,6 +992,7 @@ dependencies = [
  "edge-clipboard",
  "edge-common",
  "edge-crypto",
+ "edge-geometry",
  "edge-linux-audio",
  "edge-linux-input",
  "edge-protocol",

@@ -1,11 +1,11 @@
 # edge-kvm
 
-Personal Windows-to-Hyprland software KVM prototype.
+Portable two-computer software KVM prototype for Windows and Linux.
 
-This workspace follows `PLAN.md` and is intentionally narrow:
+The current supported directions are intentionally narrow:
 
-- Windows controller owns the physical keyboard and mouse.
-- Linux receiver runs on the Hyprland laptop.
+- Windows controller to Linux receiver.
+- Linux controller to Linux receiver through the InputCapture portal.
 - Protocol frames are length-prefixed MessagePack.
 - Pairing uses persistent device identities and pinned peer fingerprints.
 - Portable by default: configs and state live beside the running executable.
@@ -19,7 +19,7 @@ This workspace follows `PLAN.md` and is intentionally narrow:
 cargo test --workspace
 ```
 
-## Linux receiver
+## Linux node
 
 For development:
 
@@ -43,6 +43,27 @@ On first run it creates:
 receiver.toml
 state/
 ```
+
+The default config listens as a receiver. For the Linux computer that should
+initiate the connection and control its peer, use:
+
+```toml
+preferred_role = "controller"
+transport = "connect"
+
+[peer]
+name = "Other Linux PC"
+host = "192.168.0.11"
+port = 42420
+
+[layout]
+listener_position = "left"
+```
+
+Keep `transport = "listen"` and `preferred_role = "receiver"` on the other
+Linux computer. Pair from both tray menus. Linux-to-Linux audio is shown as
+unavailable because Linux playback is not implemented; input and clipboard are
+independent of audio.
 
 Linux audio streaming uses the PipeWire-Pulse command-line tools `pactl` and
 `parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside

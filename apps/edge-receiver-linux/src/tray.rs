@@ -31,14 +31,14 @@ pub struct ReceiverTrayHandle {
 
 impl ReceiverTrayHandle {
     pub async fn spawn(
-        listen: String,
+        transport: String,
         backend: String,
         pairing_armed: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<TrayCommand>), ksni::Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let tray = ReceiverTray {
             state: TrayState::Starting,
-            listen,
+            transport,
             backend,
             pairing_armed,
             connected_peer: None,
@@ -46,6 +46,7 @@ impl ReceiverTrayHandle {
             input_events: 0,
             clipboard_events: 0,
             input_forwarding_enabled: true,
+            audio_available: true,
             last_error: None,
             command_tx,
         };
@@ -63,6 +64,16 @@ impl ReceiverTrayHandle {
     pub async fn listening(&self) {
         self.update(|tray| {
             tray.state = TrayState::Listening;
+            tray.connected_peer = None;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn connecting(&self) {
+        self.update(|tray| {
+            tray.state = TrayState::Starting;
             tray.connected_peer = None;
             tray.last_error = None;
         })
@@ -137,6 +148,11 @@ impl ReceiverTrayHandle {
             .await;
     }
 
+    pub async fn audio_available(&self, available: bool) {
+        self.update(move |tray| tray.audio_available = available)
+            .await;
+    }
+
     pub async fn error(&self, error: String) {
         self.update(|tray| {
             tray.state = TrayState::Error;
@@ -179,7 +195,7 @@ impl TrayState {
 #[derive(Debug)]
 pub struct ReceiverTray {
     state: TrayState,
-    listen: String,
+    transport: String,
     backend: String,
     pairing_armed: bool,
     connected_peer: Option<String>,
@@ -187,13 +203,14 @@ pub struct ReceiverTray {
     input_events: u64,
     clipboard_events: u64,
     input_forwarding_enabled: bool,
+    audio_available: bool,
     last_error: Option<String>,
     command_tx: mpsc::UnboundedSender<TrayCommand>,
 }
 
 impl ksni::Tray for ReceiverTray {
     fn id(&self) -> String {
-        "edge-kvm-receiver".to_string()
+        "edge-kvm-node".to_string()
     }
 
     fn category(&self) -> ksni::Category {
@@ -201,7 +218,7 @@ impl ksni::Tray for ReceiverTray {
     }
 
     fn title(&self) -> String {
-        format!("edge-kvm receiver: {}", self.state.label())
+        format!("edge-kvm: {}", self.state.label())
     }
 
     fn status(&self) -> ksni::Status {
@@ -226,7 +243,7 @@ impl ksni::Tray for ReceiverTray {
         ksni::ToolTip {
             icon_name: self.icon_name(),
             icon_pixmap: self.icon_pixmap(),
-            title: "edge-kvm receiver".to_string(),
+            title: "edge-kvm".to_string(),
             description: self.description(),
         }
     }
@@ -240,7 +257,7 @@ impl ksni::Tray for ReceiverTray {
 
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             disabled_item(format!("Status: {}", self.state.label())),
-            disabled_item(format!("Listen: {}", self.listen)),
+            disabled_item(format!("Transport: {}", self.transport)),
             disabled_item(format!("Input backend: {}", self.backend)),
             disabled_item(format!(
                 "Pairing: {}",
@@ -269,7 +286,7 @@ impl ksni::Tray for ReceiverTray {
                 label: if self.pairing_armed {
                     "Pairing enabled for next connection".to_string()
                 } else {
-                    "Pair or replace controller...".to_string()
+                    "Pair or replace peer...".to_string()
                 },
                 icon_name: "network-connect".to_string(),
                 enabled: !self.pairing_armed && self.state != TrayState::Connected,
@@ -296,9 +313,13 @@ impl ksni::Tray for ReceiverTray {
         );
         items.push(
             StandardItem {
-                label: "Toggle audio streaming".to_string(),
+                label: if self.audio_available {
+                    "Toggle audio streaming".to_string()
+                } else {
+                    "Audio unavailable for this direction".to_string()
+                },
                 icon_name: "audio-volume-high".to_string(),
-                enabled: self.state == TrayState::Connected,
+                enabled: self.state == TrayState::Connected && self.audio_available,
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::ToggleAudio);
                 }),
@@ -319,7 +340,7 @@ impl ksni::Tray for ReceiverTray {
         );
         items.push(
             StandardItem {
-                label: "Quit receiver".to_string(),
+                label: "Quit edge-kvm".to_string(),
                 icon_name: "application-exit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Quit);
@@ -357,7 +378,7 @@ impl ReceiverTray {
             }
             .into(),
             TrayState::Starting | TrayState::Listening | TrayState::Error => StandardItem {
-                label: "Stop listening".to_string(),
+                label: "Disconnect".to_string(),
                 icon_name: "network-offline".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Disconnect);
@@ -379,7 +400,7 @@ impl ReceiverTray {
     fn description(&self) -> String {
         let mut lines = vec![
             format!("Status: {}", self.state.label()),
-            format!("Listen: {}", self.listen),
+            format!("Transport: {}", self.transport),
             format!("Input backend: {}", self.backend),
         ];
         if let Some(peer) = &self.connected_peer {
@@ -485,7 +506,7 @@ mod tests {
         let (command_tx, _) = mpsc::unbounded_channel();
         ReceiverTray {
             state,
-            listen: "0.0.0.0:42420".to_string(),
+            transport: "Listen: 0.0.0.0:42420".to_string(),
             backend: "hyprland".to_string(),
             pairing_armed: true,
             connected_peer: (state == TrayState::Connected).then(|| "controller".to_string()),
@@ -493,6 +514,7 @@ mod tests {
             input_events: 2,
             clipboard_events: 3,
             input_forwarding_enabled: true,
+            audio_available: true,
             last_error: last_error.map(str::to_string),
             command_tx,
         }
@@ -546,11 +568,11 @@ mod tests {
         );
         assert_eq!(
             menu_label(&test_tray(TrayState::Listening, None), 11),
-            "Stop listening"
+            "Disconnect"
         );
         assert_eq!(
             menu_label(&test_tray(TrayState::Error, Some("failed")), 11),
-            "Stop listening"
+            "Disconnect"
         );
     }
 
@@ -570,7 +592,7 @@ mod tests {
         let ksni::MenuItem::Standard(pairing) = &menu[10] else {
             panic!("pairing action is not a standard item");
         };
-        assert_eq!(pairing.label, "Pair or replace controller...");
+        assert_eq!(pairing.label, "Pair or replace peer...");
         assert!(pairing.enabled);
 
         let mut connected = test_tray(TrayState::Connected, None);

@@ -18,13 +18,20 @@ use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
     IncomingImageTransfer, OutgoingImageTransfer,
 };
+#[cfg(test)]
+use edge_common::Role;
 use edge_common::{
-    AppConfig, AudioLocalPlayback, Role, TransportMode, default_state_dir, detect_primary_local_ip,
+    AppConfig, AudioLocalPlayback, TransportMode, default_state_dir, detect_primary_local_ip,
     init_tracing, portable_config_path,
 };
+#[cfg(target_os = "linux")]
+use edge_crypto::initiate_noise_session;
 use edge_crypto::{
     IdentityKey, NoiseSession, PinStatus, PinStore, accept_noise_session, pairing_code,
 };
+#[cfg(any(target_os = "linux", test))]
+use edge_geometry::local_restore_point;
+use edge_geometry::{Point, Rect, normalized_perpendicular};
 use edge_linux_input::{
     ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
     UinputBackend, hyprland_cursor_position, hyprland_screen_info, read_clipboard_item,
@@ -71,7 +78,7 @@ mod tray;
 use tray::{ReceiverTrayHandle, TrayCommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Linux receiver daemon for edge-kvm")]
+#[command(version, about = "Linux edge-kvm node")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -175,13 +182,6 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
 
-    if config.transport != TransportMode::Listen {
-        anyhow::bail!(
-            "receiver requires transport = \"listen\" in {}",
-            config_path.display()
-        );
-    }
-
     if let Err(error) = edge_linux_audio::recover_portable_routing(&default_state_dir()).await {
         tracing::warn!(%error, "failed to recover previous Linux audio routing");
         append_portable_log(
@@ -192,7 +192,7 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
 
     if args.settings {
         let settings_input = SettingsUiInput {
-            role: Role::Receiver,
+            role: config.preferred_role,
             config_path,
             config,
             local_ip: detect_primary_local_ip(),
@@ -215,9 +215,8 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let backend = ReceiverBackend::from_config(&config)?;
-
     if let Some(test) = args.test_input {
+        let backend = ReceiverBackend::from_config(&config)?;
         run_input_test(&backend, test).await?;
         return Ok(());
     }
@@ -230,15 +229,23 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    run_receiver(
-        config,
-        config_path,
-        args.pair,
-        backend,
-        !args.no_tray,
-        receiver_log,
-    )
-    .await
+    match config.transport {
+        TransportMode::Listen => {
+            let backend = ReceiverBackend::from_config(&config)?;
+            run_receiver(
+                config,
+                config_path,
+                args.pair,
+                backend,
+                !args.no_tray,
+                receiver_log,
+            )
+            .await
+        }
+        TransportMode::Connect => {
+            run_linux_connector(config, config_path, args.pair, !args.no_tray, receiver_log).await
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -407,6 +414,768 @@ async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+struct LinuxPeerConnection {
+    session: NoiseSession<TcpStream>,
+    peer_name: String,
+    peer_fingerprint: String,
+    local_screen_info: Option<ScreenInfo>,
+    peer_screen_info: Option<ScreenInfo>,
+    peer_supports_input_injection: bool,
+    peer_supports_images: bool,
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_connector(
+    mut config: AppConfig,
+    config_path: PathBuf,
+    initial_pairing_armed: bool,
+    enable_tray: bool,
+    log_path: PathBuf,
+) -> Result<()> {
+    let identity = IdentityKey::load_or_create(default_state_dir().join("identity.toml"))
+        .await
+        .context("failed to load Linux connector identity")?;
+    let mut pairing_armed = initial_pairing_armed;
+    let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
+    let (tray, mut tray_commands) = if enable_tray {
+        let (tray, commands) = ReceiverTrayHandle::spawn(
+            format!("Connect: {endpoint}"),
+            "InputCapture portal".to_string(),
+            pairing_armed,
+        )
+        .await
+        .context("failed to start Linux tray")?;
+        (Some(tray), Some(commands))
+    } else {
+        (None, None)
+    };
+    let mut connection_enabled = true;
+
+    loop {
+        if !connection_enabled {
+            let command = recv_tray_command(&mut tray_commands).await;
+            match command {
+                TrayCommandEvent::Command(TrayCommand::Reconnect) => {
+                    connection_enabled = true;
+                    continue;
+                }
+                TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
+                    pairing_armed = true;
+                    connection_enabled = true;
+                    if let Some(tray) = &tray {
+                        tray.pairing_armed(true).await;
+                    }
+                    continue;
+                }
+                TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                    open_receiver_settings(&config_path, &log_path);
+                }
+                TrayCommandEvent::Command(TrayCommand::Quit) => break,
+                TrayCommandEvent::Command(
+                    TrayCommand::Disconnect
+                    | TrayCommand::ToggleInputForwarding
+                    | TrayCommand::ToggleAudio,
+                )
+                | TrayCommandEvent::Closed => {}
+            }
+            continue;
+        }
+
+        if let Some(tray) = &tray {
+            tray.connecting().await;
+        }
+        let connection =
+            connect_linux_peer(&config, &config_path, &identity, pairing_armed, &log_path).await;
+        let connection = match connection {
+            Ok(connection) => {
+                pairing_armed = false;
+                config.peer.pinned_fingerprint = connection.peer_fingerprint.clone();
+                if let Some(tray) = &tray {
+                    tray.pairing_armed(false).await;
+                    tray.connected(format!(
+                        "{} ({})",
+                        connection.peer_name, connection.peer_fingerprint
+                    ))
+                    .await;
+                }
+                connection
+            }
+            Err(error) => {
+                let message = error.to_string();
+                append_portable_log(&log_path, format!("Linux connector failed: {error:#}"));
+                if let Some(tray) = &tray {
+                    tray.error(message.clone()).await;
+                }
+                if message.contains("Upgrade the other computer") {
+                    connection_enabled = false;
+                    continue;
+                }
+                tokio::select! {
+                    _ = time::sleep(Duration::from_secs(2)) => {}
+                    command = recv_tray_command(&mut tray_commands) => {
+                        match command {
+                            TrayCommandEvent::Command(TrayCommand::Quit) => break,
+                            TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                                connection_enabled = false;
+                            }
+                            TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
+                                pairing_armed = true;
+                                if let Some(tray) = &tray {
+                                    tray.pairing_armed(true).await;
+                                }
+                            }
+                            TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                                open_receiver_settings(&config_path, &log_path);
+                            }
+                            TrayCommandEvent::Command(
+                                TrayCommand::Reconnect
+                                | TrayCommand::ToggleInputForwarding
+                                | TrayCommand::ToggleAudio,
+                            )
+                            | TrayCommandEvent::Closed => {}
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+
+        match run_linux_controller_session(
+            connection,
+            &config,
+            &config_path,
+            tray.as_ref(),
+            &mut tray_commands,
+            &log_path,
+        )
+        .await
+        {
+            Ok(ControllerSessionExit::QuitRequested) => break,
+            Ok(ControllerSessionExit::DisconnectRequested) => {
+                connection_enabled = false;
+                if let Some(tray) = &tray {
+                    tray.disconnected_by_user().await;
+                }
+            }
+            Err(error) => {
+                append_portable_log(
+                    &log_path,
+                    format!("Linux controller session ended: {error:#}"),
+                );
+                if let Some(tray) = &tray {
+                    tray.disconnected(Some(error.to_string())).await;
+                }
+                time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    if let Some(tray) = &tray {
+        tray.shutdown().await;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_linux_peer(
+    config: &AppConfig,
+    config_path: &Path,
+    identity: &IdentityKey,
+    pairing_armed: bool,
+    log_path: &Path,
+) -> Result<LinuxPeerConnection> {
+    if config.peer.host.trim().is_empty() {
+        anyhow::bail!("peer.host is required when transport = \"connect\"");
+    }
+    if config.peer.pinned_fingerprint.is_empty() && !pairing_armed {
+        anyhow::bail!("peer is not paired; choose 'Pair or replace peer...' on both computers");
+    }
+
+    let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
+    let stream = time::timeout(Duration::from_secs(5), TcpStream::connect(&endpoint))
+        .await
+        .with_context(|| format!("connection to {endpoint} timed out"))?
+        .with_context(|| format!("failed to connect to {endpoint}"))?;
+    configure_controller_socket(&stream)?;
+    let expected_fingerprint = (!pairing_armed && !config.peer.pinned_fingerprint.is_empty())
+        .then_some(config.peer.pinned_fingerprint.as_str());
+    let (mut session, peer_fingerprint) = time::timeout(
+        Duration::from_secs(15),
+        initiate_noise_session(stream, identity, expected_fingerprint),
+    )
+    .await
+    .context("encrypted handshake timed out")?
+    .context("failed encrypted handshake with Linux peer")?;
+    let locally_trusted = config.peer.pinned_fingerprint == peer_fingerprint;
+
+    write_secure_frame(
+        &mut session,
+        &Frame::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: config.device_name.clone(),
+            role: config.preferred_role,
+            public_key_fingerprint: identity.fingerprint(),
+            capabilities: Vec::new(),
+            extensions: vec![
+                CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                INPUT_TOGGLE_EXTENSION.to_string(),
+                PAIRING_CONFIRMATION_EXTENSION.to_string(),
+            ],
+            node_capabilities: vec![
+                NodeCapability::InputCaptureV1,
+                NodeCapability::InputInjectV1,
+                NodeCapability::ScreenInfoBothSidesV1,
+                NodeCapability::AudioCaptureV1,
+            ],
+        }),
+    )
+    .await?;
+
+    let hello = time::timeout(Duration::from_secs(15), async {
+        loop {
+            match read_secure_frame(&mut session).await? {
+                Frame::Hello(hello) => break Ok(hello),
+                Frame::Error(error) => {
+                    anyhow::bail!("peer error: {}: {}", error.code, error.message)
+                }
+                frame => tracing::debug!(?frame, "waiting for peer hello"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for peer hello")??;
+    validate_controller_hello(&hello, &peer_fingerprint)?;
+
+    let supports_confirmation = hello
+        .extensions
+        .iter()
+        .any(|extension| extension == PAIRING_CONFIRMATION_EXTENSION);
+    if supports_confirmation {
+        write_secure_frame(
+            &mut session,
+            &Frame::Pairing(PairingEvent::Status {
+                trusted: locally_trusted,
+                armed: pairing_armed,
+            }),
+        )
+        .await?;
+        let (peer_trusted, peer_armed) = read_pairing_status(&mut session).await?;
+        if !locally_trusted || !peer_trusted {
+            if !pairing_armed || !peer_armed {
+                write_secure_frame(
+                    &mut session,
+                    &Frame::Pairing(PairingEvent::Decision { accepted: false }),
+                )
+                .await
+                .ok();
+                anyhow::bail!("pairing needs approval on both computers");
+            }
+            let confirmation = PairingConfirmationInput {
+                peer_name: hello.device_name.clone(),
+                peer_addr: Some(endpoint.clone()),
+                local_fingerprint: identity.fingerprint(),
+                peer_fingerprint: peer_fingerprint.clone(),
+                verification_code: pairing_code(&identity.fingerprint(), &peer_fingerprint),
+                previous_peer_fingerprint: (!config.peer.pinned_fingerprint.is_empty()
+                    && config.peer.pinned_fingerprint != peer_fingerprint)
+                    .then(|| config.peer.pinned_fingerprint.clone()),
+            };
+            let accepted = tokio::task::spawn_blocking(move || {
+                edge_ui::run_pairing_confirmation(confirmation)
+            })
+            .await
+            .context("Linux pairing confirmation task failed")??;
+            write_secure_frame(
+                &mut session,
+                &Frame::Pairing(PairingEvent::Decision { accepted }),
+            )
+            .await?;
+            if !accepted || !read_pairing_decision(&mut session).await? {
+                anyhow::bail!("pairing was not approved on both computers");
+            }
+            let mut updated = AppConfig::load(config_path)
+                .await
+                .unwrap_or_else(|_| config.clone());
+            updated.peer.pinned_fingerprint = peer_fingerprint.clone();
+            updated.save(config_path).await?;
+            append_portable_log(
+                log_path,
+                format!("paired peer {} ({peer_fingerprint})", hello.device_name),
+            );
+        }
+    } else if !locally_trusted {
+        anyhow::bail!("peer does not support two-sided pairing confirmation; update it first");
+    }
+
+    write_secure_frame(
+        &mut session,
+        &Frame::Role(RoleEvent::SessionState(edge_protocol::RoleState {
+            controller_fingerprint: Some(identity.fingerprint()),
+            role_epoch: INITIAL_ROLE_EPOCH,
+            transition: edge_protocol::RoleTransitionState::Stable,
+            listener_position: peer_position_to_edge(config.layout.listener_position),
+            paused: false,
+            failure_detail: None,
+        })),
+    )
+    .await?;
+
+    let requested_output = linux_capture_output(config);
+    let local_screen_info = match hyprland_screen_info(requested_output).await {
+        Ok(info) => {
+            write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
+            Some(info)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to query local Linux screen geometry");
+            None
+        }
+    };
+    let peer_screen_info = read_initial_peer_screen(&mut session).await?;
+    let peer_supports_input_injection = hello
+        .node_capabilities
+        .contains(&NodeCapability::InputInjectV1);
+    let peer_supports_images = hello
+        .extensions
+        .iter()
+        .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+    Ok(LinuxPeerConnection {
+        session,
+        peer_name: hello.device_name,
+        peer_fingerprint,
+        local_screen_info,
+        peer_screen_info,
+        peer_supports_input_injection,
+        peer_supports_images,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn read_initial_peer_screen(
+    session: &mut NoiseSession<TcpStream>,
+) -> Result<Option<ScreenInfo>> {
+    time::timeout(Duration::from_secs(15), async {
+        loop {
+            match read_secure_frame(session).await? {
+                Frame::ScreenInfo(info) => break Ok(Some(info)),
+                Frame::Heartbeat(_) => break Ok(None),
+                Frame::Error(error) => {
+                    anyhow::bail!("peer error: {}: {}", error.code, error.message)
+                }
+                frame => tracing::debug!(?frame, "waiting for peer screen info"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for peer screen info")?
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_controller_session(
+    connection: LinuxPeerConnection,
+    config: &AppConfig,
+    config_path: &Path,
+    tray: Option<&ReceiverTrayHandle>,
+    tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
+    log_path: &Path,
+) -> Result<ControllerSessionExit> {
+    use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
+
+    let LinuxPeerConnection {
+        session,
+        local_screen_info,
+        peer_screen_info,
+        peer_supports_input_injection,
+        peer_supports_images,
+        ..
+    } = connection;
+    if let Some(info) = &peer_screen_info {
+        tracing::info!(
+            primary = %info.primary_output,
+            outputs = info.outputs.len(),
+            "Linux receiver screen info"
+        );
+    }
+
+    let edge = peer_position_to_edge(config.layout.listener_position);
+    let mut capture = if peer_supports_input_injection {
+        let backend = PortalCaptureBackend::preflight(edge)
+            .await
+            .context("Linux controller capture preflight failed")?;
+        backend
+            .arm()
+            .await
+            .context("failed to arm Linux controller capture")?;
+        Some(backend)
+    } else {
+        tracing::warn!("peer cannot inject input; keeping a clipboard-only session");
+        None
+    };
+    let mut input_forwarding_enabled = capture.is_some();
+    if let Some(tray) = tray {
+        tray.input_forwarding(input_forwarding_enabled).await;
+        tray.audio_available(false).await;
+    }
+
+    let (reader, mut writer) = SecureFrameSession::new(session).split();
+    let mut frame_rx = spawn_controller_reader(reader);
+    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
+    let mut clipboard_watcher = config
+        .clipboard
+        .enabled
+        .then(spawn_clipboard_change_watcher);
+    let mut clipboard_send = time::interval(Duration::from_millis(2));
+    clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let liveness_config = LivenessConfig::default();
+    let mut peer_liveness = LivenessTracker::new(liveness_config, tokio::time::Instant::now());
+    let mut watchdog = time::interval(Duration::from_millis(250));
+    watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
+    tokio::pin!(heartbeat);
+    let mut heartbeat_sequence = 0_u64;
+    let mut input_active = false;
+
+    let outcome: Result<ControllerSessionExit> = async {
+        loop {
+            if writer.bulk_is_due() && clipboard_sync.outgoing.is_some() {
+                clipboard_sync.send_next_image_frame(&mut writer).await?;
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                _ = watchdog.tick() => {
+                    match peer_liveness.poll(tokio::time::Instant::now()) {
+                        Some(LivenessEvent::SoftInputTimeout) => {
+                            if let Some(capture) = &capture {
+                                capture.release(None).await.ok();
+                            }
+                            input_active = false;
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
+                            tracing::warn!("Linux receiver was silent; released local capture");
+                        }
+                        Some(LivenessEvent::HardSessionTimeout) => {
+                            anyhow::bail!("Linux receiver stopped responding for five seconds");
+                        }
+                        None => {}
+                    }
+                }
+                _ = &mut heartbeat => {
+                    heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                    )
+                    .await?;
+                    heartbeat.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + liveness_config.heartbeat_interval(input_active),
+                    );
+                }
+                event = recv_portal_capture_event(&mut capture) => {
+                    match event {
+                        Some(CaptureEvent::Activated {
+                            edge,
+                            normalized_position,
+                            ..
+                        }) => {
+                            input_active = true;
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::control(
+                                    INITIAL_ROLE_EPOCH,
+                                    ControlEvent::EnterRemote {
+                                        edge,
+                                        normalized_position,
+                                    },
+                                ),
+                            )
+                            .await?;
+                        }
+                        Some(CaptureEvent::Input(event)) => {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, event),
+                            )
+                            .await?;
+                            if let Some(tray) = tray {
+                                tray.input_event().await;
+                            }
+                        }
+                        Some(CaptureEvent::Deactivated) => {
+                            input_active = false;
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await?;
+                        }
+                        Some(CaptureEvent::EmergencyReleased) => {
+                            input_active = false;
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
+                            tracing::info!("Linux emergency release chord restored local input");
+                        }
+                        Some(CaptureEvent::LayoutChanged { .. }) => {
+                            input_active = false;
+                            if input_forwarding_enabled
+                                && let Some(capture) = &capture
+                            {
+                                capture.arm().await.context(
+                                    "monitor layout changed and capture could not be re-armed",
+                                )?;
+                            }
+                        }
+                        Some(CaptureEvent::BackendFailed(error)) => {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
+                            anyhow::bail!("Linux capture backend failed: {error}");
+                        }
+                        None if capture.is_some() => {
+                            anyhow::bail!("Linux capture backend stopped unexpectedly");
+                        }
+                        None => {}
+                    }
+                }
+                command = recv_tray_command(tray_commands) => {
+                    match command {
+                        TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                            open_receiver_settings(config_path, log_path);
+                        }
+                        TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
+                            if let Some(capture) = &capture {
+                                input_forwarding_enabled = !input_forwarding_enabled;
+                                input_active = false;
+                                if input_forwarding_enabled {
+                                    capture.arm().await?;
+                                } else {
+                                    capture.disarm().await?;
+                                }
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::control(
+                                        INITIAL_ROLE_EPOCH,
+                                        ControlEvent::SetInputForwarding {
+                                            enabled: input_forwarding_enabled,
+                                        },
+                                    ),
+                                )
+                                .await?;
+                                if let Some(tray) = tray {
+                                    tray.input_forwarding(input_forwarding_enabled).await;
+                                }
+                            }
+                        }
+                        TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                            break Ok(ControllerSessionExit::DisconnectRequested);
+                        }
+                        TrayCommandEvent::Command(TrayCommand::Quit) => {
+                            break Ok(ControllerSessionExit::QuitRequested);
+                        }
+                        TrayCommandEvent::Command(
+                            TrayCommand::Reconnect
+                            | TrayCommand::ArmPairing
+                            | TrayCommand::ToggleAudio,
+                        )
+                        | TrayCommandEvent::Closed => {}
+                    }
+                }
+                event = recv_clipboard_change(&mut clipboard_watcher) => {
+                    match event {
+                        ClipboardWatchEvent::Changed => {
+                            if clipboard_sync.send_changed_offer(config, &mut writer).await?
+                                && let Some(tray) = tray
+                            {
+                                tray.clipboard_event().await;
+                            }
+                        }
+                        ClipboardWatchEvent::Closed => {
+                            clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                        }
+                    }
+                }
+                frame = frame_rx.recv() => {
+                    let frame = frame.context("Linux receiver frame reader ended")??;
+                    peer_liveness.observe_authenticated_frame(tokio::time::Instant::now());
+                    writer.record_received(&frame);
+                    match frame {
+                        Frame::Heartbeat(_) => {}
+                        Frame::Clipboard(event) => {
+                            if clipboard_sync.handle_event(config, &mut writer, event).await?
+                                && let Some(tray) = tray
+                            {
+                                tray.clipboard_event().await;
+                            }
+                        }
+                        Frame::Control(control) if control.role_epoch == INITIAL_ROLE_EPOCH => {
+                            match control.event {
+                                ControlEvent::LeaveRemote {
+                                    edge,
+                                    normalized_position,
+                                } => {
+                                    write_secure_frame_writer(
+                                        &mut writer,
+                                        &Frame::input(
+                                            INITIAL_ROLE_EPOCH,
+                                            InputEvent::AllKeysUp,
+                                        ),
+                                    )
+                                    .await?;
+                                    if let Some(capture) = &capture {
+                                        let cursor = linux_release_cursor(
+                                            local_screen_info.as_ref(),
+                                            edge,
+                                            normalized_position,
+                                        );
+                                        capture.release(cursor).await?;
+                                    }
+                                    input_active = false;
+                                }
+                                ControlEvent::ReleaseToLocal { .. } => {
+                                    if let Some(capture) = &capture {
+                                        capture.release(None).await?;
+                                    }
+                                    input_active = false;
+                                }
+                                ControlEvent::SetInputForwarding { enabled } => {
+                                    input_forwarding_enabled = enabled && capture.is_some();
+                                    input_active = false;
+                                    if let Some(capture) = &capture {
+                                        if input_forwarding_enabled {
+                                            capture.arm().await?;
+                                        } else {
+                                            capture.disarm().await?;
+                                        }
+                                    }
+                                    if let Some(tray) = tray {
+                                        tray.input_forwarding(input_forwarding_enabled).await;
+                                    }
+                                }
+                                ControlEvent::EnterRemote { .. } => {}
+                            }
+                        }
+                        Frame::Control(control) => {
+                            tracing::debug!(
+                                role_epoch = control.role_epoch,
+                                "ignored stale Linux receiver control"
+                            );
+                        }
+                        Frame::Error(error) => {
+                            anyhow::bail!("Linux receiver error: {}: {}", error.code, error.message);
+                        }
+                        Frame::ScreenInfo(info) => {
+                            tracing::info!(primary = %info.primary_output, "updated Linux receiver screen info");
+                        }
+                        Frame::Role(event) => {
+                            tracing::warn!(?event, "role transition ignored until Phase 4");
+                        }
+                        Frame::Audio(_)
+                        | Frame::Hello(_)
+                        | Frame::Input(_)
+                        | Frame::Pairing(_) => {}
+                    }
+                }
+                _ = clipboard_send.tick(), if clipboard_sync.outgoing.is_some() => {
+                    clipboard_sync.send_next_image_frame(&mut writer).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    write_secure_frame_writer(
+        &mut writer,
+        &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+    )
+    .await
+    .ok();
+    if let Some(capture) = &capture {
+        capture.release(None).await.ok();
+        capture.disarm().await.ok();
+    }
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+async fn recv_portal_capture_event(
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
+) -> Option<edge_linux_input::CaptureEvent> {
+    match capture {
+        Some(capture) => capture.next_event().await,
+        None => future::pending().await,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_release_cursor(
+    screen_info: Option<&ScreenInfo>,
+    edge: Edge,
+    normalized_position: f32,
+) -> Option<(f64, f64)> {
+    let info = screen_info?;
+    let output = info
+        .outputs
+        .iter()
+        .find(|output| output.name == info.primary_output)
+        .or_else(|| info.outputs.first())?;
+    let point = local_restore_point(
+        edge,
+        normalized_position,
+        Rect {
+            x: f64::from(output.x),
+            y: f64::from(output.y),
+            width: output.width,
+            height: output.height,
+        },
+        3.0,
+    );
+    Some((point.x, point.y))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_capture_output(config: &AppConfig) -> &str {
+    if config.input.capture.output.trim().is_empty() {
+        config.input.inject.output.as_str()
+    } else {
+        config.input.capture.output.as_str()
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn peer_position_to_edge(position: edge_common::PeerPosition) -> Edge {
+    match position {
+        edge_common::PeerPosition::Left => Edge::Left,
+        edge_common::PeerPosition::Right => Edge::Right,
+        edge_common::PeerPosition::Top => Edge::Top,
+        edge_common::PeerPosition::Bottom => Edge::Bottom,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_linux_connector(
+    _config: AppConfig,
+    _config_path: PathBuf,
+    _initial_pairing_armed: bool,
+    _enable_tray: bool,
+    _log_path: PathBuf,
+) -> Result<()> {
+    anyhow::bail!("Linux controller mode is available only on Linux")
+}
+
 async fn run_receiver(
     config: AppConfig,
     config_path: PathBuf,
@@ -433,7 +1202,7 @@ async fn run_receiver(
 
     let (tray, mut tray_commands) = if enable_tray {
         match ReceiverTrayHandle::spawn(
-            listen.clone(),
+            format!("Listen: {listen}"),
             backend.label().to_string(),
             initial_pairing_armed,
         )
@@ -707,7 +1476,7 @@ async fn run_receiver(
                 }
                 if !accepted || !peer_accepted {
                     let message = if accepted {
-                        "pairing was declined on the controller"
+                        "pairing was declined on the peer"
                     } else {
                         "pairing was cancelled on this computer"
                     };
@@ -720,18 +1489,17 @@ async fn run_receiver(
 
                 pins.pin(hello.device_name.clone(), peer_fingerprint.clone());
                 pins.save(state_dir.join("pins.toml")).await?;
-                tracing::info!(fingerprint = %peer_fingerprint, "paired controller after two-sided confirmation");
+                tracing::info!(fingerprint = %peer_fingerprint, "paired peer after two-sided confirmation");
                 append_portable_log(
                     &log_path,
                     format!(
-                        "paired controller {} ({peer_fingerprint}) after confirmation on both computers",
+                        "paired peer {} ({peer_fingerprint}) after confirmation on both computers",
                         hello.device_name
                     ),
                 );
             }
         } else if !controller_trusted {
-            let message =
-                "controller does not support two-sided pairing confirmation; update it first";
+            let message = "peer does not support two-sided pairing confirmation; update it first";
             reject_pairing(&mut session, "pairing_update_required", message).await;
             if let Some(tray) = &tray {
                 tray.error(message.to_string()).await;
@@ -762,6 +1530,9 @@ async fn run_receiver(
             .extensions
             .iter()
             .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+        if let Some(tray) = &tray {
+            tray.audio_available(controller_supports_audio).await;
+        }
 
         let requested_monitor = config.input.inject.output.as_str();
         let screen_info = match hyprland_screen_info(requested_monitor).await {
@@ -938,13 +1709,13 @@ async fn recv_clipboard_change(
 fn validate_controller_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
     if hello.protocol_version != PROTOCOL_VERSION {
         anyhow::bail!(
-            "Upgrade the other computer: controller protocol version {} is incompatible with {}",
+            "Upgrade the other computer: peer protocol version {} is incompatible with {}",
             hello.protocol_version,
             PROTOCOL_VERSION
         );
     }
     if hello.public_key_fingerprint != noise_fingerprint {
-        anyhow::bail!("controller hello fingerprint does not match its encrypted identity");
+        anyhow::bail!("peer hello fingerprint does not match its encrypted identity");
     }
     Ok(())
 }
@@ -965,11 +1736,11 @@ async fn read_pairing_status(session: &mut NoiseSession<TcpStream>) -> Result<(b
     match time::timeout(Duration::from_secs(15), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Status { trusted, armed }))) => Ok((trusted, armed)),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("controller error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
-        Ok(Ok(frame)) => anyhow::bail!("expected controller pairing status, got {frame:?}"),
-        Ok(Err(error)) => Err(error).context("failed to read controller pairing status"),
-        Err(_) => anyhow::bail!("timed out waiting for controller pairing status"),
+        Ok(Ok(frame)) => anyhow::bail!("expected peer pairing status, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read peer pairing status"),
+        Err(_) => anyhow::bail!("timed out waiting for peer pairing status"),
     }
 }
 
@@ -977,11 +1748,11 @@ async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<
     match time::timeout(Duration::from_secs(120), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Decision { accepted }))) => Ok(accepted),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("controller error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
-        Ok(Ok(frame)) => anyhow::bail!("expected controller pairing decision, got {frame:?}"),
-        Ok(Err(error)) => Err(error).context("failed to read controller pairing decision"),
-        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the controller"),
+        Ok(Ok(frame)) => anyhow::bail!("expected peer pairing decision, got {frame:?}"),
+        Ok(Err(error)) => Err(error).context("failed to read peer pairing decision"),
+        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the peer"),
     }
 }
 
@@ -1057,8 +1828,8 @@ async fn handle_controller(
                     Some(LivenessEvent::SoftInputTimeout) => {
                         input_epoch.suspend();
                         backend.all_keys_up().await.ok();
-                        tracing::warn!("controller was silent for one second; released injected input and suspended its input epoch");
-                        append_portable_log(log_path, "controller liveness soft timeout; released injected input and suspended stale frames");
+                        tracing::warn!("peer was silent for one second; released injected input and suspended its input epoch");
+                        append_portable_log(log_path, "peer liveness soft timeout; released injected input and suspended stale frames");
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::control(role_epoch, ControlEvent::ReleaseToLocal {
@@ -1070,7 +1841,7 @@ async fn handle_controller(
                     }
                     Some(LivenessEvent::HardSessionTimeout) => {
                         anyhow::bail!(
-                            "controller stopped responding for {:?}; closing session",
+                            "peer stopped responding for {:?}; closing session",
                             controller_liveness.elapsed(tokio::time::Instant::now())
                         );
                     }
@@ -1223,10 +1994,10 @@ async fn handle_controller(
                     }
                     TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
                         if !controller_supports_audio {
-                            tracing::warn!("audio toggle ignored because controller lacks AudioV1");
+                            tracing::warn!("audio toggle ignored because the peer lacks audio playback");
                             append_portable_log(
                                 log_path,
-                                "audio toggle ignored because controller lacks AudioV1",
+                                "audio toggle ignored because the peer lacks audio playback",
                             );
                             continue;
                         }
@@ -2026,11 +2797,25 @@ impl RemoteReturnWatcher {
             return Ok(None);
         }
 
+        let normalized_position = normalized_perpendicular(
+            edge,
+            Point {
+                x: f64::from(cursor.x),
+                y: f64::from(cursor.y),
+            },
+            Rect {
+                x: f64::from(output.x),
+                y: f64::from(output.y),
+                width: output.width,
+                height: output.height,
+            },
+        );
         self.edge = None;
         self.entered_at = None;
         self.consecutive_edge_polls = 0;
-        Ok(Some(ControlEvent::ReleaseToLocal {
-            reason: ReleaseReason::UserRequest,
+        Ok(Some(ControlEvent::LeaveRemote {
+            edge,
+            normalized_position,
         }))
     }
 }
@@ -2311,6 +3096,50 @@ mod tests {
                 reason: ReleaseReason::UserRequest,
             },
         ));
+    }
+
+    #[test]
+    fn linux_release_lands_on_the_matching_local_edge() {
+        let screen = ScreenInfo {
+            outputs: vec![OutputInfo {
+                name: "DP-1".to_string(),
+                width: 2560,
+                height: 1440,
+                scale: 1.25,
+                x: -1920,
+                y: 0,
+            }],
+            primary_output: "DP-1".to_string(),
+        };
+
+        assert_eq!(
+            linux_release_cursor(Some(&screen), Edge::Left, 0.25),
+            Some((-1917.0, 360.0))
+        );
+        assert_eq!(
+            linux_release_cursor(Some(&screen), Edge::Right, 0.25),
+            Some((636.0, 360.0))
+        );
+        assert_eq!(
+            linux_release_cursor(Some(&screen), Edge::Top, 0.25),
+            Some((-1280.0, 3.0))
+        );
+        assert_eq!(
+            linux_release_cursor(Some(&screen), Edge::Bottom, 0.25),
+            Some((-1280.0, 1436.0))
+        );
+    }
+
+    #[test]
+    fn empty_capture_output_reuses_the_injection_output() {
+        let mut config = AppConfig::receiver_default();
+        assert_eq!(linux_capture_output(&config), "eDP-1");
+        config.input.capture.output = "DP-2".to_string();
+        assert_eq!(linux_capture_output(&config), "DP-2");
+        assert_eq!(
+            peer_position_to_edge(edge_common::PeerPosition::Top),
+            Edge::Top
+        );
     }
 
     #[cfg(target_os = "linux")]

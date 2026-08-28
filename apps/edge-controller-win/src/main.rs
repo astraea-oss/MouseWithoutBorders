@@ -1409,6 +1409,13 @@ async fn run_connected_inner(
                                     append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
                                 }
                             }
+                            ControlEvent::LeaveRemote { .. } => {
+                                if edge_windows_input::handle_receiver_release(
+                                    edge_protocol::ReleaseReason::UserRequest,
+                                ) {
+                                    tracing::info!("accepted receiver edge-return release");
+                                }
+                            }
                             ControlEvent::SetInputForwarding { enabled } => {
                                 if peer_supports_input_toggle {
                                     *input_forwarding_enabled = enabled;
@@ -1420,7 +1427,9 @@ async fn run_connected_inner(
                                     );
                                 }
                             }
-                            event => tracing::debug!(?event, "receiver control frame"),
+                            event @ ControlEvent::EnterRemote { .. } => {
+                                tracing::debug!(?event, "receiver control frame")
+                            }
                         }
                     }
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),

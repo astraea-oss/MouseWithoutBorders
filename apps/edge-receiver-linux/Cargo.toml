@@ -16,6 +16,7 @@ edge-common = { path = "../../crates/edge-common" }
 edge-clipboard = { path = "../../crates/edge-clipboard" }
 edge-audio = { path = "../../crates/edge-audio" }
 edge-crypto = { path = "../../crates/edge-crypto" }
+edge-geometry = { path = "../../crates/edge-geometry" }
 edge-linux-input = { path = "../../crates/edge-linux-input" }
 edge-linux-audio = { path = "../../crates/edge-linux-audio" }
 edge-protocol = { path = "../../crates/edge-protocol" }
