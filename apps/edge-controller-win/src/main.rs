@@ -1387,7 +1387,12 @@ async fn run_connected_inner(
                     )
                     .await?;
                 }
-                match receiver_liveness.poll(tokio::time::Instant::now()) {
+                let input_active = if local_is_controller {
+                    edge_windows_input::capture_stats().active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                match receiver_liveness.poll(tokio::time::Instant::now(), input_active) {
                     Some(LivenessEvent::SoftInputTimeout) => {
                         if local_is_controller {
                             edge_windows_input::force_release_to_local();

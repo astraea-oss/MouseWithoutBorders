@@ -146,6 +146,7 @@ pub enum LivenessEvent {
 pub struct LivenessTracker {
     config: LivenessConfig,
     last_authenticated_activity: Instant,
+    input_active_since: Option<Instant>,
     soft_timeout_reported: bool,
     hard_timeout_reported: bool,
 }
@@ -159,6 +160,7 @@ impl LivenessTracker {
         Self {
             config,
             last_authenticated_activity: now,
+            input_active_since: None,
             soft_timeout_reported: false,
             hard_timeout_reported: false,
         }
@@ -174,13 +176,24 @@ impl LivenessTracker {
         now.saturating_duration_since(self.last_authenticated_activity)
     }
 
-    pub fn poll(&mut self, now: Instant) -> Option<LivenessEvent> {
+    pub fn poll(&mut self, now: Instant, input_active: bool) -> Option<LivenessEvent> {
         let elapsed = self.elapsed(now);
         if elapsed >= self.config.hard_session_timeout && !self.hard_timeout_reported {
             self.hard_timeout_reported = true;
             return Some(LivenessEvent::HardSessionTimeout);
         }
-        if elapsed >= self.config.soft_input_timeout && !self.soft_timeout_reported {
+
+        if !input_active {
+            self.input_active_since = None;
+            self.soft_timeout_reported = false;
+            return None;
+        }
+
+        let input_active_since = *self.input_active_since.get_or_insert(now);
+        let soft_timeout_baseline = self.last_authenticated_activity.max(input_active_since);
+        if now.saturating_duration_since(soft_timeout_baseline) >= self.config.soft_input_timeout
+            && !self.soft_timeout_reported
+        {
             self.soft_timeout_reported = true;
             return Some(LivenessEvent::SoftInputTimeout);
         }
@@ -402,18 +415,37 @@ mod tests {
         let start = Instant::now();
         let mut tracker = LivenessTracker::new(LivenessConfig::default(), start);
 
+        assert_eq!(tracker.poll(Instant::now(), true), None);
         tokio::time::advance(Duration::from_millis(999)).await;
-        assert_eq!(tracker.poll(Instant::now()), None);
+        assert_eq!(tracker.poll(Instant::now(), true), None);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(
-            tracker.poll(Instant::now()),
+            tracker.poll(Instant::now(), true),
             Some(LivenessEvent::SoftInputTimeout)
         );
-        assert_eq!(tracker.poll(Instant::now()), None);
+        assert_eq!(tracker.poll(Instant::now(), true), None);
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(
-            tracker.poll(Instant::now()),
+            tracker.poll(Instant::now(), true),
             Some(LivenessEvent::HardSessionTimeout)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_idle_time_does_not_arm_the_soft_input_timeout() {
+        let start = Instant::now();
+        let mut tracker = LivenessTracker::new(LivenessConfig::default(), start);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(tracker.poll(Instant::now(), false), None);
+        assert_eq!(tracker.poll(Instant::now(), true), None);
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(tracker.poll(Instant::now(), true), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            tracker.poll(Instant::now(), true),
+            Some(LivenessEvent::SoftInputTimeout)
         );
     }
 

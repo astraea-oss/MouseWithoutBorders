@@ -972,7 +972,7 @@ async fn run_linux_controller_session(
                             tray.role_failure("Role switch timed out".to_string()).await;
                         }
                     }
-                    match peer_liveness.poll(tokio::time::Instant::now()) {
+                    match peer_liveness.poll(tokio::time::Instant::now(), input_active) {
                         Some(LivenessEvent::SoftInputTimeout) => {
                             if local_is_controller && let Some(capture) = &capture {
                                 capture.release(None).await.ok();
@@ -2406,7 +2406,12 @@ async fn handle_controller(
                     }
                     tracing::warn!("role request timed out; retained committed assignment");
                 }
-                match controller_liveness.poll(tokio::time::Instant::now()) {
+                let input_active = if local_is_controller {
+                    capture_input_active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                match controller_liveness.poll(tokio::time::Instant::now(), input_active) {
                     Some(LivenessEvent::SoftInputTimeout) => {
                         capture_input_active = false;
                         input_epoch.suspend();
