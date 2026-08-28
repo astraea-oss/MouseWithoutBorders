@@ -2,10 +2,10 @@
 
 Portable two-computer software KVM prototype for Windows and Linux.
 
-The current supported directions are intentionally narrow:
+The current supported two-computer directions are:
 
-- Windows controller to Linux receiver.
-- Linux controller to Linux receiver through the InputCapture portal.
+- Windows to Linux in either input direction, switchable from either tray.
+- Linux to Linux in either input direction through the InputCapture portal.
 - Protocol frames are length-prefixed MessagePack.
 - Pairing uses persistent device identities and pinned peer fingerprints.
 - Portable by default: configs and state live beside the running executable.
@@ -73,6 +73,10 @@ and is never rewritten. `Disconnect` pauses input and clipboard on both Linux
 nodes while retaining the encrypted control channel, and `Reconnect` resumes it
 from either tray.
 
+The executable is still named `edge-receiver-linux` as a compatibility entry
+point. A role-neutral package name will follow a deprecation window; retaining
+the current name keeps existing scripts and portable layouts stable meanwhile.
+
 Linux audio streaming uses the PipeWire-Pulse command-line tools `pactl` and
 `parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside
 `pipewire-pulse`. Verify routing without a Windows connection:
@@ -123,7 +127,7 @@ this is normally the Wayland virtual input backend. Set the backend to `uinput`
 to require `/dev/uinput`, or to `log` when testing only the encrypted protocol
 without injecting local input.
 
-## Windows controller
+## Windows node
 
 For development:
 
@@ -160,13 +164,24 @@ forwarded relative motion. Uncheck `Forward mouse and keyboard` in either tray
 to pause input without stopping Linux audio or clipboard synchronization;
 either side can turn forwarding back on.
 
+When both peers advertise role switching, the right-click menu shows two radio
+choices using their device names. Selecting either computer makes it the active
+controller without reconnecting. Windows receives Linux mouse and keyboard
+input through `SendInput`; normal desktop applications are supported, but
+Windows integrity boundaries are not bypassed. Input into an elevated process
+may be rejected by UIPI, and the UAC secure desktop is explicitly unsupported.
+Run both nodes at the same privilege level for normal use.
+
+The executable remains `edge-controller-win.exe` as a compatibility entry point
+for existing scripts and portable layouts; its role is no longer fixed.
+
 ### Pairing and changed keys
 
 Normal reconnects use the saved identity keys automatically. For a first
 connection, or after intentionally resetting either computer's `state` folder:
 
-1. Choose `Pair or replace controller...` from the Linux tray.
-2. Choose `Pair or replace laptop...` from the Windows tray.
+1. Choose `Pair or replace peer...` from the Linux tray.
+2. Choose `Pair or replace peer...` from the Windows tray.
 3. Compare the six-digit code shown on both computers.
 4. Select `Pair` on both only when the codes match.
 
@@ -187,8 +202,8 @@ To verify Windows playback without Linux, run:
 .\edge-controller-win.exe --test-audio
 ```
 
-Linux system-audio streaming is enabled by default for new Windows controller
-configs. Legacy controller configs without an `[audio]` section are migrated on
+Linux system-audio streaming is enabled by default for new Windows node
+configs. Legacy Windows configs without an `[audio]` section are migrated on
 startup; an explicit existing preference is preserved. Use Settings or the
 checked `Stream Linux audio` tray action to change it while connected. The
 initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
@@ -196,7 +211,7 @@ initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
 
 ## End-to-end test
 
-Start the Linux receiver:
+Start the Linux node:
 
 ```bash
 ./edge-receiver-linux
@@ -213,5 +228,7 @@ From Windows, send test events:
 ```
 
 Expected result with `backend = "auto"`: pointer, click, and key events are
-injected into the Linux desktop. If no real input backend can initialize, the
-receiver exits with an error instead of appearing healthy in log-only mode.
+injected into the Linux desktop. Then use either tray's named role choice to
+switch direction and verify Linux input reaches the Windows desktop. If no real
+Linux input backend can initialize, the node exits with an error instead of
+appearing healthy in log-only mode.

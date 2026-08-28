@@ -188,9 +188,15 @@ impl LivenessTracker {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InputEpochGate {
     suspended: bool,
+}
+
+impl Default for InputEpochGate {
+    fn default() -> Self {
+        Self { suspended: true }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +420,6 @@ mod tests {
     #[test]
     fn stale_input_is_rejected_until_a_fresh_entry() {
         let mut gate = InputEpochGate::default();
-        gate.suspend();
         assert!(!gate.accepts_input());
         gate.observe_control(&ControlEvent::LeaveRemote {
             edge: Edge::Right,

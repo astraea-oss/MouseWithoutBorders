@@ -1,5 +1,19 @@
 # Universal Controller and Receiver Roles
 
+## Implementation status
+
+The protocol/runtime, Linux capture and controller path, v2 migration, safe
+runtime handover, and Windows `SendInput` receiver path are implemented on the
+feature branch. Automated workspace tests cover negotiation, liveness, role
+epochs, migration, four-edge geometry, and input cleanup on both build targets.
+
+Live InputCapture and repeated Linux-to-Linux/Windows-to-Linux handover still
+need the Phase 0 probe and end-to-end run on the target Hyprland computers; no
+Wayland compositor is available in the Windows/WSL development environment.
+Phase 6 keeps the old executable names as compatibility entry points because
+their deprecation window has not happened yet; UI, help, and examples are now
+role-neutral.
+
 ## Goal
 
 Keep the existing Windows-controller to Linux-receiver path working while adding:

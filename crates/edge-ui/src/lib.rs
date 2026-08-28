@@ -470,7 +470,7 @@ impl eframe::App for SettingsApp {
                 ui.checkbox(&mut self.audio_enabled, "Enabled on connection");
                 ui.end_row();
 
-                ui.label("Laptop playback");
+                ui.label("Peer playback");
                 ui.checkbox(&mut self.audio_play_local, "Keep playing locally");
                 ui.end_row();
 

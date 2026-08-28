@@ -27,18 +27,19 @@ use edge_common::{
 };
 use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session, pairing_code};
 #[cfg(windows)]
-use edge_geometry::Size;
+use edge_geometry::{Point, Rect, Size, normalized_perpendicular};
 use edge_protocol::Edge;
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
     ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello,
     INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, NodeCapability,
-    PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent, RoleState,
-    RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
+    OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent,
+    RoleState, RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_runtime::{
-    LivenessConfig, LivenessEvent, LivenessTracker, SecureFrameReader, SecureFrameSession,
-    SecureFrameWriter,
+    CommittedRole, InputDirectionCapabilities, InputEpochGate, LivenessConfig, LivenessEvent,
+    LivenessTracker, RoleCoordinator, RoleDecision, RoleStore, SecureFrameReader,
+    SecureFrameSession, SecureFrameWriter, select_initial_controller,
 };
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput};
 use tokio::{
@@ -63,10 +64,20 @@ const FALLBACK_REMOTE_SIZE: Size = Size {
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIPBOARD_PASTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
+#[cfg(windows)]
+const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
+#[cfg(windows)]
+const RETURN_EDGE_MARGIN: i32 = 12;
+#[cfg(windows)]
+const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 const UPGRADE_PEER_STATUS: &str = "Upgrade the other computer";
+static CONNECTOR_SESSION_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Windows controller for edge-kvm")]
+#[command(version, about = "Windows node for edge-kvm")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -74,7 +85,7 @@ struct Args {
     dry_run: bool,
     #[arg(long, help = "Run the Windows tray shell after connecting")]
     tray: bool,
-    #[arg(long, help = "Confirm and replace an unknown or changed laptop key")]
+    #[arg(long, help = "Confirm and replace an unknown or changed peer key")]
     pair: bool,
     #[arg(long, help = "Send one test input event over the encrypted session")]
     test_input: Option<TestInput>,
@@ -244,7 +255,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         connection = None;
                         next_connect_attempt = Instant::now();
                         update_windows_tray_status(
-                            "Pairing: enable pairing on the laptop",
+                            "Pairing: enable pairing on the peer",
                             &controller_log,
                         );
                     }
@@ -266,26 +277,18 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                             &controller_log,
                         );
                     }
+                    TrayCommandOutcome::ControllerRequested(_) => {
+                        tracing::debug!("role selection ignored while no peer session is active");
+                    }
                     TrayCommandOutcome::Continue => {}
                 }
 
-                if let Some((active_connection, screen_info)) = connection.take() {
+                if let Some((active_connection, initial_receiver)) = connection.take() {
                     update_windows_tray_status(&active_connection.status(), &controller_log);
                     match run_connected(
                         active_connection,
                         &config,
-                        screen_info.screen_info,
-                        screen_info
-                            .node_capabilities
-                            .contains(&NodeCapability::AudioCaptureV1),
-                        screen_info
-                            .extensions
-                            .iter()
-                            .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
-                        screen_info
-                            .extensions
-                            .iter()
-                            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+                        initial_receiver,
                         &mut input_forwarding_enabled,
                         &controller_log,
                         &config_path,
@@ -312,7 +315,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                             connection_enabled = true;
                             next_connect_attempt = Instant::now();
                             update_windows_tray_status(
-                                "Pairing: enable pairing on the laptop",
+                                "Pairing: enable pairing on the peer",
                                 &controller_log,
                             );
                         }
@@ -412,18 +415,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         run_connected(
             connection,
             &config,
-            initial_receiver.screen_info,
-            initial_receiver
-                .node_capabilities
-                .contains(&NodeCapability::AudioCaptureV1),
-            initial_receiver
-                .extensions
-                .iter()
-                .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
-            initial_receiver
-                .extensions
-                .iter()
-                .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+            initial_receiver,
             &mut input_forwarding_enabled,
             &controller_log,
             &config_path,
@@ -541,6 +533,7 @@ enum TrayCommandOutcome {
     Pair,
     InputForwardingChanged(bool),
     AudioChanged(bool),
+    ControllerRequested(edge_windows_input::WindowsControllerChoice),
 }
 
 #[cfg(windows)]
@@ -600,6 +593,10 @@ fn handle_pending_windows_tray_commands(
                 );
                 return Ok(TrayCommandOutcome::AudioChanged(updated.audio.enabled));
             }
+            edge_windows_input::WindowsTrayCommand::SetController(choice) => {
+                append_portable_log(log_path, format!("controller role requested: {choice:?}"));
+                return Ok(TrayCommandOutcome::ControllerRequested(choice));
+            }
             edge_windows_input::WindowsTrayCommand::Quit => {
                 append_portable_log(log_path, "quit requested from tray");
                 return Ok(TrayCommandOutcome::Quit);
@@ -632,6 +629,8 @@ fn install_controller_panic_log(log_path: PathBuf) {
 
 struct ControllerConnection {
     session: NoiseSession<TcpStream>,
+    local_name: String,
+    local_fingerprint: String,
     addr: String,
     peer_addr: std::net::SocketAddr,
     peer_fingerprint: String,
@@ -659,7 +658,7 @@ async fn connect_and_initialize(
             match read_secure_frame(&mut connection.session).await? {
                 Frame::Hello(hello) => break Ok(hello),
                 Frame::Error(error) => {
-                    anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+                    anyhow::bail!("peer error: {}: {}", error.code, error.message)
                 }
                 frame => tracing::debug!(?frame, "waiting for receiver hello"),
             }
@@ -670,9 +669,11 @@ async fn connect_and_initialize(
     validate_receiver_hello(&hello, &connection.peer_fingerprint)?;
 
     let mut initial = InitialReceiverState {
+        peer_name: hello.device_name.clone(),
         screen_info: None,
         node_capabilities: hello.node_capabilities.clone(),
         extensions: hello.extensions.clone(),
+        role_state: None,
     };
     let supports_confirmation = hello
         .extensions
@@ -734,7 +735,7 @@ async fn connect_and_initialize(
                 anyhow::bail!("pairing was cancelled on this computer");
             }
             if !read_pairing_decision(&mut connection.session).await? {
-                anyhow::bail!("pairing was declined on the laptop");
+                anyhow::bail!("pairing was declined on the peer");
             }
 
             let mut updated = AppConfig::load(config_path).await.unwrap_or_else(|error| {
@@ -747,29 +748,70 @@ async fn connect_and_initialize(
             append_portable_log(
                 log_path,
                 format!(
-                    "paired laptop {} ({}) after confirmation on both computers",
+                    "paired peer {} ({}) after confirmation on both computers",
                     hello.device_name, connection.peer_fingerprint
                 ),
             );
         }
     } else if !connection.peer_trusted {
         anyhow::bail!(
-            "the laptop does not support two-sided pairing confirmation; update it before replacing its key"
+            "the peer does not support two-sided pairing confirmation; update it before replacing its key"
         );
     }
 
+    let local_fingerprint = identity.fingerprint();
+    let peer_can_capture = hello
+        .node_capabilities
+        .contains(&NodeCapability::InputCaptureV1);
+    let peer_can_inject = hello
+        .node_capabilities
+        .contains(&NodeCapability::InputInjectV1);
+    let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let persisted = role_store.load().await.unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to read committed role state; using fresh-pair selection");
+        None
+    });
+    let selected_controller = persisted
+        .filter(|role| role.belongs_to(&local_fingerprint, &connection.peer_fingerprint))
+        .map(|role| role.controller_fingerprint)
+        .or_else(|| {
+            select_initial_controller(
+                &local_fingerprint,
+                &connection.peer_fingerprint,
+                config.preferred_role == Role::Controller,
+                InputDirectionCapabilities {
+                    controller_can_capture: true,
+                    receiver_can_inject: peer_can_inject,
+                },
+                InputDirectionCapabilities {
+                    controller_can_capture: peer_can_capture,
+                    receiver_can_inject: true,
+                },
+            )
+            .map(str::to_string)
+        });
+    if let Some(controller) = &selected_controller {
+        role_store
+            .save(&CommittedRole::new(controller))
+            .await
+            .context("failed to persist initial controller assignment")?;
+    } else {
+        role_store.clear().await.ok();
+    }
+    let role_state = RoleState {
+        controller_fingerprint: selected_controller,
+        role_epoch: INITIAL_ROLE_EPOCH,
+        transition: RoleTransitionState::Stable,
+        listener_position: peer_position_to_edge(config.layout.listener_position),
+        paused: CONNECTOR_SESSION_PAUSED.load(std::sync::atomic::Ordering::Acquire),
+        failure_detail: None,
+    };
     write_secure_frame(
         &mut connection.session,
-        &Frame::Role(RoleEvent::SessionState(RoleState {
-            controller_fingerprint: Some(identity.fingerprint()),
-            role_epoch: INITIAL_ROLE_EPOCH,
-            transition: RoleTransitionState::Stable,
-            listener_position: peer_position_to_edge(config.layout.listener_position),
-            paused: false,
-            failure_detail: None,
-        })),
+        &Frame::Role(RoleEvent::SessionState(role_state.clone())),
     )
     .await?;
+    initial.role_state = Some(role_state);
     #[cfg(windows)]
     write_secure_frame(
         &mut connection.session,
@@ -799,7 +841,7 @@ async fn read_pairing_status(session: &mut NoiseSession<TcpStream>) -> Result<(b
     match time::timeout(Duration::from_secs(15), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Status { trusted, armed }))) => Ok((trusted, armed)),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
         Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing status, got {frame:?}"),
         Ok(Err(error)) => Err(error).context("failed to read receiver pairing status"),
@@ -811,11 +853,11 @@ async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<
     match time::timeout(Duration::from_secs(120), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Decision { accepted }))) => Ok(accepted),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
         Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing decision, got {frame:?}"),
         Ok(Err(error)) => Err(error).context("failed to read receiver pairing decision"),
-        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the laptop"),
+        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the peer"),
     }
 }
 
@@ -842,14 +884,14 @@ async fn connect_session(
     .context("encrypted handshake timed out")?
             .with_context(|| {
                 format!(
-                    "failed encrypted handshake with {addr}; if this laptop was reset, choose 'Pair or replace laptop...' from the tray on both computers"
+                    "failed encrypted handshake with {addr}; if this peer was reset, choose 'Pair or replace peer...' from the tray on both computers"
                 )
             })?;
     let peer_trusted =
         !peer.pinned_fingerprint.is_empty() && peer.pinned_fingerprint == peer_fingerprint;
     if !peer_trusted && !pairing_armed {
         anyhow::bail!(
-            "the laptop at {addr} is not paired; choose 'Pair or replace laptop...' from both tray menus"
+            "the peer at {addr} is not paired; choose 'Pair or replace peer...' from both tray menus"
         );
     }
 
@@ -868,6 +910,8 @@ async fn connect_session(
             ],
             node_capabilities: vec![
                 NodeCapability::InputCaptureV1,
+                NodeCapability::InputInjectV1,
+                NodeCapability::RoleSwitchV1,
                 NodeCapability::ScreenInfoBothSidesV1,
                 NodeCapability::AudioPlaybackV1,
             ],
@@ -878,6 +922,8 @@ async fn connect_session(
     tracing::info!(%addr, %peer_fingerprint, "sent encrypted controller hello");
     Ok(ControllerConnection {
         session,
+        local_name: config.device_name.clone(),
+        local_fingerprint: identity.fingerprint(),
         addr,
         peer_addr,
         peer_fingerprint,
@@ -888,9 +934,11 @@ async fn connect_session(
 
 #[derive(Debug, Default)]
 struct InitialReceiverState {
+    peer_name: String,
     screen_info: Option<ScreenInfo>,
     node_capabilities: Vec<NodeCapability>,
     extensions: Vec<String>,
+    role_state: Option<RoleState>,
 }
 
 async fn read_initial_frames(
@@ -905,6 +953,7 @@ async fn read_initial_frames(
                     fingerprint = %hello.public_key_fingerprint,
                     "receiver hello"
                 );
+                initial.peer_name = hello.device_name;
                 initial.node_capabilities = hello.node_capabilities;
                 initial.extensions = hello.extensions;
             }
@@ -919,7 +968,7 @@ async fn read_initial_frames(
             }
             Ok(Frame::Heartbeat(_)) => return Ok(()),
             Ok(Frame::Error(err)) => {
-                anyhow::bail!("receiver error: {}: {}", err.code, err.message)
+                anyhow::bail!("peer error: {}: {}", err.code, err.message)
             }
             Ok(frame) => tracing::debug!(?frame, "initial receiver frame"),
             Err(err) => return Err(err).context("failed to read receiver frame"),
@@ -928,6 +977,17 @@ async fn read_initial_frames(
 }
 
 async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput) -> Result<()> {
+    write_secure_frame(
+        session,
+        &Frame::control(
+            INITIAL_ROLE_EPOCH,
+            ControlEvent::EnterRemote {
+                edge: Edge::Left,
+                normalized_position: 0.5,
+            },
+        ),
+    )
+    .await?;
     match test {
         TestInput::Pointer => {
             write_secure_frame(
@@ -1021,10 +1081,7 @@ enum ConnectedSessionExit {
 async fn run_connected(
     connection: ControllerConnection,
     config: &AppConfig,
-    screen_info: Option<ScreenInfo>,
-    peer_supports_audio: bool,
-    peer_supports_input_toggle: bool,
-    peer_supports_images: bool,
+    initial_receiver: InitialReceiverState,
     input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
@@ -1033,10 +1090,7 @@ async fn run_connected(
     let result = run_connected_inner(
         connection,
         config,
-        screen_info,
-        peer_supports_audio,
-        peer_supports_input_toggle,
-        peer_supports_images,
+        initial_receiver,
         input_forwarding_enabled,
         log_path,
         config_path,
@@ -1052,23 +1106,83 @@ async fn run_connected(
 async fn run_connected_inner(
     connection: ControllerConnection,
     config: &AppConfig,
-    screen_info: Option<ScreenInfo>,
-    peer_supports_audio: bool,
-    peer_supports_input_toggle: bool,
-    peer_supports_images: bool,
+    initial_receiver: InitialReceiverState,
     input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
     mut tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
 ) -> Result<ConnectedSessionExit> {
+    let connection_status = connection.status();
+    let peer_supports_audio = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::AudioCaptureV1);
+    let peer_supports_input_toggle = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == INPUT_TOGGLE_EXTENSION);
+    let peer_supports_images = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+    let screen_info = initial_receiver.screen_info.clone();
+    let initial_role_state = initial_receiver
+        .role_state
+        .clone()
+        .context("connector did not initialize role state")?;
+    let peer_supports_role_switch = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::RoleSwitchV1);
+    let peer_supports_input_capture = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::InputCaptureV1);
+    let peer_supports_input_injection = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::InputInjectV1);
+    let role_switch_available =
+        peer_supports_role_switch && peer_supports_input_capture && peer_supports_input_injection;
+    let local_name = connection.local_name.clone();
+    let local_fingerprint = connection.local_fingerprint.clone();
+    let peer_name = initial_receiver.peer_name.clone();
+    let peer_fingerprint = connection.peer_fingerprint.clone();
+    let mut coordinator = RoleCoordinator::new(
+        local_fingerprint.clone(),
+        peer_fingerprint.clone(),
+        initial_role_state.controller_fingerprint.clone(),
+        initial_role_state.role_epoch,
+        initial_role_state.listener_position,
+        initial_role_state.paused,
+    )?;
+    let mut role_epoch = initial_role_state.role_epoch;
+    let mut local_is_controller =
+        initial_role_state.controller_fingerprint.as_deref() == Some(local_fingerprint.as_str());
+    let mut session_paused = initial_role_state.paused;
+    let mut input_epoch = InputEpochGate::default();
+    let mut injector = edge_windows_input::WindowsInputInjector::new()
+        .context("failed to initialize Windows input injection")?;
+    let mut return_watcher = WindowsRemoteReturnWatcher::new(edge_windows_input::screen_info());
+    let mut pending_role_readiness: Option<(bool, bool, Option<String>)> = None;
+    let mut transition_deadline: Option<tokio::time::Instant> = None;
+    let role_store = RoleStore::new(default_state_dir().join("role.toml"));
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
     append_portable_log(
         log_path,
         format!("connected session started: {}", connection.status()),
     );
     let mut input_rx = start_live_input(config, screen_info)?;
-    edge_windows_input::set_forwarding_enabled(*input_forwarding_enabled);
+    edge_windows_input::set_forwarding_enabled(
+        local_is_controller && *input_forwarding_enabled && !session_paused,
+    );
     update_windows_tray_input_forwarding(*input_forwarding_enabled, log_path);
+    edge_windows_input::update_tray_role(
+        &local_name,
+        &peer_name,
+        local_is_controller,
+        role_switch_available && !session_paused,
+        false,
+    )?;
+    if session_paused {
+        update_windows_tray_status("Disconnected by user", log_path);
+    }
     let mut runtime_config = config.clone();
     let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images).await?;
     let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
@@ -1084,8 +1198,8 @@ async fn run_connected_inner(
     let mut receiver_rx = spawn_receiver_reader(reader);
     let mut tray_command_poll = time::interval(Duration::from_millis(200));
     let liveness_config = LivenessConfig::default();
-    let mut heartbeat = time::interval(liveness_config.heartbeat_interval(true));
-    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
+    tokio::pin!(heartbeat);
     let mut heartbeat_sequence = 0_u64;
     let mut connection_watchdog = time::interval(Duration::from_millis(250));
     connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1094,7 +1208,7 @@ async fn run_connected_inner(
     let mut _audio_receiver: Option<edge_windows_audio::WindowsAudioReceiver> = None;
     let mut audio_restart_attempted = false;
     let mut audio_enabled = runtime_config.audio.enabled;
-    if peer_supports_audio {
+    if peer_supports_audio && !session_paused {
         append_portable_log(
             log_path,
             format!("requesting Linux audio enabled={audio_enabled}"),
@@ -1115,6 +1229,8 @@ async fn run_connected_inner(
             }),
         )
         .await?;
+    } else if session_paused {
+        update_windows_tray_audio(audio_enabled, "Audio: Paused", log_path);
     } else {
         append_portable_log(log_path, "receiver does not advertise AudioV1");
         update_windows_tray_audio(audio_enabled, "Audio: Unsupported by receiver", log_path);
@@ -1123,7 +1239,7 @@ async fn run_connected_inner(
         write_secure_frame_writer(
             &mut writer,
             &Frame::control(
-                INITIAL_ROLE_EPOCH,
+                role_epoch,
                 ControlEvent::SetInputForwarding {
                     enabled: *input_forwarding_enabled,
                 },
@@ -1133,7 +1249,8 @@ async fn run_connected_inner(
     }
 
     loop {
-        if writer.bulk_is_due()
+        if !session_paused
+            && writer.bulk_is_due()
             && let Some((frame, completed)) = live_clipboard.next_image_frame()
         {
             write_secure_frame_writer(&mut writer, &frame).await?;
@@ -1154,7 +1271,7 @@ async fn run_connected_inner(
             _ = tokio::signal::ctrl_c() => {
                 write_secure_frame_writer(
                     &mut writer,
-                    &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                    &Frame::input(role_epoch, InputEvent::AllKeysUp),
                 )
                 .await
                 .ok();
@@ -1218,7 +1335,7 @@ async fn run_connected_inner(
                                 log_path,
                             );
                             append_portable_log(log_path, format!("applied saved audio setting enabled={audio_enabled}"));
-                            if peer_supports_audio {
+                            if peer_supports_audio && !session_paused {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: audio_enabled })).await?;
                             }
                         }
@@ -1228,6 +1345,30 @@ async fn run_connected_inner(
                 }
             },
             _ = connection_watchdog.tick() => {
+                if transition_deadline.is_some_and(|deadline| {
+                    tokio::time::Instant::now() >= deadline
+                }) && coordinator.is_transitioning() {
+                    transition_deadline = None;
+                    pending_role_readiness = None;
+                    let abort = coordinator.abort("peer did not complete role preflight in time")?;
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Role(RoleEvent::Abort(abort)),
+                    )
+                    .await
+                    .ok();
+                    edge_windows_input::set_forwarding_enabled(
+                        local_is_controller && *input_forwarding_enabled && !session_paused,
+                    );
+                    edge_windows_input::update_tray_role(
+                        &local_name,
+                        &peer_name,
+                        local_is_controller,
+                        role_switch_available && !session_paused,
+                        false,
+                    )?;
+                    update_windows_tray_status("Connected: role switch timed out", log_path);
+                }
                 if let Some(transfer_id) = live_clipboard.incoming.expire_transfer_id() {
                     tracing::warn!(transfer_id, "expired incomplete receiver clipboard image");
                     write_secure_frame_writer(
@@ -1241,28 +1382,47 @@ async fn run_connected_inner(
                 }
                 match receiver_liveness.poll(tokio::time::Instant::now()) {
                     Some(LivenessEvent::SoftInputTimeout) => {
-                        edge_windows_input::force_release_to_local();
-                        tracing::warn!("receiver was silent for one second; released local capture while keeping the session available");
-                        append_portable_log(log_path, "receiver liveness soft timeout; released local capture");
+                        if local_is_controller {
+                            edge_windows_input::force_release_to_local();
+                        } else {
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                        }
+                        tracing::warn!("peer was silent for one second; released active input direction while keeping the session available");
+                        append_portable_log(log_path, "peer liveness soft timeout; released active input direction");
                     }
                     Some(LivenessEvent::HardSessionTimeout) => {
                         anyhow::bail!(
-                            "receiver stopped responding for {:?}; reconnecting",
+                            "peer stopped responding for {:?}; reconnecting",
                             receiver_liveness.elapsed(tokio::time::Instant::now())
                         );
                     }
                     None => {}
                 }
             },
-            _ = heartbeat.tick() => {
+            _ = &mut heartbeat => {
                 heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
                 write_secure_frame_writer(
                     &mut writer,
                     &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
                 )
                 .await?;
+                let input_active = if local_is_controller {
+                    edge_windows_input::capture_stats().active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                heartbeat.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + liveness_config.heartbeat_interval(
+                            input_active || coordinator.is_transitioning(),
+                        ),
+                );
             },
             _ = clipboard_poll.tick() => {
+                if session_paused {
+                    continue;
+                }
                 match live_clipboard.local_change_offer(&runtime_config).await {
                     Ok(frames) => for frame in frames {
                         write_secure_frame_writer(&mut writer, &frame).await?;
@@ -1286,7 +1446,7 @@ async fn run_connected_inner(
                         TrayCommandOutcome::Quit => {
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
                             )
                             .await
                             .ok();
@@ -1296,9 +1456,37 @@ async fn run_connected_inner(
                             return Ok(ConnectedSessionExit::Quit);
                         }
                         TrayCommandOutcome::Disconnect => {
+                            if role_switch_available && !coordinator.is_transitioning() {
+                                coordinator.set_paused(true)?;
+                                session_paused = true;
+                                CONNECTOR_SESSION_PAUSED
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                edge_windows_input::force_release_to_local();
+                                edge_windows_input::set_forwarding_enabled(false);
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::SetPaused { paused: true }),
+                                )
+                                .await?;
+                                if peer_supports_audio {
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
+                                }
+                                _audio_receiver = None;
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    false,
+                                    false,
+                                )?;
+                                update_windows_tray_status("Disconnected by user", log_path);
+                                continue;
+                            }
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
                             )
                             .await
                             .ok();
@@ -1309,11 +1497,41 @@ async fn run_connected_inner(
                             edge_windows_input::force_release_to_local();
                             return Ok(ConnectedSessionExit::Disconnect);
                         }
-                        TrayCommandOutcome::Reconnect => {}
+                        TrayCommandOutcome::Reconnect => {
+                            if role_switch_available {
+                                coordinator.set_paused(false)?;
+                                session_paused = false;
+                                CONNECTOR_SESSION_PAUSED
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::SetPaused { paused: false }),
+                                )
+                                .await?;
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller && *input_forwarding_enabled,
+                                );
+                                if audio_enabled && peer_supports_audio {
+                                    write_secure_frame_writer(
+                                        &mut writer,
+                                        &Frame::Audio(AudioControl::SetEnabled { enabled: true }),
+                                    )
+                                    .await?;
+                                }
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available,
+                                    false,
+                                )?;
+                                update_windows_tray_status(&connection_status, log_path);
+                            }
+                        }
                         TrayCommandOutcome::Pair => {
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
                             )
                             .await
                             .ok();
@@ -1324,18 +1542,22 @@ async fn run_connected_inner(
                             if !enabled {
                                 write_secure_frame_writer(
                                     &mut writer,
-                                    &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                                    &Frame::input(role_epoch, InputEvent::AllKeysUp),
                                 )
                                 .await?;
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
                             }
                             *input_forwarding_enabled = enabled;
-                            edge_windows_input::set_forwarding_enabled(enabled);
+                            edge_windows_input::set_forwarding_enabled(
+                                local_is_controller && enabled && !session_paused,
+                            );
                             update_windows_tray_input_forwarding(enabled, log_path);
                             if peer_supports_input_toggle {
                                 write_secure_frame_writer(
                                     &mut writer,
                                     &Frame::control(
-                                        INITIAL_ROLE_EPOCH,
+                                        role_epoch,
                                         ControlEvent::SetInputForwarding { enabled },
                                     ),
                                 )
@@ -1352,12 +1574,53 @@ async fn run_connected_inner(
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled })).await?;
                             }
                         }
+                        TrayCommandOutcome::ControllerRequested(choice) => {
+                            let requested = match choice {
+                                edge_windows_input::WindowsControllerChoice::Local => {
+                                    local_fingerprint.as_str()
+                                }
+                                edge_windows_input::WindowsControllerChoice::Peer => {
+                                    peer_fingerprint.as_str()
+                                }
+                            };
+                            if !session_paused
+                                && role_switch_available
+                                && !coordinator.is_transitioning()
+                                && coordinator.state().controller_fingerprint.as_deref()
+                                    != Some(requested)
+                            {
+                                pending_role_readiness = begin_windows_role_switch(
+                                    requested,
+                                    &local_fingerprint,
+                                    &mut coordinator,
+                                    &mut input_epoch,
+                                    &mut injector,
+                                    &mut writer,
+                                )
+                                .await?;
+                                transition_deadline = pending_role_readiness
+                                    .as_ref()
+                                    .map(|_| tokio::time::Instant::now() + Duration::from_secs(5));
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    false,
+                                    pending_role_readiness.is_some(),
+                                )?;
+                            }
+                        }
                         TrayCommandOutcome::Continue => {}
                     }
                 }
             },
             event = recv_live_input(&mut input_rx) => {
-                if *input_forwarding_enabled && let Some(frame) = event {
+                if local_is_controller
+                    && *input_forwarding_enabled
+                    && !session_paused
+                    && let Some(frame) = event
+                {
+                    let frame = frame_with_role_epoch(frame, role_epoch);
                     for prepared in live_clipboard.prepare_input(frame, &runtime_config).await? {
                         write_secure_frame_writer(&mut writer, &prepared).await?;
                         stats.record_frame(&prepared);
@@ -1366,7 +1629,7 @@ async fn run_connected_inner(
                 }
             },
             frame = clipboard_rx.recv() => {
-                if let Some(frame) = frame {
+                if !session_paused && let Some(frame) = frame {
                     write_secure_frame_writer(&mut writer, &frame).await?;
                     stats.record_frame(&frame);
                 }
@@ -1376,7 +1639,43 @@ async fn run_connected_inner(
                 receiver_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
+                    Frame::Input(input) => {
+                        if input.role_epoch != role_epoch
+                            || local_is_controller
+                            || session_paused
+                        {
+                            tracing::trace!(
+                                role_epoch = input.role_epoch,
+                                "ignored input outside the committed Windows receiving epoch"
+                            );
+                            continue;
+                        }
+                        if input.event == InputEvent::AllKeysUp {
+                            injector.all_keys_up()?;
+                            input_epoch.suspend();
+                            continue;
+                        }
+                        if !*input_forwarding_enabled || !input_epoch.accepts_input() {
+                            continue;
+                        }
+                        let is_motion = matches!(input.event, InputEvent::PointerMotion { .. });
+                        injector.inject(input.event)?;
+                        if is_motion
+                            && let Some(control) = return_watcher.release_if_at_edge()?
+                        {
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::control(role_epoch, control),
+                            )
+                            .await?;
+                        }
+                    }
                     Frame::Clipboard(event) => {
+                        if session_paused {
+                            continue;
+                        }
                         if let Err(error) = live_clipboard
                             .handle_remote_event(
                                 event,
@@ -1392,7 +1691,7 @@ async fn run_connected_inner(
                     }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
                     Frame::Control(control) => {
-                        if control.role_epoch != INITIAL_ROLE_EPOCH {
+                        if control.role_epoch != role_epoch {
                             tracing::debug!(
                                 role_epoch = control.role_epoch,
                                 "ignored receiver control from a stale role epoch"
@@ -1401,7 +1700,7 @@ async fn run_connected_inner(
                         }
                         match control.event {
                             ControlEvent::ReleaseToLocal { reason } => {
-                                if edge_windows_input::handle_receiver_release(reason) {
+                                if local_is_controller && edge_windows_input::handle_receiver_release(reason) {
                                     tracing::info!(?reason, "accepted receiver-requested local release");
                                     append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
                                 } else {
@@ -1410,7 +1709,7 @@ async fn run_connected_inner(
                                 }
                             }
                             ControlEvent::LeaveRemote { .. } => {
-                                if edge_windows_input::handle_receiver_release(
+                                if local_is_controller && edge_windows_input::handle_receiver_release(
                                     edge_protocol::ReleaseReason::UserRequest,
                                 ) {
                                     tracing::info!("accepted receiver edge-return release");
@@ -1419,7 +1718,16 @@ async fn run_connected_inner(
                             ControlEvent::SetInputForwarding { enabled } => {
                                 if peer_supports_input_toggle {
                                     *input_forwarding_enabled = enabled;
-                                    edge_windows_input::set_forwarding_enabled(enabled);
+                                    edge_windows_input::set_forwarding_enabled(
+                                        local_is_controller && enabled && !session_paused,
+                                    );
+                                    if !enabled {
+                                        input_epoch.suspend();
+                                        injector.all_keys_up().ok();
+                                    }
+                                    return_watcher.record_control(
+                                        &ControlEvent::SetInputForwarding { enabled },
+                                    );
                                     update_windows_tray_input_forwarding(enabled, log_path);
                                     append_portable_log(
                                         log_path,
@@ -1428,11 +1736,184 @@ async fn run_connected_inner(
                                 }
                             }
                             event @ ControlEvent::EnterRemote { .. } => {
-                                tracing::debug!(?event, "receiver control frame")
+                                if !local_is_controller {
+                                    input_epoch.observe_control(&event);
+                                    return_watcher.record_control(&event);
+                                }
+                                tracing::debug!(?event, "peer control frame")
                             }
                         }
                     }
-                    Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
+                    Frame::Role(RoleEvent::Request { controller_fingerprint }) => {
+                        if !session_paused
+                            && role_switch_available
+                            && (controller_fingerprint == local_fingerprint
+                                || controller_fingerprint == peer_fingerprint)
+                            && !coordinator.is_transitioning()
+                            && coordinator.state().controller_fingerprint.as_deref()
+                                != Some(controller_fingerprint.as_str())
+                        {
+                            pending_role_readiness = begin_windows_role_switch(
+                                &controller_fingerprint,
+                                &local_fingerprint,
+                                &mut coordinator,
+                                &mut input_epoch,
+                                &mut injector,
+                                &mut writer,
+                            )
+                            .await?;
+                            transition_deadline = pending_role_readiness
+                                .as_ref()
+                                .map(|_| tokio::time::Instant::now() + Duration::from_secs(5));
+                            edge_windows_input::update_tray_role(
+                                &local_name,
+                                &peer_name,
+                                local_is_controller,
+                                false,
+                                pending_role_readiness.is_some(),
+                            )?;
+                        }
+                    }
+                    Frame::Role(RoleEvent::Ready {
+                        role_epoch: ready_epoch,
+                        capture_ready,
+                        inject_ready,
+                        failure_detail,
+                    }) => {
+                        let Some(local_ready) = pending_role_readiness.take() else {
+                            tracing::debug!(ready_epoch, "ignored unexpected role readiness");
+                            continue;
+                        };
+                        transition_deadline = None;
+                        let decision = match coordinator.finish_ready(
+                            ready_epoch,
+                            local_ready.0,
+                            local_ready.1,
+                            capture_ready,
+                            inject_ready,
+                            failure_detail.or_else(|| local_ready.2.clone()),
+                        ) {
+                            Ok(decision) => decision,
+                            Err(edge_runtime::RoleStateError::UnexpectedEpoch { .. }) => {
+                                pending_role_readiness = Some(local_ready);
+                                transition_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
+                                tracing::debug!(ready_epoch, "ignored stale role readiness");
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        match decision {
+                            RoleDecision::Commit(commit) => {
+                                let controller = commit.controller_fingerprint.as_deref()
+                                    .context("role commit omitted controller identity")?;
+                                role_store
+                                    .save(&CommittedRole::new(controller))
+                                    .await
+                                    .context("failed to persist committed role before handover")?;
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::Commit(commit.clone())),
+                                )
+                                .await?;
+                                role_epoch = commit.role_epoch;
+                                local_is_controller = controller == local_fingerprint;
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller
+                                        && *input_forwarding_enabled
+                                        && !session_paused,
+                                );
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available && !session_paused,
+                                    false,
+                                )?;
+                                update_windows_tray_status(&connection_status, log_path);
+                            }
+                            RoleDecision::Abort(abort) => {
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller
+                                        && *input_forwarding_enabled
+                                        && !session_paused,
+                                );
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::Abort(abort.clone())),
+                                )
+                                .await?;
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available && !session_paused,
+                                    false,
+                                )?;
+                                if let Some(detail) = abort.failure_detail {
+                                    update_windows_tray_status(
+                                        &format!("Connected: {detail}"),
+                                        log_path,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Frame::Role(RoleEvent::SetPaused { paused }) => {
+                        if coordinator.is_transitioning() {
+                            continue;
+                        }
+                        coordinator.set_paused(paused)?;
+                        session_paused = paused;
+                        CONNECTOR_SESSION_PAUSED
+                            .store(paused, std::sync::atomic::Ordering::Release);
+                        if paused {
+                            edge_windows_input::force_release_to_local();
+                            edge_windows_input::set_forwarding_enabled(false);
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                            _audio_receiver = None;
+                        } else {
+                            edge_windows_input::set_forwarding_enabled(
+                                local_is_controller && *input_forwarding_enabled,
+                            );
+                            if audio_enabled && peer_supports_audio {
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::SetEnabled { enabled: true }),
+                                )
+                                .await?;
+                            }
+                        }
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Role(RoleEvent::SetPaused { paused }),
+                        )
+                        .await?;
+                        edge_windows_input::update_tray_role(
+                            &local_name,
+                            &peer_name,
+                            local_is_controller,
+                            role_switch_available && !paused,
+                            false,
+                        )?;
+                        update_windows_tray_status(
+                            if paused { "Disconnected by user" } else { &connection_status },
+                            log_path,
+                        );
+                    }
+                    Frame::Role(
+                        RoleEvent::SessionState(_)
+                        | RoleEvent::Prepare(_)
+                        | RoleEvent::Commit(_)
+                        | RoleEvent::Abort(_),
+                    ) => {
+                        tracing::warn!("ignored connector-authoritative role message from listener");
+                    }
+                    Frame::Error(err) => anyhow::bail!("peer error: {}: {}", err.code, err.message),
                     Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
                         if audio_enabled && codecs.contains(&AudioCodec::PcmS16Stereo48Khz) {
                             update_windows_tray_audio(true, "Audio: Starting", log_path);
@@ -1523,7 +2004,7 @@ async fn run_connected_inner(
                     other => tracing::debug!(?other, "receiver frame"),
                 }
             },
-            _ = clipboard_send.tick(), if live_clipboard.needs_send_tick() => {
+            _ = clipboard_send.tick(), if !session_paused && live_clipboard.needs_send_tick() => {
                 if live_clipboard.paste_barrier_expired() {
                     if let Some(cancel) = live_clipboard.cancel_expired_paste_barrier() {
                         write_secure_frame_writer(&mut writer, &cancel).await?;
@@ -1550,6 +2031,149 @@ async fn run_connected_inner(
                 }
             },
         }
+    }
+}
+
+fn frame_with_role_epoch(frame: Frame, role_epoch: u64) -> Frame {
+    match frame {
+        Frame::Input(mut input) => {
+            input.role_epoch = role_epoch;
+            Frame::Input(input)
+        }
+        Frame::Control(mut control) => {
+            control.role_epoch = role_epoch;
+            Frame::Control(control)
+        }
+        frame => frame,
+    }
+}
+
+#[cfg(windows)]
+async fn begin_windows_role_switch(
+    requested_controller: &str,
+    local_fingerprint: &str,
+    coordinator: &mut RoleCoordinator,
+    input_epoch: &mut InputEpochGate,
+    injector: &mut edge_windows_input::WindowsInputInjector,
+    writer: &mut ScheduledNoiseWriter,
+) -> Result<Option<(bool, bool, Option<String>)>> {
+    let old_local_controller =
+        coordinator.state().controller_fingerprint.as_deref() == Some(local_fingerprint);
+    if old_local_controller {
+        edge_windows_input::set_forwarding_enabled(false);
+        edge_windows_input::force_release_to_local();
+        write_secure_frame_writer(
+            writer,
+            &Frame::input(coordinator.state().role_epoch, InputEvent::AllKeysUp),
+        )
+        .await
+        .ok();
+    } else {
+        input_epoch.suspend();
+        injector.all_keys_up().ok();
+    }
+    let prepare = coordinator.prepare(requested_controller)?;
+    write_secure_frame_writer(writer, &Frame::Role(RoleEvent::Prepare(prepare))).await?;
+    Ok(Some((true, true, None)))
+}
+
+#[cfg(windows)]
+struct WindowsRemoteReturnWatcher {
+    output: Option<OutputInfo>,
+    entry_edge: Option<Edge>,
+    entered_at: Option<Instant>,
+    last_poll: Instant,
+    confirmations: u8,
+}
+
+#[cfg(windows)]
+impl WindowsRemoteReturnWatcher {
+    fn new(screen_info: ScreenInfo) -> Self {
+        let output = screen_info
+            .outputs
+            .iter()
+            .find(|output| output.name == screen_info.primary_output)
+            .cloned()
+            .or_else(|| screen_info.outputs.first().cloned());
+        Self {
+            output,
+            entry_edge: None,
+            entered_at: None,
+            last_poll: Instant::now() - RETURN_EDGE_POLL_INTERVAL,
+            confirmations: 0,
+        }
+    }
+
+    fn record_control(&mut self, control: &ControlEvent) {
+        match control {
+            ControlEvent::EnterRemote { edge, .. } => {
+                self.entry_edge = Some(*edge);
+                self.entered_at = Some(Instant::now());
+                self.last_poll = Instant::now() - RETURN_EDGE_POLL_INTERVAL;
+                self.confirmations = 0;
+            }
+            ControlEvent::LeaveRemote { .. }
+            | ControlEvent::ReleaseToLocal { .. }
+            | ControlEvent::SetInputForwarding { enabled: false } => {
+                self.entry_edge = None;
+                self.entered_at = None;
+                self.confirmations = 0;
+            }
+            ControlEvent::SetInputForwarding { enabled: true } => {}
+        }
+    }
+
+    fn release_if_at_edge(&mut self) -> Result<Option<ControlEvent>> {
+        let (Some(edge), Some(output)) = (self.entry_edge, self.output.as_ref()) else {
+            return Ok(None);
+        };
+        if self
+            .entered_at
+            .is_some_and(|entered| entered.elapsed() < RETURN_EDGE_ENTRY_GRACE)
+            || self.last_poll.elapsed() < RETURN_EDGE_POLL_INTERVAL
+        {
+            return Ok(None);
+        }
+        self.last_poll = Instant::now();
+        let (x, y) = edge_windows_input::cursor_position()?;
+        let left = output.x;
+        let top = output.y;
+        let right = output.x + output.width.saturating_sub(1) as i32;
+        let bottom = output.y + output.height.saturating_sub(1) as i32;
+        let reached = match edge {
+            Edge::Left => x >= right - RETURN_EDGE_MARGIN,
+            Edge::Right => x <= left + RETURN_EDGE_MARGIN,
+            Edge::Top => y >= bottom - RETURN_EDGE_MARGIN,
+            Edge::Bottom => y <= top + RETURN_EDGE_MARGIN,
+        };
+        if !reached {
+            self.confirmations = 0;
+            return Ok(None);
+        }
+        self.confirmations = self.confirmations.saturating_add(1);
+        if self.confirmations < RETURN_EDGE_CONFIRMATIONS {
+            return Ok(None);
+        }
+        let normalized_position = normalized_perpendicular(
+            edge,
+            Point {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+            Rect {
+                x: f64::from(output.x),
+                y: f64::from(output.y),
+                width: output.width,
+                height: output.height,
+            },
+        );
+        self.entry_edge = None;
+        self.entered_at = None;
+        self.confirmations = 0;
+        Ok(Some(ControlEvent::LeaveRemote {
+            edge,
+            normalized_position,
+        }))
     }
 }
 

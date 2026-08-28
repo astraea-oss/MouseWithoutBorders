@@ -867,7 +867,7 @@ async fn run_linux_controller_session(
         tracing::info!(
             primary = %info.primary_output,
             outputs = info.outputs.len(),
-            "Linux receiver screen info"
+            "Linux node screen info"
         );
     }
 
@@ -990,7 +990,7 @@ async fn run_linux_controller_session(
                             tracing::warn!("Linux peer was silent; released active input direction");
                         }
                         Some(LivenessEvent::HardSessionTimeout) => {
-                            anyhow::bail!("Linux receiver stopped responding for five seconds");
+                            anyhow::bail!("Linux peer stopped responding for five seconds");
                         }
                         None => {}
                     }
@@ -1152,6 +1152,7 @@ async fn run_linux_controller_session(
                                 != Some(requested)
                                 && !coordinator.is_transitioning()
                             {
+                                input_epoch.suspend();
                                 pending_readiness = begin_connector_role_switch(
                                     requested,
                                     &local_fingerprint,
@@ -1180,6 +1181,7 @@ async fn run_linux_controller_session(
                                     capture.release(None).await.ok();
                                     capture.disarm().await.ok();
                                 }
+                                input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
                                 write_secure_frame_writer(
                                     &mut writer,
@@ -1269,6 +1271,11 @@ async fn run_linux_controller_session(
                                 && input_forwarding_enabled
                                 && !session_paused =>
                         {
+                            if input.event == InputEvent::AllKeysUp {
+                                input_epoch.suspend();
+                                injector.all_keys_up().await?;
+                                continue;
+                            }
                             if !input_epoch.accepts_input() {
                                 continue;
                             }
@@ -1277,6 +1284,7 @@ async fn run_linux_controller_session(
                             if is_motion
                                 && let Some(control) = return_watcher.release_if_at_edge().await?
                             {
+                                input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
                                 write_secure_frame_writer(
                                     &mut writer,
@@ -1345,6 +1353,7 @@ async fn run_linux_controller_session(
                                             capture.disarm().await?;
                                         }
                                     } else if !enabled {
+                                        input_epoch.suspend();
                                         injector.all_keys_up().await.ok();
                                     }
                                     if let Some(tray) = tray {
@@ -1369,6 +1378,7 @@ async fn run_linux_controller_session(
                                     != Some(controller_fingerprint.as_str())
                                 && !coordinator.is_transitioning()
                             {
+                                input_epoch.suspend();
                                 pending_readiness = begin_connector_role_switch(
                                     &controller_fingerprint,
                                     &local_fingerprint,
@@ -1503,6 +1513,7 @@ async fn run_linux_controller_session(
                                     capture.release(None).await.ok();
                                     capture.disarm().await.ok();
                                 }
+                                input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
                             } else if local_is_controller
                                 && input_forwarding_enabled
@@ -2305,8 +2316,8 @@ async fn handle_controller(
 
     let mut heartbeat_sequence = 0_u64;
     let liveness_config = LivenessConfig::default();
-    let mut heartbeat = time::interval(liveness_config.heartbeat_interval(true));
-    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
+    tokio::pin!(heartbeat);
     let mut connection_watchdog = time::interval(Duration::from_millis(250));
     connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut controller_liveness =
@@ -2345,6 +2356,7 @@ async fn handle_controller(
         failure_detail: None,
     };
     let mut local_is_controller = false;
+    let mut capture_input_active = false;
     let mut capture: Option<PortalCaptureBackend> = None;
     let mut prepared_role: Option<edge_protocol::RoleState> = None;
     let mut role_request_deadline: Option<tokio::time::Instant> = None;
@@ -2396,6 +2408,7 @@ async fn handle_controller(
                 }
                 match controller_liveness.poll(tokio::time::Instant::now()) {
                     Some(LivenessEvent::SoftInputTimeout) => {
+                        capture_input_active = false;
                         input_epoch.suspend();
                         backend.all_keys_up().await.ok();
                         if let Some(capture) = &capture {
@@ -2426,6 +2439,7 @@ async fn handle_controller(
                     Some(CaptureEvent::Activated { edge, normalized_position, .. })
                         if local_is_controller && input_forwarding_enabled && !session_paused =>
                     {
+                        capture_input_active = true;
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::control(role_epoch, ControlEvent::EnterRemote {
@@ -2448,6 +2462,7 @@ async fn handle_controller(
                         }
                     }
                     Some(CaptureEvent::Deactivated | CaptureEvent::EmergencyReleased) => {
+                        capture_input_active = false;
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::input(role_epoch, InputEvent::AllKeysUp),
@@ -2456,6 +2471,7 @@ async fn handle_controller(
                         .ok();
                     }
                     Some(CaptureEvent::LayoutChanged { .. }) => {
+                        capture_input_active = false;
                         if let Some(prepared) = prepared_role.take() {
                             role_request_deadline = None;
                             write_secure_frame_writer(
@@ -2494,7 +2510,7 @@ async fn handle_controller(
                     _ => {}
                 }
             }
-            _ = heartbeat.tick() => {
+            _ = &mut heartbeat => {
                 if let Some(transfer_id) = clipboard_sync.incoming.expire_transfer_id() {
                     tracing::warn!(transfer_id, "expired incomplete controller clipboard image");
                     write_secure_frame_writer(
@@ -2509,6 +2525,17 @@ async fn handle_controller(
                 heartbeat_sequence += 1;
                 write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
                 stats.heartbeats = stats.heartbeats.saturating_add(1);
+                let input_active = if local_is_controller {
+                    capture_input_active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                heartbeat.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + liveness_config.heartbeat_interval(
+                            input_active || prepared_role.is_some(),
+                        ),
+                );
             }
             _ = status_log.tick() => {
                 stats.log(log_path, "receiver");
@@ -2816,6 +2843,7 @@ async fn handle_controller(
                         let event = input.event;
                         if event == InputEvent::AllKeysUp {
                             stats.all_keys_up = stats.all_keys_up.saturating_add(1);
+                            input_epoch.suspend();
                             backend.all_keys_up().await?;
                             if let Some(tray) = tray {
                                 tray.input_event().await;
@@ -2842,6 +2870,7 @@ async fn handle_controller(
                                         log_path,
                                         format!("real cursor reached return edge: {control:?}"),
                                     );
+                                    input_epoch.suspend();
                                     backend.all_keys_up().await.ok();
                                     write_secure_frame_writer(
                                         &mut writer,
@@ -2889,6 +2918,8 @@ async fn handle_controller(
                             if controller_supports_input_toggle {
                                 input_forwarding_enabled = enabled;
                                 if !enabled {
+                                    capture_input_active = false;
+                                    input_epoch.suspend();
                                     backend.all_keys_up().await.ok();
                                     if let Some(capture) = &capture {
                                         capture.disarm().await.ok();
@@ -2920,6 +2951,7 @@ async fn handle_controller(
                                     edge,
                                     normalized_position,
                                 } => {
+                                    capture_input_active = false;
                                     write_secure_frame_writer(
                                         &mut writer,
                                         &Frame::input(role_epoch, InputEvent::AllKeysUp),
@@ -2935,6 +2967,7 @@ async fn handle_controller(
                                     }
                                 }
                                 ControlEvent::ReleaseToLocal { .. } => {
+                                    capture_input_active = false;
                                     if let Some(capture) = &capture {
                                         capture.release(None).await?;
                                     }
@@ -3150,6 +3183,7 @@ async fn handle_controller(
                                 .context("failed to mirror connector role state")?;
                         }
                         current_role_state = state.clone();
+                        capture_input_active = false;
                         prepared_role = None;
                         role_request_deadline = None;
                         if let Some(tray) = tray {
@@ -3197,6 +3231,7 @@ async fn handle_controller(
                             continue;
                         }
                         if local_is_controller {
+                            capture_input_active = false;
                             if let Some(capture) = &capture {
                                 capture.release(None).await.ok();
                                 capture.disarm().await.ok();
@@ -3208,6 +3243,7 @@ async fn handle_controller(
                             .await
                             .ok();
                         } else {
+                            input_epoch.suspend();
                             backend.all_keys_up().await.ok();
                         }
 
@@ -3265,6 +3301,7 @@ async fn handle_controller(
                             .context("failed to mirror committed role")?;
                         role_epoch = commit.role_epoch;
                         local_is_controller = controller == local_fingerprint;
+                        capture_input_active = false;
                         current_role_state = commit;
                         prepared_role = None;
                         role_request_deadline = None;
@@ -3324,11 +3361,13 @@ async fn handle_controller(
                     Frame::Role(RoleEvent::SetPaused { paused }) => {
                         session_paused = paused;
                         if paused {
+                            capture_input_active = false;
                             drop(audio_start_task.take());
                             audio_start_generation = audio_start_generation.wrapping_add(1);
                             if let Some(sender) = audio_sender.take() {
                                 sender.stop().await.ok();
                             }
+                            input_epoch.suspend();
                             backend.all_keys_up().await.ok();
                             if let Some(capture) = &capture {
                                 capture.disarm().await.ok();

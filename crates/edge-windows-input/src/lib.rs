@@ -8,12 +8,19 @@ use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
 use edge_protocol::{ControlEvent, Edge, InputEvent, OutputInfo, ReleaseReason, ScreenInfo};
 
+mod injection;
+pub use injection::WindowsInputInjector;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WindowsInputError {
     #[error("Windows input capture is only available on Windows")]
     UnsupportedPlatform,
     #[error("unmapped Windows scan code {scan_code:#x}, extended={extended}")]
     UnmappedKey { scan_code: u16, extended: bool },
+    #[error("unmapped evdev key code {evdev_code}")]
+    UnmappedEvdevKey { evdev_code: u16 },
+    #[error("Windows input injection error: {0}")]
+    Injection(String),
     #[error("Windows tray error: {0}")]
     Tray(String),
     #[error("Windows input capture is already running")]
@@ -54,7 +61,14 @@ pub enum WindowsTrayCommand {
     Reconnect,
     ToggleInputForwarding,
     ToggleAudio,
+    SetController(WindowsControllerChoice),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsControllerChoice {
+    Local,
+    Peer,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,6 +130,16 @@ pub fn screen_info() -> ScreenInfo {
 }
 
 #[cfg(windows)]
+pub fn cursor_position() -> Result<(i32, i32)> {
+    capture::cursor_position()
+}
+
+#[cfg(not(windows))]
+pub fn cursor_position() -> Result<(i32, i32)> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
 pub fn install_hooks() -> Result<()> {
     tracing::info!("Windows hook installation placeholder");
     Ok(())
@@ -163,6 +187,34 @@ pub fn update_tray_input_forwarding(enabled: bool) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn update_tray_input_forwarding(_enabled: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn update_tray_role(
+    local_name: &str,
+    peer_name: &str,
+    local_is_controller: bool,
+    available: bool,
+    switching: bool,
+) -> Result<()> {
+    tray::update_role(
+        local_name,
+        peer_name,
+        local_is_controller,
+        available,
+        switching,
+    )
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_role(
+    _local_name: &str,
+    _peer_name: &str,
+    _local_is_controller: bool,
+    _available: bool,
+    _switching: bool,
+) -> Result<()> {
     Ok(())
 }
 
@@ -616,12 +668,12 @@ mod capture {
             },
             WindowsAndMessaging::{
                 CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyCursor,
-                DispatchMessageW, GetClipCursor, GetForegroundWindow, GetMessageW,
-                GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLMHF_INJECTED,
-                MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM,
-                OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE,
-                OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, RegisterClassW, SPI_SETCURSORS,
-                SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
+                DispatchMessageW, GetClipCursor, GetCursorPos, GetForegroundWindow, GetMessageW,
+                GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND,
+                OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS,
+                OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, RegisterClassW,
+                SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
                 SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
                 WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
                 WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
@@ -631,6 +683,7 @@ mod capture {
         },
     };
 
+    use crate::injection::is_edge_kvm_injected;
     use crate::{
         CaptureConfig, CaptureStatsSnapshot, CapturedInput, ControlEvent, InputEvent, Result,
         WindowsInputError, map_key,
@@ -677,6 +730,17 @@ mod capture {
             }],
             primary_output: "Windows Virtual Desktop".to_string(),
         }
+    }
+
+    pub(super) fn cursor_position() -> Result<(i32, i32)> {
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return Err(WindowsInputError::Capture(format!(
+                "GetCursorPos failed with Win32 error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        Ok((point.x, point.y))
     }
     const INPUT_STALL_CONFIRMATIONS: u8 = 2;
     const INPUT_RESTART_COOLDOWN: Duration = Duration::from_secs(8);
@@ -1307,6 +1371,16 @@ mod capture {
         CAPTURE_STATS
             .mouse_hook_events
             .fetch_add(1, Ordering::Relaxed);
+        if is_edge_kvm_injected(mouse.dwExtraInfo) {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -1487,6 +1561,16 @@ mod capture {
         CAPTURE_STATS
             .keyboard_hook_events
             .fetch_add(1, Ordering::Relaxed);
+        if is_edge_kvm_injected(keyboard.dwExtraInfo) {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -1516,6 +1600,10 @@ mod capture {
         let message = wparam as u32;
         let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let up = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+        if keyboard.flags & LLKHF_INJECTED != 0 && state.active {
+            return 1;
+        }
 
         if !state.enabled {
             return unsafe {
@@ -2391,18 +2479,19 @@ mod tray {
                 Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu, CreateWindowExW,
-                DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_DISABLED,
-                MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-                TranslateMessage, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
-                WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateIcon, CreatePopupMenu,
+                CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+                DispatchMessageW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW,
+                MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, MF_STRING, MSG,
+                PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN,
+                TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+                WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+                WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
             },
         },
     };
 
-    use crate::{Result, WindowsInputError, WindowsTrayCommand};
+    use crate::{Result, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand};
 
     const TRAY_ID: u32 = 1;
     const WM_TRAY_ICON: u32 = WM_APP + 1;
@@ -2413,6 +2502,8 @@ mod tray {
     const ID_CONNECTION: usize = 1005;
     const ID_INPUT_FORWARDING: usize = 1006;
     const ID_PAIR: usize = 1007;
+    const ID_LOCAL_CONTROLLER: usize = 1008;
+    const ID_PEER_CONTROLLER: usize = 1009;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
@@ -2422,6 +2513,27 @@ mod tray {
     static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
     static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
     static TRAY_INPUT_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(true);
+    static TRAY_ROLE: Mutex<TrayRole> = Mutex::new(TrayRole::new());
+
+    struct TrayRole {
+        local_name: String,
+        peer_name: String,
+        local_is_controller: bool,
+        available: bool,
+        switching: bool,
+    }
+
+    impl TrayRole {
+        const fn new() -> Self {
+            Self {
+                local_name: String::new(),
+                peer_name: String::new(),
+                local_is_controller: true,
+                available: false,
+                switching: false,
+            }
+        }
+    }
 
     pub fn run(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
         unsafe {
@@ -2504,6 +2616,22 @@ mod tray {
         Ok(())
     }
 
+    pub fn update_role(
+        local_name: &str,
+        peer_name: &str,
+        local_is_controller: bool,
+        available: bool,
+        switching: bool,
+    ) -> Result<()> {
+        let mut role = TRAY_ROLE.lock().expect("tray role poisoned");
+        role.local_name = local_name.to_string();
+        role.peer_name = peer_name.to_string();
+        role.local_is_controller = local_is_controller;
+        role.available = available;
+        role.switching = switching;
+        Ok(())
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         message: u32,
@@ -2556,6 +2684,12 @@ mod tray {
             }
             ID_INPUT_FORWARDING => send_tray_command(WindowsTrayCommand::ToggleInputForwarding),
             ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
+            ID_LOCAL_CONTROLLER => send_tray_command(WindowsTrayCommand::SetController(
+                WindowsControllerChoice::Local,
+            )),
+            ID_PEER_CONTROLLER => send_tray_command(WindowsTrayCommand::SetController(
+                WindowsControllerChoice::Peer,
+            )),
             ID_QUIT => {
                 send_tray_command(WindowsTrayCommand::Quit);
                 remove_tray_icon(hwnd);
@@ -2648,7 +2782,7 @@ mod tray {
         let status = current_tray_status();
         let audio_status = current_audio_status();
         let settings = to_wide("Settings...");
-        let pair = to_wide("Pair or replace laptop...");
+        let pair = to_wide("Pair or replace peer...");
         let release = to_wide("Release control");
         let connection = to_wide(if TRAY_CONNECTED.load(Ordering::Relaxed) {
             "Disconnect"
@@ -2658,6 +2792,38 @@ mod tray {
         let audio = to_wide("Stream Linux audio");
         let input_forwarding = to_wide("Forward mouse and keyboard");
         let quit = to_wide("Quit");
+        let role = TRAY_ROLE.lock().expect("tray role poisoned");
+        let local_controller = to_wide(&format!(
+            "{} controls {}",
+            if role.local_name.is_empty() {
+                "This computer"
+            } else {
+                &role.local_name
+            },
+            if role.peer_name.is_empty() {
+                "Peer"
+            } else {
+                &role.peer_name
+            }
+        ));
+        let peer_controller = to_wide(&format!(
+            "{} controls {}",
+            if role.peer_name.is_empty() {
+                "Peer"
+            } else {
+                &role.peer_name
+            },
+            if role.local_name.is_empty() {
+                "this computer"
+            } else {
+                &role.local_name
+            }
+        ));
+        let role_enabled =
+            role.available && !role.switching && TRAY_CONNECTED.load(Ordering::Relaxed);
+        let role_disabled_flag = if role_enabled { 0 } else { MF_DISABLED };
+        let local_role_flags = MF_STRING | role_disabled_flag;
+        let peer_role_flags = MF_STRING | role_disabled_flag;
         let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
             MF_STRING | MF_CHECKED
         } else {
@@ -2677,6 +2843,30 @@ mod tray {
         unsafe {
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(
+                menu,
+                local_role_flags,
+                ID_LOCAL_CONTROLLER,
+                local_controller.as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                peer_role_flags,
+                ID_PEER_CONTROLLER,
+                peer_controller.as_ptr(),
+            );
+            CheckMenuRadioItem(
+                menu,
+                ID_LOCAL_CONTROLLER as u32,
+                ID_PEER_CONTROLLER as u32,
+                if role.local_is_controller {
+                    ID_LOCAL_CONTROLLER as u32
+                } else {
+                    ID_PEER_CONTROLLER as u32
+                },
+                MF_BYCOMMAND,
+            );
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
