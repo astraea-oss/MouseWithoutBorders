@@ -471,7 +471,7 @@ async fn connect_for_tray(
                 "Identity changed — pair again".to_string()
             } else if message.contains("pairing") || message.contains("not paired") {
                 "Pairing required on both computers".to_string()
-            } else if message.contains(UPGRADE_PEER_STATUS) {
+            } else if is_protocol_mismatch_message(&message) {
                 UPGRADE_PEER_STATUS.to_string()
             } else {
                 "Disconnected".to_string()
@@ -479,6 +479,13 @@ async fn connect_for_tray(
             (None, pairing_consumed, status)
         }
     }
+}
+
+fn is_protocol_mismatch_message(message: &str) -> bool {
+    message.contains(UPGRADE_PEER_STATUS)
+        || (message.contains("invalid_hello")
+            && message.contains("protocol version")
+            && message.contains("incompatible"))
 }
 
 fn append_portable_log(path: &Path, message: impl AsRef<str>) {
@@ -3033,6 +3040,19 @@ mod config_tests {
         };
         assert!(validate_receiver_hello(&hello, "actual").is_ok());
         assert!(validate_receiver_hello(&hello, "different").is_err());
+    }
+
+    #[test]
+    fn authenticated_v1_rejection_is_a_non_retrying_upgrade_error() {
+        assert!(is_protocol_mismatch_message(
+            "peer error: invalid_hello: controller protocol version 2 is incompatible with 1"
+        ));
+        assert!(is_protocol_mismatch_message(
+            "Upgrade the other computer: receiver protocol version 1 is incompatible with 2"
+        ));
+        assert!(!is_protocol_mismatch_message(
+            "peer error: invalid_hello: fingerprint mismatch"
+        ));
     }
 
     #[tokio::test]
