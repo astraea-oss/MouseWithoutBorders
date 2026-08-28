@@ -79,6 +79,14 @@ struct Args {
     pair: bool,
     #[arg(long)]
     test_input: Option<TestInput>,
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "left",
+        help = "Capture local input at an edge without connecting to a peer"
+    )]
+    test_capture: Option<TestCaptureEdge>,
     #[arg(long)]
     test_clipboard: bool,
     #[arg(long, help = "Exercise and restore the Linux audio routing path")]
@@ -95,6 +103,25 @@ enum TestInput {
     Click,
     Wheel,
     Key,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TestCaptureEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl From<TestCaptureEdge> for Edge {
+    fn from(edge: TestCaptureEdge) -> Self {
+        match edge {
+            TestCaptureEdge::Left => Self::Left,
+            TestCaptureEdge::Right => Self::Right,
+            TestCaptureEdge::Top => Self::Top,
+            TestCaptureEdge::Bottom => Self::Bottom,
+        }
+    }
 }
 
 #[tokio::main]
@@ -183,6 +210,11 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(edge) = args.test_capture {
+        run_capture_test(edge.into()).await?;
+        return Ok(());
+    }
+
     let backend = ReceiverBackend::from_config(&config)?;
 
     if let Some(test) = args.test_input {
@@ -207,6 +239,111 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         receiver_log,
     )
     .await
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CaptureCounts {
+    activations: u64,
+    pointer_motion: u64,
+    buttons: u64,
+    wheel: u64,
+    keyboard: u64,
+    all_keys_up: u64,
+    deactivations: u64,
+    layout_changes: u64,
+}
+
+#[cfg(target_os = "linux")]
+async fn run_capture_test(edge: Edge) -> Result<()> {
+    use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
+
+    let mut backend = PortalCaptureBackend::preflight(edge)
+        .await
+        .context("InputCapture portal preflight failed")?;
+    backend
+        .arm()
+        .await
+        .context("failed to arm the InputCapture portal")?;
+
+    println!(
+        "Capture armed on the {edge:?} edge (zone set {}). Cross the edge to test; Ctrl+Alt+Pause releases locally; Ctrl+C exits.",
+        backend.zone_set()
+    );
+    let mut counts = CaptureCounts::default();
+    let mut displayed = counts;
+    let mut status_tick = time::interval(Duration::from_secs(1));
+    status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+    let outcome = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = status_tick.tick() => {
+                if counts != displayed {
+                    println!(
+                        "events: activation={} motion={} button={} wheel={} keyboard={} release={} deactivation={} layout={}",
+                        counts.activations,
+                        counts.pointer_motion,
+                        counts.buttons,
+                        counts.wheel,
+                        counts.keyboard,
+                        counts.all_keys_up,
+                        counts.deactivations,
+                        counts.layout_changes,
+                    );
+                    displayed = counts;
+                }
+            }
+            event = backend.next_event() => {
+                match event {
+                    Some(CaptureEvent::Activated { .. }) => counts.activations += 1,
+                    Some(CaptureEvent::Input(InputEvent::PointerMotion { .. })) => {
+                        counts.pointer_motion += 1;
+                    }
+                    Some(CaptureEvent::Input(InputEvent::PointerButton { .. })) => {
+                        counts.buttons += 1;
+                    }
+                    Some(CaptureEvent::Input(InputEvent::PointerWheel { .. })) => {
+                        counts.wheel += 1;
+                    }
+                    Some(CaptureEvent::Input(InputEvent::Key { .. })) => {
+                        counts.keyboard += 1;
+                    }
+                    Some(CaptureEvent::Input(InputEvent::AllKeysUp)) => {
+                        counts.all_keys_up += 1;
+                    }
+                    Some(CaptureEvent::Deactivated) => counts.deactivations += 1,
+                    Some(CaptureEvent::EmergencyReleased) => {
+                        println!("Emergency release accepted locally; capture is no longer active.");
+                        break Ok(());
+                    }
+                    Some(CaptureEvent::LayoutChanged { .. }) => {
+                        counts.layout_changes += 1;
+                        if let Err(error) = backend.arm().await {
+                            break Err(anyhow::Error::new(error)
+                                .context("layout changed and capture could not be re-armed"));
+                        }
+                    }
+                    Some(CaptureEvent::BackendFailed(error)) => {
+                        break Err(anyhow::anyhow!("capture backend failed: {error}"));
+                    }
+                    None => break Err(anyhow::anyhow!("capture backend stopped unexpectedly")),
+                }
+            }
+        }
+    };
+
+    let cleanup = backend.disarm().await;
+    match (outcome, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(anyhow::Error::new(error).context("failed to disarm capture")),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_capture_test(_edge: Edge) -> Result<()> {
+    anyhow::bail!("--test-capture is available only on Linux")
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
