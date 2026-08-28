@@ -11,6 +11,13 @@ use tokio::{
     time::Instant,
 };
 
+mod role;
+
+pub use role::{
+    CommittedRole, InputDirectionCapabilities, RoleCoordinator, RoleDecision, RoleStateError,
+    RoleStore, select_initial_controller, validate_commit, validate_prepare,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error(transparent)]

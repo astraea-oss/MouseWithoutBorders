@@ -19,7 +19,14 @@ pub enum TrayCommand {
     Reconnect,
     ToggleInputForwarding,
     ToggleAudio,
+    SetController(ControllerChoice),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerChoice {
+    Local,
+    Peer,
 }
 
 #[derive(Clone)]
@@ -47,6 +54,11 @@ impl ReceiverTrayHandle {
             clipboard_events: 0,
             input_forwarding_enabled: true,
             audio_available: true,
+            local_device_name: None,
+            peer_device_name: None,
+            local_is_controller: true,
+            role_switch_available: false,
+            role_switching: false,
             last_error: None,
             command_tx,
         };
@@ -148,9 +160,53 @@ impl ReceiverTrayHandle {
             .await;
     }
 
+    pub async fn session_paused(&self, paused: bool) {
+        self.update(move |tray| {
+            tray.state = if paused {
+                TrayState::Paused
+            } else {
+                TrayState::Connected
+            };
+            tray.role_switching = false;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
     pub async fn audio_available(&self, available: bool) {
         self.update(move |tray| tray.audio_available = available)
             .await;
+    }
+
+    pub async fn role_assignment(
+        &self,
+        local_device_name: String,
+        peer_device_name: String,
+        local_is_controller: bool,
+        available: bool,
+    ) {
+        self.update(|tray| {
+            tray.local_device_name = Some(local_device_name);
+            tray.peer_device_name = Some(peer_device_name);
+            tray.local_is_controller = local_is_controller;
+            tray.role_switch_available = available;
+            tray.role_switching = false;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
+    pub async fn role_switching(&self, switching: bool) {
+        self.update(move |tray| tray.role_switching = switching)
+            .await;
+    }
+
+    pub async fn role_failure(&self, error: String) {
+        self.update(|tray| {
+            tray.role_switching = false;
+            tray.last_error = Some(error);
+        })
+        .await;
     }
 
     pub async fn error(&self, error: String) {
@@ -204,6 +260,11 @@ pub struct ReceiverTray {
     clipboard_events: u64,
     input_forwarding_enabled: bool,
     audio_available: bool,
+    local_device_name: Option<String>,
+    peer_device_name: Option<String>,
+    local_is_controller: bool,
+    role_switch_available: bool,
+    role_switching: bool,
     last_error: Option<String>,
     command_tx: mpsc::UnboundedSender<TrayCommand>,
 }
@@ -298,6 +359,7 @@ impl ksni::Tray for ReceiverTray {
             .into(),
         );
         items.push(self.connection_item());
+        items.push(self.controller_items());
         items.push(
             CheckmarkItem {
                 label: "Forward mouse and keyboard".to_string(),
@@ -355,6 +417,40 @@ impl ksni::Tray for ReceiverTray {
 }
 
 impl ReceiverTray {
+    fn controller_items(&self) -> ksni::MenuItem<Self> {
+        use ksni::menu::{RadioGroup, RadioItem};
+
+        let local = self.local_device_name.as_deref().unwrap_or("This computer");
+        let peer = self.peer_device_name.as_deref().unwrap_or("Peer");
+        let enabled = self.state == TrayState::Connected
+            && self.role_switch_available
+            && !self.role_switching;
+        RadioGroup {
+            selected: usize::from(!self.local_is_controller),
+            select: Box::new(|tray: &mut Self, selected| {
+                let choice = if selected == 0 {
+                    ControllerChoice::Local
+                } else {
+                    ControllerChoice::Peer
+                };
+                let _ = tray.command_tx.send(TrayCommand::SetController(choice));
+            }),
+            options: vec![
+                RadioItem {
+                    label: format!("{local} controls {peer}"),
+                    enabled,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: format!("{peer} controls {local}"),
+                    enabled,
+                    ..Default::default()
+                },
+            ],
+        }
+        .into()
+    }
+
     fn connection_item(&self) -> ksni::MenuItem<Self> {
         use ksni::menu::StandardItem;
 
@@ -515,6 +611,11 @@ mod tests {
             clipboard_events: 3,
             input_forwarding_enabled: true,
             audio_available: true,
+            local_device_name: Some("Desk".to_string()),
+            peer_device_name: Some("Studio".to_string()),
+            local_is_controller: true,
+            role_switch_available: true,
+            role_switching: false,
             last_error: last_error.map(str::to_string),
             command_tx,
         }
@@ -548,7 +649,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 16);
+        assert_eq!(expected.len(), 17);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);
@@ -609,7 +710,7 @@ mod tests {
         let mut connected = test_tray(TrayState::Connected, None);
         connected.input_forwarding_enabled = false;
         let menu = connected.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[13] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert_eq!(toggle.label, "Forward mouse and keyboard");
@@ -618,9 +719,31 @@ mod tests {
 
         let listening = test_tray(TrayState::Listening, None);
         let menu = listening.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[13] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert!(!toggle.enabled);
+    }
+
+    #[test]
+    fn role_actions_use_device_names_and_committed_selection() {
+        let tray = test_tray(TrayState::Connected, None);
+        let menu = tray.menu();
+        let ksni::MenuItem::RadioGroup(roles) = &menu[12] else {
+            panic!("role actions are not a radio group");
+        };
+        assert_eq!(roles.selected, 0);
+        assert_eq!(roles.options[0].label, "Desk controls Studio");
+        assert_eq!(roles.options[1].label, "Studio controls Desk");
+        assert!(roles.options.iter().all(|option| option.enabled));
+
+        let mut switching = test_tray(TrayState::Connected, None);
+        switching.local_is_controller = false;
+        switching.role_switching = true;
+        let ksni::MenuItem::RadioGroup(roles) = &switching.menu()[12] else {
+            panic!("role actions are not a radio group");
+        };
+        assert_eq!(roles.selected, 1);
+        assert!(roles.options.iter().all(|option| !option.enabled));
     }
 }

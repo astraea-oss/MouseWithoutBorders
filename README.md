@@ -65,6 +65,14 @@ Linux computer. Pair from both tray menus. Linux-to-Linux audio is shown as
 unavailable because Linux playback is not implemented; input and clipboard are
 independent of audio.
 
+Once connected, right-click either tray and select which named computer should
+control the other. The connector serializes the handover, releases held input,
+and changes direction without reconnecting. Only a completed selection is saved
+to portable `state/role.toml`; `preferred_role` remains the fresh-pair default
+and is never rewritten. `Disconnect` pauses input and clipboard on both Linux
+nodes while retaining the encrypted control channel, and `Reconnect` resumes it
+from either tray.
+
 Linux audio streaming uses the PipeWire-Pulse command-line tools `pactl` and
 `parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside
 `pipewire-pulse`. Verify routing without a Windows connection:
