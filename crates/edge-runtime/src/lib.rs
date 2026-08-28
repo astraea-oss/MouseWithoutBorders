@@ -288,7 +288,9 @@ mod tests {
     use edge_crypto::{
         IdentityKey, PinStatus, PinStore, accept_noise_session, initiate_noise_session,
     };
-    use edge_protocol::{Heartbeat, Hello, MouseButton, OutputInfo, PROTOCOL_VERSION};
+    use edge_protocol::{
+        Heartbeat, Hello, INITIAL_ROLE_EPOCH, MouseButton, OutputInfo, PROTOCOL_VERSION,
+    };
 
     #[derive(Default)]
     struct FakeCapture {
@@ -409,12 +411,12 @@ mod tests {
         assert!(!gate.accepts_input());
         gate.observe_control(&ControlEvent::LeaveRemote {
             edge: Edge::Right,
-            normalized_y: 0.5,
+            normalized_position: 0.5,
         });
         assert!(!gate.accepts_input());
         gate.observe_control(&ControlEvent::EnterRemote {
             edge: Edge::Left,
-            normalized_y: 0.5,
+            normalized_position: 0.5,
         });
         assert!(gate.accepts_input());
     }
@@ -514,6 +516,7 @@ mod tests {
                     public_key_fingerprint: connector_identity.fingerprint(),
                     capabilities: Vec::new(),
                     extensions: Vec::new(),
+                    node_capabilities: Vec::new(),
                 }))
                 .await
                 .unwrap();
@@ -522,17 +525,23 @@ mod tests {
                 Frame::ScreenInfo(_)
             ));
             session
-                .write(&Frame::Control(ControlEvent::EnterRemote {
-                    edge: Edge::Left,
-                    normalized_y: 0.5,
-                }))
+                .write(&Frame::control(
+                    INITIAL_ROLE_EPOCH,
+                    ControlEvent::EnterRemote {
+                        edge: Edge::Left,
+                        normalized_position: 0.5,
+                    },
+                ))
                 .await
                 .unwrap();
             session
-                .write(&Frame::Input(InputEvent::Key {
-                    evdev_code: 30,
-                    down: true,
-                }))
+                .write(&Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: true,
+                    },
+                ))
                 .await
                 .unwrap();
             session
@@ -544,7 +553,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(session.read().await.unwrap(), Frame::Heartbeat(_)));
             session
-                .write(&Frame::Input(InputEvent::AllKeysUp))
+                .write(&Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp))
                 .await
                 .unwrap();
         });
@@ -568,7 +577,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 session.read().await.unwrap(),
-                Frame::Input(InputEvent::AllKeysUp)
+                Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp)
             );
         });
 

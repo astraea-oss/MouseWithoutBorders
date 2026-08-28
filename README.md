@@ -60,7 +60,12 @@ Useful checks:
 ```bash
 cargo run -p edge-receiver-linux -- --test-clipboard
 cargo run -p edge-receiver-linux -- --test-input pointer
+cargo run -p edge-receiver-linux -- --test-capture left
 ```
+
+The capture check uses the desktop InputCapture portal and reports event counts
+without printing key codes or typed text. Cross the selected edge to activate
+it; `Ctrl+Alt+Pause` releases capture locally even without a peer.
 
 With `[clipboard].enabled = true`, connected devices automatically synchronize
 text clipboard changes in both directions. With `images_enabled = true`, static
@@ -83,7 +88,7 @@ max_image_bytes = 4194304
 Multiple copied files, arbitrary files, and file paths themselves are
 intentionally not transferred.
 
-With `input.backend = "auto"`, `--test-input` uses `uinput` in a Niri session so
+With `input.inject.backend = "auto"`, `--test-input` uses `uinput` in a Niri session so
 synthetic keys pass through Niri's normal compositor-shortcut path. On Hyprland
 this is normally the Wayland virtual input backend. Set the backend to `uinput`
 to require `/dev/uinput`, or to `log` when testing only the encrypted protocol
@@ -114,10 +119,12 @@ controller.toml
 state\
 ```
 
-Edit `controller.toml` in that same folder and set `[peer.laptop].host` to the Linux laptop IP. Nothing is written to `%APPDATA%` unless you explicitly set `EDGE_KVM_CONFIG` or `EDGE_KVM_STATE_DIR` there yourself.
+Edit `controller.toml` in that same folder and set `[peer].host` to the Linux
+computer's IP. Nothing is written to `%APPDATA%` unless you explicitly set
+`EDGE_KVM_CONFIG` or `EDGE_KVM_STATE_DIR` there yourself.
 
 The tray icon opens Settings with a left-click and shows its menu with a
-right-click. `input.game_compatibility` controls edge switching while a game is
+right-click. `input.capture.game_compatibility` controls edge switching while a game is
 focused: `always-enabled` (default), `borderless`, or `compatible`. Active
 remote mouse movement uses Windows Raw Input so games cannot distort the
 forwarded relative motion. Uncheck `Forward mouse and keyboard` in either tray
@@ -139,6 +146,11 @@ shown with an additional warning. For scripted startup, `--pair` arms the same
 one-shot confirmation flow; it no longer trusts the next key automatically.
 
 On non-Windows hosts, use `--dry-run` to validate config and the initial protocol hello.
+
+The protocol-v2 upgrade is a deliberate two-computer update. On first startup,
+an old config is rewritten to the role-neutral schema after an exact adjacent
+`*.v1.bak` copy is created. A mixed v1/v2 pair reports `Upgrade the other
+computer`; it does not retry in a tight reconnect loop.
 
 To verify Windows playback without Linux, run:
 

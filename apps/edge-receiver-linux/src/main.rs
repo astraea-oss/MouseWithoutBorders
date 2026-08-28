@@ -19,8 +19,8 @@ use edge_clipboard::{
     IncomingImageTransfer, OutgoingImageTransfer,
 };
 use edge_common::{
-    AppConfig, AudioLocalPlayback, Role, default_state_dir, detect_primary_local_ip, init_tracing,
-    portable_config_path,
+    AppConfig, AudioLocalPlayback, Role, TransportMode, default_state_dir, detect_primary_local_ip,
+    init_tracing, portable_config_path,
 };
 use edge_crypto::{
     IdentityKey, NoiseSession, PinStatus, PinStore, accept_noise_session, pairing_code,
@@ -32,11 +32,11 @@ use edge_linux_input::{
     write_clipboard_text,
 };
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, Capability,
-    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
-    INPUT_TOGGLE_EXTENSION, InputEvent, OutputInfo, PAIRING_CONFIRMATION_EXTENSION,
-    PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError, ScreenInfo, decode_frame,
-    encode_frame,
+    AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason,
+    ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH,
+    INPUT_TOGGLE_EXTENSION, InputEvent, NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION,
+    PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError, RoleEvent, ScreenInfo,
+    decode_frame, encode_frame,
 };
 use edge_runtime::{
     InputEpochGate, LivenessConfig, LivenessEvent, LivenessTracker, SecureFrameReader,
@@ -175,9 +175,9 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let config = load_or_create_config(&config_path).await?;
 
-    if config.role != Role::Receiver {
+    if config.transport != TransportMode::Listen {
         anyhow::bail!(
-            "receiver requires role = \"receiver\" in {}",
+            "receiver requires transport = \"listen\" in {}",
             config_path.display()
         );
     }
@@ -347,36 +347,8 @@ async fn run_capture_test(_edge: Edge) -> Result<()> {
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
-    match AppConfig::load(path).await {
-        Ok(mut config) => {
-            let text = tokio::fs::read_to_string(path).await.with_context(|| {
-                format!("failed to inspect receiver config at {}", path.display())
-            })?;
-            let has_image_setting = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("images_enabled"));
-            let has_text_only = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("text_only"));
-            if !has_image_setting {
-                config.clipboard.images_enabled = true;
-                config.clipboard.max_image_bytes = 4 * 1024 * 1024;
-            }
-            if !has_image_setting || has_text_only {
-                config.save(path).await.with_context(|| {
-                    format!(
-                        "failed to migrate receiver clipboard config at {}",
-                        path.display()
-                    )
-                })?;
-                tracing::info!(
-                    path = %path.display(),
-                    images_enabled = config.clipboard.images_enabled,
-                    "migrated legacy receiver clipboard config"
-                );
-            }
-            Ok(config)
-        }
+    match AppConfig::load_migrating(path).await {
+        Ok(config) => Ok(config),
         Err(edge_common::CommonError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -641,13 +613,19 @@ async fn run_receiver(
             &Frame::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
                 device_name: config.device_name.clone(),
-                role: Role::Receiver,
+                role: config.preferred_role,
                 public_key_fingerprint: identity.fingerprint(),
-                capabilities: vec![Capability::AudioV1],
+                capabilities: Vec::new(),
                 extensions: vec![
                     CLIPBOARD_IMAGE_EXTENSION.to_string(),
                     INPUT_TOGGLE_EXTENSION.to_string(),
                     PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                ],
+                node_capabilities: vec![
+                    NodeCapability::InputCaptureV1,
+                    NodeCapability::InputInjectV1,
+                    NodeCapability::ScreenInfoBothSidesV1,
+                    NodeCapability::AudioCaptureV1,
                 ],
             }),
         )
@@ -773,7 +751,9 @@ async fn run_receiver(
             tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
                 .await;
         }
-        let controller_supports_audio = hello.capabilities.contains(&Capability::AudioV1);
+        let controller_supports_audio = hello
+            .node_capabilities
+            .contains(&NodeCapability::AudioPlaybackV1);
         let controller_supports_input_toggle = hello
             .extensions
             .iter()
@@ -783,7 +763,7 @@ async fn run_receiver(
             .iter()
             .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
 
-        let requested_monitor = config.monitor.as_deref().unwrap_or_default();
+        let requested_monitor = config.input.inject.output.as_str();
         let screen_info = match hyprland_screen_info(requested_monitor).await {
             Ok(info) => {
                 write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
@@ -820,6 +800,7 @@ async fn run_receiver(
             controller_supports_audio,
             controller_supports_input_toggle,
             controller_supports_images,
+            &peer_fingerprint,
         )
         .await
         {
@@ -957,13 +938,10 @@ async fn recv_clipboard_change(
 fn validate_controller_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
     if hello.protocol_version != PROTOCOL_VERSION {
         anyhow::bail!(
-            "controller protocol version {} is incompatible with {}",
+            "Upgrade the other computer: controller protocol version {} is incompatible with {}",
             hello.protocol_version,
             PROTOCOL_VERSION
         );
-    }
-    if hello.role != Role::Controller {
-        anyhow::bail!("connected peer did not identify itself as a controller");
     }
     if hello.public_key_fingerprint != noise_fingerprint {
         anyhow::bail!("controller hello fingerprint does not match its encrypted identity");
@@ -1022,6 +1000,7 @@ async fn handle_controller(
     controller_supports_audio: bool,
     controller_supports_input_toggle: bool,
     controller_supports_images: bool,
+    controller_fingerprint: &str,
 ) -> Result<ControllerSessionExit> {
     let mut heartbeat_sequence = 0_u64;
     let liveness_config = LivenessConfig::default();
@@ -1051,6 +1030,7 @@ async fn handle_controller(
     let mut audio_start_generation = 0_u64;
     let mut audio_requested = config.audio.enabled;
     let mut input_forwarding_enabled = true;
+    let mut role_epoch = INITIAL_ROLE_EPOCH;
     if let Some(tray) = tray {
         tray.input_forwarding(true).await;
     }
@@ -1081,7 +1061,7 @@ async fn handle_controller(
                         append_portable_log(log_path, "controller liveness soft timeout; released injected input and suspended stale frames");
                         write_secure_frame_writer(
                             &mut writer,
-                            &Frame::Control(ControlEvent::ReleaseToLocal {
+                            &Frame::control(role_epoch, ControlEvent::ReleaseToLocal {
                                 reason: ReleaseReason::HeartbeatTimeout,
                             }),
                         )
@@ -1197,7 +1177,7 @@ async fn handle_controller(
                         backend.all_keys_up().await.ok();
                         write_secure_frame_writer(
                             &mut writer,
-                            &Frame::Control(ControlEvent::ReleaseToLocal {
+                            &Frame::control(role_epoch, ControlEvent::ReleaseToLocal {
                                 reason: ReleaseReason::UserRequest,
                             }),
                         )
@@ -1226,7 +1206,7 @@ async fn handle_controller(
                         if controller_supports_input_toggle {
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::Control(ControlEvent::SetInputForwarding {
+                                &Frame::control(role_epoch, ControlEvent::SetInputForwarding {
                                     enabled: input_forwarding_enabled,
                                 }),
                             )
@@ -1234,7 +1214,7 @@ async fn handle_controller(
                         } else if !input_forwarding_enabled {
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::Control(ControlEvent::ReleaseToLocal {
+                                &Frame::control(role_epoch, ControlEvent::ReleaseToLocal {
                                     reason: ReleaseReason::BackendFailure,
                                 }),
                             )
@@ -1312,14 +1292,23 @@ async fn handle_controller(
                 controller_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 writer.record_received(&frame);
                 match frame {
-                    Frame::Input(InputEvent::AllKeysUp) => {
-                        stats.all_keys_up = stats.all_keys_up.saturating_add(1);
-                        backend.all_keys_up().await?;
-                        if let Some(tray) = tray {
-                            tray.input_event().await;
+                    Frame::Input(input) => {
+                        if input.role_epoch != role_epoch {
+                            tracing::debug!(
+                                role_epoch = input.role_epoch,
+                                "ignored input from a stale role epoch"
+                            );
+                            continue;
                         }
-                    }
-                    Frame::Input(event) => {
+                        let event = input.event;
+                        if event == InputEvent::AllKeysUp {
+                            stats.all_keys_up = stats.all_keys_up.saturating_add(1);
+                            backend.all_keys_up().await?;
+                            if let Some(tray) = tray {
+                                tray.input_event().await;
+                            }
+                            continue;
+                        }
                         if !input_forwarding_enabled {
                             tracing::trace!(?event, "ignored input while forwarding is disabled");
                             continue;
@@ -1341,7 +1330,11 @@ async fn handle_controller(
                                         format!("real cursor reached return edge: {control:?}"),
                                     );
                                     backend.all_keys_up().await.ok();
-                                    write_secure_frame_writer(&mut writer, &Frame::Control(control)).await?;
+                                    write_secure_frame_writer(
+                                        &mut writer,
+                                        &Frame::control(role_epoch, control),
+                                    )
+                                    .await?;
                                 }
                                 Ok(None) => {}
                                 Err(err) => tracing::warn!(%err, "failed to check Hyprland cursor position"),
@@ -1367,26 +1360,35 @@ async fn handle_controller(
                         }
                     }
                     Frame::Heartbeat(_) => {}
-                    Frame::Control(ControlEvent::SetInputForwarding { enabled }) => {
-                        if controller_supports_input_toggle {
-                            input_forwarding_enabled = enabled;
-                            if !enabled {
-                                backend.all_keys_up().await.ok();
-                            }
-                            return_watcher.record_control(
-                                &ControlEvent::SetInputForwarding { enabled },
-                            );
-                            if let Some(tray) = tray {
-                                tray.input_forwarding(enabled).await;
-                            }
-                            stats.control = stats.control.saturating_add(1);
-                            append_portable_log(
-                                log_path,
-                                format!("controller set input forwarding to {enabled}"),
-                            );
-                        }
-                    }
                     Frame::Control(control) => {
+                        if control.role_epoch != role_epoch {
+                            tracing::debug!(
+                                role_epoch = control.role_epoch,
+                                "ignored control from a stale role epoch"
+                            );
+                            continue;
+                        }
+                        let control = control.event;
+                        if let ControlEvent::SetInputForwarding { enabled } = control {
+                            if controller_supports_input_toggle {
+                                input_forwarding_enabled = enabled;
+                                if !enabled {
+                                    backend.all_keys_up().await.ok();
+                                }
+                                return_watcher.record_control(
+                                    &ControlEvent::SetInputForwarding { enabled },
+                                );
+                                if let Some(tray) = tray {
+                                    tray.input_forwarding(enabled).await;
+                                }
+                                stats.control = stats.control.saturating_add(1);
+                                append_portable_log(
+                                    log_path,
+                                    format!("controller set input forwarding to {enabled}"),
+                                );
+                            }
+                            continue;
+                        }
                         input_epoch.observe_control(&control);
                         stats.control = stats.control.saturating_add(1);
                         return_watcher.record_control(&control);
@@ -1401,9 +1403,12 @@ async fn handle_controller(
                             );
                             write_secure_frame_writer(
                                 &mut writer,
-                                &Frame::Control(ControlEvent::ReleaseToLocal {
-                                    reason: ReleaseReason::BackendFailure,
-                                }),
+                                &Frame::control(
+                                    role_epoch,
+                                    ControlEvent::ReleaseToLocal {
+                                        reason: ReleaseReason::BackendFailure,
+                                    },
+                                ),
                             )
                             .await?;
                         }
@@ -1538,10 +1543,44 @@ async fn handle_controller(
                         .await?;
                     }
                     Frame::Audio(AudioControl::State { .. } | AudioControl::Offer { .. }) => {}
-                    Frame::Hello(_)
-                    | Frame::ScreenInfo(_)
-                    | Frame::Error(_)
-                    | Frame::Pairing(_) => {}
+                    Frame::Role(RoleEvent::SessionState(state)) => {
+                        if state.controller_fingerprint.as_deref()
+                            != Some(controller_fingerprint)
+                        {
+                            anyhow::bail!(
+                                "connector role state names a controller other than its authenticated identity"
+                            );
+                        }
+                        if state.role_epoch == 0 {
+                            anyhow::bail!("connector sent invalid zero role epoch");
+                        }
+                        role_epoch = state.role_epoch;
+                        input_forwarding_enabled = !state.paused;
+                        if state.paused {
+                            input_epoch.suspend();
+                            backend.all_keys_up().await.ok();
+                        }
+                        if let Some(tray) = tray {
+                            tray.input_forwarding(input_forwarding_enabled).await;
+                        }
+                        tracing::info!(
+                            role_epoch,
+                            listener_position = ?state.listener_position,
+                            paused = state.paused,
+                            "adopted connector-authoritative session state"
+                        );
+                    }
+                    Frame::Role(event) => {
+                        tracing::warn!(?event, "role transition ignored until role switching is enabled");
+                    }
+                    Frame::ScreenInfo(info) => {
+                        tracing::info!(
+                            primary = %info.primary_output,
+                            outputs = info.outputs.len(),
+                            "controller screen info"
+                        );
+                    }
+                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) => {}
                 }
             },
             _ = clipboard_send.tick(), if clipboard_sync.outgoing.is_some() => {
@@ -2090,7 +2129,7 @@ impl ReceiverBackend {
     }
 
     fn from_config(config: &AppConfig) -> Result<Self> {
-        let requested = config.input.backend.to_ascii_lowercase();
+        let requested = config.input.inject.backend.to_ascii_lowercase();
         let libei = LibeiBackend::probe();
 
         match requested.as_str() {
@@ -2249,6 +2288,7 @@ mod tests {
             public_key_fingerprint: "actual".to_string(),
             capabilities: Vec::new(),
             extensions: Vec::new(),
+            node_capabilities: Vec::new(),
         };
         assert!(validate_controller_hello(&hello, "actual").is_ok());
         assert!(validate_controller_hello(&hello, "different").is_err());
@@ -2258,7 +2298,7 @@ mod tests {
     fn disabled_input_releases_a_legacy_controller_on_each_remote_entry() {
         let enter = ControlEvent::EnterRemote {
             edge: Edge::Left,
-            normalized_y: 0.5,
+            normalized_position: 0.5,
         };
 
         assert!(should_release_legacy_controller(false, false, &enter));

@@ -6,7 +6,7 @@ use edge_clipboard::{CanonicalImage, ClipboardItem};
 use edge_common::{ClipboardConfig, GameCompatibilityMode};
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
-use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
+use edge_protocol::{ControlEvent, Edge, InputEvent, OutputInfo, ReleaseReason, ScreenInfo};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WindowsInputError {
@@ -108,6 +108,11 @@ pub fn start_capture(config: CaptureConfig) -> Result<mpsc::Receiver<CapturedInp
 #[cfg(not(windows))]
 pub fn start_capture(_config: CaptureConfig) -> Result<mpsc::Receiver<CapturedInput>> {
     Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
+pub fn screen_info() -> ScreenInfo {
+    capture::screen_info()
 }
 
 #[cfg(windows)]
@@ -658,6 +663,21 @@ mod capture {
     const GAME_GUARD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
     const RELEASE_REENTRY_COOLDOWN: Duration = Duration::from_millis(750);
     const INPUT_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+
+    pub(super) fn screen_info() -> crate::ScreenInfo {
+        let bounds = LocalBounds::query();
+        crate::ScreenInfo {
+            outputs: vec![crate::OutputInfo {
+                name: "Windows Virtual Desktop".to_string(),
+                width: bounds.width.max(1) as u32,
+                height: bounds.height.max(1) as u32,
+                scale: 1.0,
+                x: bounds.left,
+                y: bounds.top,
+            }],
+            primary_output: "Windows Virtual Desktop".to_string(),
+        }
+    }
     const INPUT_STALL_CONFIRMATIONS: u8 = 2;
     const INPUT_RESTART_COOLDOWN: Duration = Duration::from_secs(8);
     const FULLSCREEN_TOLERANCE_PX: i32 = 2;
@@ -1663,7 +1683,7 @@ mod capture {
             self.raw_absolute_position = None;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
-                normalized_y: self.normalized_perpendicular(point),
+                normalized_position: self.normalized_perpendicular(point),
             });
             unsafe {
                 SetCursorPos(self.anchor.x, self.anchor.y);

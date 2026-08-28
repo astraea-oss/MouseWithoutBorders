@@ -20,21 +20,21 @@ use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
     IncomingImageTransfer, OutgoingImageTransfer,
 };
-#[cfg(windows)]
 use edge_common::PeerPosition;
 use edge_common::{
-    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
+    AppConfig, Role, TransportMode, default_state_dir, detect_primary_local_ip, init_tracing,
+    portable_config_path,
 };
 use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session, pairing_code};
 #[cfg(windows)]
 use edge_geometry::Size;
-#[cfg(windows)]
 use edge_protocol::Edge;
 use edge_protocol::{
     AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello,
-    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PAIRING_CONFIRMATION_EXTENSION,
-    PROTOCOL_VERSION, PairingEvent, ScreenInfo, decode_frame, encode_frame,
+    ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello,
+    INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, NodeCapability,
+    PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent, RoleState,
+    RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_runtime::{
     LivenessConfig, LivenessEvent, LivenessTracker, SecureFrameReader, SecureFrameSession,
@@ -63,6 +63,7 @@ const FALLBACK_REMOTE_SIZE: Size = Size {
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIPBOARD_PASTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+const UPGRADE_PEER_STATUS: &str = "Upgrade the other computer";
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows controller for edge-kvm")]
@@ -121,10 +122,16 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let mut config = load_or_create_config(&config_path).await?;
 
-    if config.role != Role::Controller {
+    if config.transport != TransportMode::Connect {
         anyhow::bail!(
-            "controller requires role = \"controller\" in {}",
+            "controller requires transport = \"connect\" in {}",
             config_path.display()
+        );
+    }
+    if !config.input.capture.output.trim().is_empty() {
+        tracing::warn!(
+            output = %config.input.capture.output,
+            "input.capture.output is Linux-only; Windows keeps using the full virtual desktop"
         );
     }
 
@@ -159,7 +166,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             if connection.is_some() || pairing_consumed {
                 pairing_armed = false;
             }
-            let mut connection_enabled = true;
+            let mut connection_enabled = connect_status != UPGRADE_PEER_STATUS;
             let mut input_forwarding_enabled = true;
             let mut next_connect_attempt = if connection.is_some() {
                 Instant::now()
@@ -268,7 +275,9 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         active_connection,
                         &config,
                         screen_info.screen_info,
-                        screen_info.capabilities.contains(&Capability::AudioV1),
+                        screen_info
+                            .node_capabilities
+                            .contains(&NodeCapability::AudioCaptureV1),
                         screen_info
                             .extensions
                             .iter()
@@ -350,7 +359,11 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                     pairing_armed = false;
                 }
                 if connection.is_none() {
-                    next_connect_attempt = Instant::now() + Duration::from_secs(2);
+                    if connect_status == UPGRADE_PEER_STATUS {
+                        connection_enabled = false;
+                    } else {
+                        next_connect_attempt = Instant::now() + Duration::from_secs(2);
+                    }
                 }
                 let status = connection
                     .as_ref()
@@ -400,7 +413,9 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             connection,
             &config,
             initial_receiver.screen_info,
-            initial_receiver.capabilities.contains(&Capability::AudioV1),
+            initial_receiver
+                .node_capabilities
+                .contains(&NodeCapability::AudioCaptureV1),
             initial_receiver
                 .extensions
                 .iter()
@@ -464,6 +479,8 @@ async fn connect_for_tray(
                 "Identity changed — pair again".to_string()
             } else if message.contains("pairing") || message.contains("not paired") {
                 "Pairing required on both computers".to_string()
+            } else if message.contains(UPGRADE_PEER_STATUS) {
+                UPGRADE_PEER_STATUS.to_string()
             } else {
                 "Disconnected".to_string()
             };
@@ -595,12 +612,10 @@ fn handle_pending_windows_tray_commands(
 
 #[cfg(windows)]
 fn controller_pairing_state(config: &AppConfig) -> PairingUiState {
-    if let Some(peer) = &config.peer.laptop
-        && !peer.pinned_fingerprint.trim().is_empty()
-    {
+    if !config.peer.pinned_fingerprint.trim().is_empty() {
         return PairingUiState::Paired {
-            peer_name: "laptop".to_string(),
-            peer_fingerprint: peer.pinned_fingerprint.clone(),
+            peer_name: config.peer.name.clone(),
+            peer_fingerprint: config.peer.pinned_fingerprint.clone(),
         };
     }
 
@@ -656,7 +671,7 @@ async fn connect_and_initialize(
 
     let mut initial = InitialReceiverState {
         screen_info: None,
-        capabilities: hello.capabilities.clone(),
+        node_capabilities: hello.node_capabilities.clone(),
         extensions: hello.extensions.clone(),
     };
     let supports_confirmation = hello
@@ -689,11 +704,7 @@ async fn connect_and_initialize(
 
             #[cfg(windows)]
             update_windows_tray_status("Pairing: compare the code on both computers", log_path);
-            let peer = config
-                .peer
-                .laptop
-                .as_ref()
-                .context("missing [peer.laptop] config")?;
+            let peer = &config.peer;
             let previous_peer_fingerprint = (!peer.pinned_fingerprint.is_empty()
                 && peer.pinned_fingerprint != connection.peer_fingerprint)
                 .then(|| peer.pinned_fingerprint.clone());
@@ -730,12 +741,7 @@ async fn connect_and_initialize(
                 tracing::warn!(%error, "failed to reload controller config before saving pin");
                 config.clone()
             });
-            let peer = updated
-                .peer
-                .laptop
-                .as_mut()
-                .context("missing [peer.laptop] config")?;
-            peer.pinned_fingerprint = connection.peer_fingerprint.clone();
+            updated.peer.pinned_fingerprint = connection.peer_fingerprint.clone();
             updated.save(config_path).await?;
             connection.peer_trusted = true;
             append_portable_log(
@@ -752,6 +758,25 @@ async fn connect_and_initialize(
         );
     }
 
+    write_secure_frame(
+        &mut connection.session,
+        &Frame::Role(RoleEvent::SessionState(RoleState {
+            controller_fingerprint: Some(identity.fingerprint()),
+            role_epoch: INITIAL_ROLE_EPOCH,
+            transition: RoleTransitionState::Stable,
+            listener_position: peer_position_to_edge(config.layout.listener_position),
+            paused: false,
+            failure_detail: None,
+        })),
+    )
+    .await?;
+    #[cfg(windows)]
+    write_secure_frame(
+        &mut connection.session,
+        &Frame::ScreenInfo(edge_windows_input::screen_info()),
+    )
+    .await?;
+
     read_initial_frames(&mut connection.session, &mut initial).await?;
     Ok((connection, initial))
 }
@@ -759,13 +784,10 @@ async fn connect_and_initialize(
 fn validate_receiver_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
     if hello.protocol_version != PROTOCOL_VERSION {
         anyhow::bail!(
-            "receiver protocol version {} is incompatible with {}",
+            "Upgrade the other computer: receiver protocol version {} is incompatible with {}",
             hello.protocol_version,
             PROTOCOL_VERSION
         );
-    }
-    if hello.role != Role::Receiver {
-        anyhow::bail!("connected peer did not identify itself as a receiver");
     }
     if hello.public_key_fingerprint != noise_fingerprint {
         anyhow::bail!("receiver hello fingerprint does not match its encrypted identity");
@@ -802,11 +824,7 @@ async fn connect_session(
     identity: &IdentityKey,
     pairing_armed: bool,
 ) -> Result<ControllerConnection> {
-    let peer = config
-        .peer
-        .laptop
-        .as_ref()
-        .context("missing [peer.laptop] config")?;
+    let peer = &config.peer;
     let addr = format!("{}:{}", peer.host, peer.port);
     let stream = time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
@@ -840,13 +858,18 @@ async fn connect_session(
         &Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             device_name: config.device_name.clone(),
-            role: Role::Controller,
+            role: config.preferred_role,
             public_key_fingerprint: identity.fingerprint(),
-            capabilities: vec![Capability::AudioV1],
+            capabilities: Vec::new(),
             extensions: vec![
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
+            ],
+            node_capabilities: vec![
+                NodeCapability::InputCaptureV1,
+                NodeCapability::ScreenInfoBothSidesV1,
+                NodeCapability::AudioPlaybackV1,
             ],
         }),
     )
@@ -866,7 +889,7 @@ async fn connect_session(
 #[derive(Debug, Default)]
 struct InitialReceiverState {
     screen_info: Option<ScreenInfo>,
-    capabilities: Vec<Capability>,
+    node_capabilities: Vec<NodeCapability>,
     extensions: Vec<String>,
 }
 
@@ -882,7 +905,7 @@ async fn read_initial_frames(
                     fingerprint = %hello.public_key_fingerprint,
                     "receiver hello"
                 );
-                initial.capabilities = hello.capabilities;
+                initial.node_capabilities = hello.node_capabilities;
                 initial.extensions = hello.extensions;
             }
             Ok(Frame::ScreenInfo(info)) => {
@@ -909,56 +932,78 @@ async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput)
         TestInput::Pointer => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerMotion { dx: 80.0, dy: 0.0 }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerMotion { dx: 80.0, dy: 0.0 },
+                ),
             )
             .await?;
         }
         TestInput::Click => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerButton {
-                    button: MouseButton::Left,
-                    down: true,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerButton {
+                        button: MouseButton::Left,
+                        down: true,
+                    },
+                ),
             )
             .await?;
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerButton {
-                    button: MouseButton::Left,
-                    down: false,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerButton {
+                        button: MouseButton::Left,
+                        down: false,
+                    },
+                ),
             )
             .await?;
         }
         TestInput::Wheel => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerWheel { x: 0.0, y: -1.0 }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerWheel { x: 0.0, y: -1.0 },
+                ),
             )
             .await?;
         }
         TestInput::Key => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::Key {
-                    evdev_code: 30,
-                    down: true,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: true,
+                    },
+                ),
             )
             .await?;
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::Key {
-                    evdev_code: 30,
-                    down: false,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: false,
+                    },
+                ),
             )
             .await?;
         }
     }
 
-    write_secure_frame(session, &Frame::Input(InputEvent::AllKeysUp)).await?;
+    write_secure_frame(
+        session,
+        &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+    )
+    .await?;
     tracing::info!(?test, "sent test input");
     Ok(())
 }
@@ -1077,9 +1122,12 @@ async fn run_connected_inner(
     if peer_supports_input_toggle {
         write_secure_frame_writer(
             &mut writer,
-            &Frame::Control(ControlEvent::SetInputForwarding {
-                enabled: *input_forwarding_enabled,
-            }),
+            &Frame::control(
+                INITIAL_ROLE_EPOCH,
+                ControlEvent::SetInputForwarding {
+                    enabled: *input_forwarding_enabled,
+                },
+            ),
         )
         .await?;
     }
@@ -1104,7 +1152,12 @@ async fn run_connected_inner(
         tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => {
-                write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                )
+                .await
+                .ok();
                 if peer_supports_audio {
                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                 }
@@ -1231,14 +1284,24 @@ async fn run_connected_inner(
                         *input_forwarding_enabled,
                     )? {
                         TrayCommandOutcome::Quit => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
                             if peer_supports_audio {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                             }
                             return Ok(ConnectedSessionExit::Quit);
                         }
                         TrayCommandOutcome::Disconnect => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
                             if peer_supports_audio {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
                             }
@@ -1248,7 +1311,12 @@ async fn run_connected_inner(
                         }
                         TrayCommandOutcome::Reconnect => {}
                         TrayCommandOutcome::Pair => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
                             edge_windows_input::force_release_to_local();
                             return Ok(ConnectedSessionExit::Pair);
                         }
@@ -1256,7 +1324,7 @@ async fn run_connected_inner(
                             if !enabled {
                                 write_secure_frame_writer(
                                     &mut writer,
-                                    &Frame::Input(InputEvent::AllKeysUp),
+                                    &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
                                 )
                                 .await?;
                             }
@@ -1266,7 +1334,10 @@ async fn run_connected_inner(
                             if peer_supports_input_toggle {
                                 write_secure_frame_writer(
                                     &mut writer,
-                                    &Frame::Control(ControlEvent::SetInputForwarding { enabled }),
+                                    &Frame::control(
+                                        INITIAL_ROLE_EPOCH,
+                                        ControlEvent::SetInputForwarding { enabled },
+                                    ),
                                 )
                                 .await?;
                             }
@@ -1320,27 +1391,38 @@ async fn run_connected_inner(
                         }
                     }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
-                    Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
-                        if edge_windows_input::handle_receiver_release(reason) {
-                            tracing::info!(?reason, "accepted receiver-requested local release");
-                            append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
-                        } else {
-                            tracing::warn!(?reason, "ignored stale or implausible receiver release");
-                            append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
-                        }
-                    }
-                    Frame::Control(ControlEvent::SetInputForwarding { enabled }) => {
-                        if peer_supports_input_toggle {
-                            *input_forwarding_enabled = enabled;
-                            edge_windows_input::set_forwarding_enabled(enabled);
-                            update_windows_tray_input_forwarding(enabled, log_path);
-                            append_portable_log(
-                                log_path,
-                                format!("receiver set input forwarding to {enabled}"),
+                    Frame::Control(control) => {
+                        if control.role_epoch != INITIAL_ROLE_EPOCH {
+                            tracing::debug!(
+                                role_epoch = control.role_epoch,
+                                "ignored receiver control from a stale role epoch"
                             );
+                            continue;
+                        }
+                        match control.event {
+                            ControlEvent::ReleaseToLocal { reason } => {
+                                if edge_windows_input::handle_receiver_release(reason) {
+                                    tracing::info!(?reason, "accepted receiver-requested local release");
+                                    append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
+                                } else {
+                                    tracing::warn!(?reason, "ignored stale or implausible receiver release");
+                                    append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
+                                }
+                            }
+                            ControlEvent::SetInputForwarding { enabled } => {
+                                if peer_supports_input_toggle {
+                                    *input_forwarding_enabled = enabled;
+                                    edge_windows_input::set_forwarding_enabled(enabled);
+                                    update_windows_tray_input_forwarding(enabled, log_path);
+                                    append_portable_log(
+                                        log_path,
+                                        format!("receiver set input forwarding to {enabled}"),
+                                    );
+                                }
+                            }
+                            event => tracing::debug!(?event, "receiver control frame"),
                         }
                     }
-                    Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),
                     Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
                     Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
                         if audio_enabled && codecs.contains(&AudioCodec::PcmS16Stereo48Khz) {
@@ -1476,26 +1558,26 @@ struct ControllerInputStats {
 impl ControllerInputStats {
     fn record_frame(&mut self, frame: &Frame) {
         self.frames = self.frames.saturating_add(1);
-        match frame {
-            Frame::Input(InputEvent::PointerMotion { .. }) => {
+        match frame.input_event() {
+            Some(InputEvent::PointerMotion { .. }) => {
                 self.motion = self.motion.saturating_add(1);
             }
-            Frame::Input(InputEvent::PointerButton { .. }) => {
+            Some(InputEvent::PointerButton { .. }) => {
                 self.buttons = self.buttons.saturating_add(1);
             }
-            Frame::Input(InputEvent::PointerWheel { .. }) => {
+            Some(InputEvent::PointerWheel { .. }) => {
                 self.wheel = self.wheel.saturating_add(1);
             }
-            Frame::Input(InputEvent::Key { .. }) => {
+            Some(InputEvent::Key { .. }) => {
                 self.keys = self.keys.saturating_add(1);
             }
-            Frame::Input(InputEvent::AllKeysUp) => {
+            Some(InputEvent::AllKeysUp) => {
                 self.keys = self.keys.saturating_add(1);
             }
-            Frame::Clipboard(_) => {
+            None if matches!(frame, Frame::Clipboard(_)) => {
                 self.clipboard = self.clipboard.saturating_add(1);
             }
-            Frame::Control(_) => {
+            None if matches!(frame, Frame::Control(_)) => {
                 self.control = self.control.saturating_add(1);
             }
             _ => {}
@@ -1637,7 +1719,7 @@ impl LiveClipboardState {
                 // through instead of freezing the cursor for the length of the
                 // transfer. Keys, buttons, and wheel stay queued: releasing those
                 // ahead of the held paste could move focus and land it elsewhere.
-                if matches!(frame, Frame::Input(InputEvent::PointerMotion { .. })) {
+                if matches!(frame.input_event(), Some(InputEvent::PointerMotion { .. })) {
                     return Ok(vec![frame]);
                 }
                 self.held_input.push_back(frame);
@@ -1648,8 +1730,8 @@ impl LiveClipboardState {
             }
 
             if matches!(
-                &frame,
-                Frame::Input(InputEvent::Key {
+                frame.input_event(),
+                Some(InputEvent::Key {
                     evdev_code: 47,
                     down: true
                 })
@@ -1703,8 +1785,8 @@ impl LiveClipboardState {
     ) {
         #[cfg(windows)]
         {
-            match frame {
-                Frame::Input(InputEvent::Key { evdev_code, down }) => match *evdev_code {
+            match frame.input_event() {
+                Some(InputEvent::Key { evdev_code, down }) => match *evdev_code {
                     29 | 97 => {
                         self.ctrl_down = *down;
                     }
@@ -1723,7 +1805,7 @@ impl LiveClipboardState {
                     }
                     _ => {}
                 },
-                Frame::Input(InputEvent::AllKeysUp) => {
+                Some(InputEvent::AllKeysUp) => {
                     self.ctrl_down = false;
                 }
                 _ => {}
@@ -2045,11 +2127,6 @@ fn start_live_input(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
 ) -> Result<Option<mpsc::Receiver<Frame>>> {
-    let peer = config
-        .peer
-        .laptop
-        .as_ref()
-        .context("missing [peer.laptop] config")?;
     let (remote_size, used_fallback_size) = remote_size(screen_info.as_ref());
     if used_fallback_size {
         tracing::warn!(
@@ -2059,9 +2136,9 @@ fn start_live_input(
         );
     }
     let capture = edge_windows_input::start_capture(edge_windows_input::CaptureConfig {
-        edge: peer_position_to_edge(peer.position),
+        edge: peer_position_to_edge(config.layout.listener_position),
         remote_size,
-        game_compatibility: config.input.game_compatibility,
+        game_compatibility: config.input.capture.game_compatibility,
     })
     .context("failed to start Windows live input capture")?;
     let (sender, receiver) = mpsc::channel(LIVE_INPUT_QUEUE_CAPACITY);
@@ -2122,8 +2199,10 @@ async fn recv_live_input(receiver: &mut Option<mpsc::Receiver<Frame>>) -> Option
 #[cfg(windows)]
 fn captured_input_to_frame(event: edge_windows_input::CapturedInput) -> Frame {
     match event {
-        edge_windows_input::CapturedInput::Input(event) => Frame::Input(event),
-        edge_windows_input::CapturedInput::Control(event) => Frame::Control(event),
+        edge_windows_input::CapturedInput::Input(event) => Frame::input(INITIAL_ROLE_EPOCH, event),
+        edge_windows_input::CapturedInput::Control(event) => {
+            Frame::control(INITIAL_ROLE_EPOCH, event)
+        }
     }
 }
 
@@ -2137,7 +2216,7 @@ struct PendingMotion {
 #[cfg(windows)]
 impl PendingMotion {
     fn coalesce(&mut self, frame: &Frame) -> bool {
-        if let Frame::Input(InputEvent::PointerMotion { dx, dy }) = frame {
+        if let Some(InputEvent::PointerMotion { dx, dy }) = frame.input_event() {
             self.dx += dx;
             self.dy += dy;
             true
@@ -2150,10 +2229,13 @@ impl PendingMotion {
         if self.dx == 0.0 && self.dy == 0.0 {
             return true;
         }
-        let frame = Frame::Input(InputEvent::PointerMotion {
-            dx: self.dx,
-            dy: self.dy,
-        });
+        let frame = Frame::input(
+            INITIAL_ROLE_EPOCH,
+            InputEvent::PointerMotion {
+                dx: self.dx,
+                dy: self.dy,
+            },
+        );
         self.dx = 0.0;
         self.dy = 0.0;
         match sender.try_send(frame) {
@@ -2231,7 +2313,6 @@ mod windows_tests {
     }
 }
 
-#[cfg(windows)]
 fn peer_position_to_edge(position: PeerPosition) -> Edge {
     match position {
         PeerPosition::Left => Edge::Left,
@@ -2282,41 +2363,8 @@ async fn read_secure_frame_reader(reader: &mut TcpFrameReader) -> Result<Frame> 
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
-    match AppConfig::load(path).await {
-        Ok(mut config) => {
-            let text = tokio::fs::read_to_string(path).await.with_context(|| {
-                format!("failed to inspect controller config at {}", path.display())
-            })?;
-            let has_audio_table = text.lines().any(|line| line.trim() == "[audio]");
-            let has_image_setting = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("images_enabled"));
-            let has_text_only = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("text_only"));
-            let mut migrated = false;
-            if !has_audio_table {
-                config.audio = AppConfig::controller_default().audio;
-                migrated = true;
-                tracing::info!(path = %path.display(), "enabled audio while migrating legacy controller config");
-            }
-            if !has_image_setting {
-                config.clipboard.images_enabled = true;
-                config.clipboard.max_image_bytes = 4 * 1024 * 1024;
-                migrated = true;
-                tracing::info!(path = %path.display(), "enabled clipboard images while migrating legacy controller config");
-            }
-            if has_text_only {
-                migrated = true;
-                tracing::info!(path = %path.display(), "dropped obsolete text_only key from controller config");
-            }
-            if migrated {
-                config.save(path).await.with_context(|| {
-                    format!("failed to migrate controller config at {}", path.display())
-                })?;
-            }
-            Ok(config)
-        }
+    match AppConfig::load_migrating(path).await {
+        Ok(config) => Ok(config),
         Err(edge_common::CommonError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -2348,6 +2396,7 @@ mod config_tests {
             public_key_fingerprint: "actual".to_string(),
             capabilities: Vec::new(),
             extensions: Vec::new(),
+            node_capabilities: Vec::new(),
         };
         assert!(validate_receiver_hello(&hello, "actual").is_ok());
         assert!(validate_receiver_hello(&hello, "different").is_err());
@@ -2503,10 +2552,13 @@ jitter_target_ms = 60
         state.outgoing = Some(OutgoingImageTransfer::new(1, 1, image));
         state.outgoing_image_id = Some(image_id);
         state.paste_barrier_deadline = Some(Instant::now() + Duration::from_secs(1));
-        state.held_input.push_back(Frame::Input(InputEvent::Key {
-            evdev_code: 47,
-            down: true,
-        }));
+        state.held_input.push_back(Frame::input(
+            INITIAL_ROLE_EPOCH,
+            InputEvent::Key {
+                evdev_code: 47,
+                down: true,
+            },
+        ));
         while let Some((_, completed)) = state.next_image_frame() {
             if completed {
                 break;

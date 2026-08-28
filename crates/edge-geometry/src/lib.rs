@@ -34,14 +34,14 @@ impl Rect {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EnterRemote {
     pub edge: Edge,
-    pub normalized_y: f32,
+    pub normalized_position: f32,
     pub remote_start: Point,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LeaveRemote {
     pub edge: Edge,
-    pub normalized_y: f32,
+    pub normalized_position: f32,
     pub local_restore: Point,
 }
 
@@ -50,12 +50,12 @@ pub fn clamp(value: f64, min: f64, max: f64) -> f64 {
 }
 
 pub fn enter_left_edge(local_cursor_y: f64, local: Size, remote: Size) -> EnterRemote {
-    let normalized_y = normalized_axis(local_cursor_y, local.height);
-    let remote_y = f64::from(remote.height.saturating_sub(1)) * f64::from(normalized_y);
+    let normalized_position = normalized_axis(local_cursor_y, local.height);
+    let remote_y = f64::from(remote.height.saturating_sub(1)) * f64::from(normalized_position);
 
     EnterRemote {
         edge: Edge::Left,
-        normalized_y,
+        normalized_position,
         remote_start: Point {
             x: f64::from(remote.width.saturating_sub(2)),
             y: clamp(remote_y, 0.0, f64::from(remote.height.saturating_sub(1))),
@@ -64,12 +64,12 @@ pub fn enter_left_edge(local_cursor_y: f64, local: Size, remote: Size) -> EnterR
 }
 
 pub fn leave_right_edge(remote_cursor_y: f64, local: Size, remote: Size) -> LeaveRemote {
-    let normalized_y = normalized_axis(remote_cursor_y, remote.height);
-    let local_y = f64::from(local.height.saturating_sub(1)) * f64::from(normalized_y);
+    let normalized_position = normalized_axis(remote_cursor_y, remote.height);
+    let local_y = f64::from(local.height.saturating_sub(1)) * f64::from(normalized_position);
 
     LeaveRemote {
         edge: Edge::Right,
-        normalized_y,
+        normalized_position,
         local_restore: Point {
             x: 1.0,
             y: clamp(local_y, 0.0, f64::from(local.height.saturating_sub(1))),

@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, AudioLocalPlayback, GameCompatibilityMode, PeerConfig, PeerPosition, Role,
-    parse_listen_port, update_listen_port, validate_device_name, validate_host, validate_port,
+    AppConfig, AudioLocalPlayback, GameCompatibilityMode, PeerPosition, Role, parse_listen_port,
+    update_listen_port, validate_device_name, validate_host, validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -279,9 +279,9 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new(input: SettingsUiInput, result: Arc<Mutex<SettingsUiResult>>) -> Self {
-        let peer = input.config.peer.laptop.clone();
+        let peer = input.config.peer.clone();
         let port = match input.role {
-            Role::Controller => peer.as_ref().map(|peer| peer.port).unwrap_or(42_420),
+            Role::Controller => peer.port,
             Role::Receiver => input
                 .config
                 .listen
@@ -298,16 +298,10 @@ impl SettingsApp {
                 .unwrap_or_else(|| "Unknown".to_string()),
             pairing: input.pairing,
             device_name: input.config.device_name.clone(),
-            peer_host: peer
-                .as_ref()
-                .map(|peer| peer.host.clone())
-                .unwrap_or_default(),
+            peer_host: peer.host,
             port: port.to_string(),
-            position: peer
-                .as_ref()
-                .map(|peer| peer.position)
-                .unwrap_or(PeerPosition::Left),
-            game_compatibility: input.config.input.game_compatibility,
+            position: input.config.layout.listener_position,
+            game_compatibility: input.config.input.capture.game_compatibility,
             clipboard_images_enabled: input.config.clipboard.images_enabled,
             audio_enabled: input.config.audio.enabled,
             audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
@@ -351,7 +345,7 @@ impl SettingsApp {
 
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
-        config.input.game_compatibility = self.game_compatibility;
+        config.input.capture.game_compatibility = self.game_compatibility;
         config.clipboard.images_enabled = self.clipboard_images_enabled;
         config.audio.enabled = self.audio_enabled;
         config.audio.local_playback = if self.audio_play_local {
@@ -363,15 +357,9 @@ impl SettingsApp {
         match self.role {
             Role::Controller => {
                 validate_host(&self.peer_host)?;
-                let peer = config.peer.laptop.get_or_insert_with(|| PeerConfig {
-                    host: String::new(),
-                    port,
-                    position: self.position,
-                    pinned_fingerprint: String::new(),
-                });
-                peer.host = self.peer_host.trim().to_string();
-                peer.port = port;
-                peer.position = self.position;
+                config.peer.host = self.peer_host.trim().to_string();
+                config.peer.port = port;
+                config.layout.listener_position = self.position;
             }
             Role::Receiver => {
                 config.listen = Some(update_listen_port(config.listen.as_deref(), port));

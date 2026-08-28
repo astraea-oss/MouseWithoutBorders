@@ -2,7 +2,8 @@ use edge_common::Role;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const INITIAL_ROLE_EPOCH: u64 = 1;
 pub const DEFAULT_PORT: u16 = 42_420;
 pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
@@ -27,13 +28,38 @@ pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub enum Frame {
     Hello(Hello),
     ScreenInfo(ScreenInfo),
-    Input(InputEvent),
+    Input(InputFrame),
     Clipboard(ClipboardEvent),
-    Control(ControlEvent),
+    Control(ControlFrame),
     Heartbeat(Heartbeat),
     Error(RemoteError),
     Audio(AudioControl),
     Pairing(PairingEvent),
+    Role(RoleEvent),
+}
+
+impl Frame {
+    pub fn input(role_epoch: u64, event: InputEvent) -> Self {
+        Self::Input(InputFrame { role_epoch, event })
+    }
+
+    pub fn control(role_epoch: u64, event: ControlEvent) -> Self {
+        Self::Control(ControlFrame { role_epoch, event })
+    }
+
+    pub fn input_event(&self) -> Option<&InputEvent> {
+        match self {
+            Self::Input(input) => Some(&input.event),
+            _ => None,
+        }
+    }
+
+    pub fn control_event(&self) -> Option<&ControlEvent> {
+        match self {
+            Self::Control(control) => Some(&control.event),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,11 +78,35 @@ pub struct Hello {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub extensions: Vec<String>,
+    #[serde(default)]
+    pub node_capabilities: Vec<NodeCapability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     AudioV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeCapability {
+    InputCaptureV1,
+    InputInjectV1,
+    RoleSwitchV1,
+    ScreenInfoBothSidesV1,
+    AudioCaptureV1,
+    AudioPlaybackV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputFrame {
+    pub role_epoch: u64,
+    pub event: InputEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlFrame {
+    pub role_epoch: u64,
+    pub event: ControlEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,10 +246,59 @@ pub enum ClipboardCancelReason {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlEvent {
-    EnterRemote { edge: Edge, normalized_y: f32 },
-    LeaveRemote { edge: Edge, normalized_y: f32 },
-    ReleaseToLocal { reason: ReleaseReason },
-    SetInputForwarding { enabled: bool },
+    EnterRemote {
+        edge: Edge,
+        normalized_position: f32,
+    },
+    LeaveRemote {
+        edge: Edge,
+        normalized_position: f32,
+    },
+    ReleaseToLocal {
+        reason: ReleaseReason,
+    },
+    SetInputForwarding {
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoleTransitionState {
+    Stable,
+    Preparing {
+        proposed_controller_fingerprint: String,
+    },
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleState {
+    pub controller_fingerprint: Option<String>,
+    pub role_epoch: u64,
+    pub transition: RoleTransitionState,
+    pub listener_position: Edge,
+    pub paused: bool,
+    pub failure_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoleEvent {
+    SessionState(RoleState),
+    Request {
+        controller_fingerprint: String,
+    },
+    Prepare(RoleState),
+    Ready {
+        role_epoch: u64,
+        capture_ready: bool,
+        inject_ready: bool,
+        failure_detail: Option<String>,
+    },
+    Commit(RoleState),
+    Abort(RoleState),
+    SetPaused {
+        paused: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,10 +373,13 @@ mod tests {
 
     #[test]
     fn messagepack_round_trip() {
-        let frame = Frame::Input(InputEvent::Key {
-            evdev_code: 30,
-            down: true,
-        });
+        let frame = Frame::input(
+            INITIAL_ROLE_EPOCH,
+            InputEvent::Key {
+                evdev_code: 30,
+                down: true,
+            },
+        );
 
         let encoded = encode_frame(&frame).unwrap();
         let decoded = decode_frame(&encoded).unwrap();
@@ -302,7 +404,10 @@ mod tests {
     #[test]
     fn input_forwarding_control_round_trip() {
         for enabled in [false, true] {
-            let frame = Frame::Control(ControlEvent::SetInputForwarding { enabled });
+            let frame = Frame::control(
+                INITIAL_ROLE_EPOCH,
+                ControlEvent::SetInputForwarding { enabled },
+            );
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
         }
     }
@@ -370,21 +475,9 @@ mod tests {
         capabilities: Vec<Capability>,
     }
 
-    #[derive(Debug, Serialize)]
-    struct ProspectiveV2Hello {
-        protocol_version: u16,
-        device_name: String,
-        role: Role,
-        public_key_fingerprint: String,
-        capabilities: Vec<Capability>,
-        extensions: Vec<String>,
-        node_capabilities: Vec<ProspectiveV2Capability>,
-    }
-
-    #[derive(Debug, Serialize)]
-    enum ProspectiveV2Capability {
-        InputCaptureV1,
-        InputInjectV1,
+    #[derive(Debug, Deserialize)]
+    enum LegacyHelloFrame {
+        Hello(LegacyHello),
     }
 
     #[test]
@@ -399,6 +492,7 @@ mod tests {
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
             ],
+            node_capabilities: vec![NodeCapability::InputCaptureV1],
         };
         let encoded = rmp_serde::to_vec_named(&hello).unwrap();
         let legacy: LegacyHello = rmp_serde::from_slice(&encoded).unwrap();
@@ -411,8 +505,8 @@ mod tests {
 
     #[test]
     fn prospective_v2_hello_reaches_version_check_in_v1_decoder() {
-        let encoded = rmp_serde::to_vec_named(&ProspectiveV2Hello {
-            protocol_version: 2,
+        let encoded = encode_frame(&Frame::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
             device_name: "future-peer".to_string(),
             role: Role::Controller,
             public_key_fingerprint: "future-fingerprint".to_string(),
@@ -421,15 +515,54 @@ mod tests {
             capabilities: Vec::new(),
             extensions: Vec::new(),
             node_capabilities: vec![
-                ProspectiveV2Capability::InputCaptureV1,
-                ProspectiveV2Capability::InputInjectV1,
+                NodeCapability::InputCaptureV1,
+                NodeCapability::InputInjectV1,
             ],
-        })
+        }))
         .unwrap();
 
-        let legacy: LegacyHello = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(legacy.protocol_version, 2);
+        let LegacyHelloFrame::Hello(legacy) = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(legacy.protocol_version, PROTOCOL_VERSION);
         assert!(legacy.capabilities.is_empty());
+    }
+
+    #[test]
+    fn v2_role_messages_and_epoch_frames_round_trip() {
+        let state = RoleState {
+            controller_fingerprint: Some("connector-fingerprint".to_string()),
+            role_epoch: 7,
+            transition: RoleTransitionState::Preparing {
+                proposed_controller_fingerprint: "listener-fingerprint".to_string(),
+            },
+            listener_position: Edge::Left,
+            paused: false,
+            failure_detail: None,
+        };
+        let frames = [
+            Frame::Role(RoleEvent::Prepare(state.clone())),
+            Frame::Role(RoleEvent::Ready {
+                role_epoch: 7,
+                capture_ready: true,
+                inject_ready: true,
+                failure_detail: None,
+            }),
+            Frame::Role(RoleEvent::Commit(RoleState {
+                transition: RoleTransitionState::Stable,
+                ..state
+            })),
+            Frame::input(7, InputEvent::AllKeysUp),
+            Frame::control(
+                7,
+                ControlEvent::EnterRemote {
+                    edge: Edge::Left,
+                    normalized_position: 0.25,
+                },
+            ),
+        ];
+
+        for frame in frames {
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
     }
 
     fn decode_hex_fixture(source: &str) -> Vec<u8> {
@@ -447,9 +580,31 @@ mod tests {
 
     #[test]
     fn protocol_v1_wire_fixtures_remain_stable() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum V1Frame {
+            Hello(V1Hello),
+            Control(V1ControlEvent),
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct V1Hello {
+            protocol_version: u16,
+            device_name: String,
+            role: Role,
+            public_key_fingerprint: String,
+            capabilities: Vec<Capability>,
+            extensions: Vec<String>,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum V1ControlEvent {
+            EnterRemote { edge: Edge, normalized_y: f32 },
+            SetInputForwarding { enabled: bool },
+        }
+
         let fixtures = [
             (
-                Frame::Hello(Hello {
+                V1Frame::Hello(V1Hello {
                     protocol_version: 1,
                     device_name: "fixture-peer".to_string(),
                     role: Role::Controller,
@@ -460,22 +615,25 @@ mod tests {
                 include_str!("../fixtures/v1-hello.hex"),
             ),
             (
-                Frame::Control(ControlEvent::EnterRemote {
+                V1Frame::Control(V1ControlEvent::EnterRemote {
                     edge: Edge::Left,
                     normalized_y: 0.25,
                 }),
                 include_str!("../fixtures/v1-enter-remote.hex"),
             ),
             (
-                Frame::Control(ControlEvent::SetInputForwarding { enabled: false }),
+                V1Frame::Control(V1ControlEvent::SetInputForwarding { enabled: false }),
                 include_str!("../fixtures/v1-input-forwarding.hex"),
             ),
         ];
 
         for (expected, fixture) in fixtures {
             let fixture = decode_hex_fixture(fixture);
-            assert_eq!(decode_frame(&fixture).unwrap(), expected);
-            assert_eq!(encode_frame(&expected).unwrap(), fixture);
+            assert_eq!(
+                rmp_serde::from_slice::<V1Frame>(&fixture).unwrap(),
+                expected
+            );
+            assert_eq!(rmp_serde::to_vec_named(&expected).unwrap(), fixture);
         }
     }
 }
