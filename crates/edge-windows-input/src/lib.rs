@@ -2961,6 +2961,7 @@ mod tray {
                 &context.local_device_name
             },
         ));
+        let audio_heading = to_wide("Audio routing");
         let audio_off = to_wide("Audio off");
         let input_forwarding = to_wide("Forward mouse and keyboard");
         let quit = to_wide("Quit edge-kvm");
@@ -3108,13 +3109,15 @@ mod tray {
                 ID_PEER_CONTROLLER,
                 peer_controller.as_ptr(),
             );
-            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(
                 menu,
                 input_forwarding_flags,
                 ID_INPUT_FORWARDING,
                 input_forwarding.as_ptr(),
             );
+            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_heading.as_ptr());
+            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
             AppendMenuW(
                 menu,
                 audio_local_flags,
@@ -3122,7 +3125,6 @@ mod tray {
                 local_audio.as_ptr(),
             );
             AppendMenuW(menu, audio_peer_flags, ID_AUDIO_PEER, peer_audio.as_ptr());
-            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());

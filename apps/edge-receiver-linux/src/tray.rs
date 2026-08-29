@@ -393,6 +393,8 @@ impl ksni::Tray for ReceiverTray {
             }
             .into(),
         );
+        items.push(MenuItem::Separator);
+        items.push(disabled_item("Audio routing".to_string()));
         items.push(self.audio_items());
         items.push(
             StandardItem {
@@ -430,19 +432,24 @@ impl ReceiverTray {
         let connected = self.state == TrayState::Connected;
         RadioGroup {
             selected: match self.audio_choice {
-                AudioChoice::Local => 0,
-                AudioChoice::Peer => 1,
-                AudioChoice::Off => 2,
+                AudioChoice::Off => 0,
+                AudioChoice::Local => 1,
+                AudioChoice::Peer => 2,
             },
             select: Box::new(|tray: &mut Self, selected| {
                 let choice = match selected {
-                    0 => AudioChoice::Local,
-                    1 => AudioChoice::Peer,
-                    _ => AudioChoice::Off,
+                    0 => AudioChoice::Off,
+                    1 => AudioChoice::Local,
+                    _ => AudioChoice::Peer,
                 };
                 let _ = tray.command_tx.send(TrayCommand::SetAudio(choice));
             }),
             options: vec![
+                RadioItem {
+                    label: "Audio off".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
                 RadioItem {
                     label: format!("{local} → {peer}"),
                     enabled: connected && self.local_audio_available,
@@ -451,11 +458,6 @@ impl ReceiverTray {
                 RadioItem {
                     label: format!("{peer} → {local}"),
                     enabled: connected && self.peer_audio_available,
-                    ..Default::default()
-                },
-                RadioItem {
-                    label: "Audio off".to_string(),
-                    enabled: true,
                     ..Default::default()
                 },
             ],
@@ -697,7 +699,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 17);
+        assert_eq!(expected.len(), 19);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);
@@ -800,15 +802,21 @@ mod tests {
         let mut tray = test_tray(TrayState::Connected, None);
         tray.audio_choice = AudioChoice::Peer;
         tray.local_audio_available = false;
-        let ksni::MenuItem::RadioGroup(audio) = &tray.menu()[14] else {
+        let menu = tray.menu();
+        let ksni::MenuItem::Standard(heading) = &menu[15] else {
+            panic!("audio heading is not a standard item");
+        };
+        assert_eq!(heading.label, "Audio routing");
+        assert!(!heading.enabled);
+        let ksni::MenuItem::RadioGroup(audio) = &menu[16] else {
             panic!("audio actions are not a radio group");
         };
-        assert_eq!(audio.selected, 1);
-        assert_eq!(audio.options[0].label, "Desk → Studio");
-        assert_eq!(audio.options[1].label, "Studio → Desk");
-        assert_eq!(audio.options[2].label, "Audio off");
-        assert!(!audio.options[0].enabled);
-        assert!(audio.options[1].enabled);
+        assert_eq!(audio.selected, 2);
+        assert_eq!(audio.options[0].label, "Audio off");
+        assert_eq!(audio.options[1].label, "Desk → Studio");
+        assert_eq!(audio.options[2].label, "Studio → Desk");
+        assert!(audio.options[0].enabled);
+        assert!(!audio.options[1].enabled);
         assert!(audio.options[2].enabled);
     }
 }
