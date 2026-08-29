@@ -427,14 +427,22 @@ mod implementation {
                 let mut timestamp = 0_u32;
                 let mut payload = Vec::with_capacity(edge_audio::PCM_BYTES_PER_FRAME);
                 let mut first_packet_tx = Some(first_packet_tx);
+                let silence = vec![0; edge_audio::SAMPLES_PER_FRAME * size_of::<f32>()];
                 loop {
-                    let Some(captured) = capture_rx.recv().await else {
-                        break "Windows audio capture stopped".to_string();
-                    };
-                    let frame = match captured {
-                        Ok(frame) => frame,
-                        Err(error) => break format!("Windows audio capture failed: {error}"),
-                    };
+                    // A WASAPI loopback endpoint may stop issuing capture events
+                    // while the speaker mix is silent. Keep the negotiated media
+                    // path alive with a sparse silent frame so the receiver does
+                    // not mistake ordinary quiet for a dead sender. Actual WASAPI
+                    // errors still arrive through the channel and end the task.
+                    let frame =
+                        match time::timeout(Duration::from_millis(250), capture_rx.recv()).await {
+                            Ok(Some(Ok(frame))) => frame,
+                            Ok(Some(Err(error))) => {
+                                break format!("Windows audio capture failed: {error}");
+                            }
+                            Ok(None) => break "Windows audio capture stopped".to_string(),
+                            Err(_) => silence.clone(),
+                        };
                     if let Err(error) = PcmCodec::encode_f32le_into(&frame, &mut payload) {
                         break format!("Windows PCM encoding failed: {error}");
                     }
