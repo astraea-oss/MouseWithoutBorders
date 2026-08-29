@@ -1150,7 +1150,7 @@ async fn run_linux_controller_session(
                             )
                             .await?;
                             if let Some(tray) = tray {
-                                tray.input_event().await;
+                                tray.input_event();
                             }
                         }
                         Some(CaptureEvent::Deactivated) => {
@@ -1441,7 +1441,7 @@ async fn run_linux_controller_session(
                                 && clipboard_sync.send_changed_offer(config, &mut writer).await?
                                 && let Some(tray) = tray
                             {
-                                tray.clipboard_event().await;
+                                tray.clipboard_event();
                             }
                         }
                         ClipboardWatchEvent::Closed => {
@@ -1460,7 +1460,7 @@ async fn run_linux_controller_session(
                                 && clipboard_sync.handle_event(config, &mut writer, event).await?
                                 && let Some(tray) = tray
                             {
-                                tray.clipboard_event().await;
+                                tray.clipboard_event();
                             }
                         }
                         Frame::Input(input)
@@ -1491,7 +1491,7 @@ async fn run_linux_controller_session(
                                 .await?;
                             }
                             if let Some(tray) = tray {
-                                tray.input_event().await;
+                                tray.input_event();
                             }
                         }
                         Frame::Input(input) => {
@@ -2994,7 +2994,7 @@ async fn handle_controller(
                         )
                         .await?;
                         if let Some(tray) = tray {
-                            tray.input_event().await;
+                            tray.input_event();
                         }
                     }
                     Some(CaptureEvent::Deactivated | CaptureEvent::EmergencyReleased) => {
@@ -3370,7 +3370,7 @@ async fn handle_controller(
                                 stats.clipboard = stats.clipboard.saturating_add(1);
                                 tracing::info!("sent changed Linux clipboard to controller");
                                 if let Some(tray) = tray {
-                                    tray.clipboard_event().await;
+                                    tray.clipboard_event();
                                 }
                             }
                             Ok(false) => {}
@@ -3410,7 +3410,7 @@ async fn handle_controller(
                             input_epoch.suspend();
                             backend.all_keys_up().await?;
                             if let Some(tray) = tray {
-                                tray.input_event().await;
+                                tray.input_event();
                             }
                             continue;
                         }
@@ -3447,7 +3447,7 @@ async fn handle_controller(
                             }
                         }
                         if let Some(tray) = tray {
-                            tray.input_event().await;
+                            tray.input_event();
                         }
                     }
                     Frame::Clipboard(event) => {
@@ -3458,7 +3458,7 @@ async fn handle_controller(
                             Ok(true) => {
                                 stats.clipboard = stats.clipboard.saturating_add(1);
                                 if let Some(tray) = tray {
-                                    tray.clipboard_event().await;
+                                    tray.clipboard_event();
                                 }
                             }
                             Ok(false) => {}

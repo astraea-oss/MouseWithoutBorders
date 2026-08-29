@@ -1,15 +1,16 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ksni::TrayMethods;
-use tokio::sync::{Mutex, mpsc};
+use tokio::{sync::mpsc, time};
 
-const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const TRAY_UPDATE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum TrayCommand {
@@ -40,7 +41,8 @@ pub enum AudioChoice {
 pub struct ReceiverTrayHandle {
     handle: ksni::Handle<ReceiverTray>,
     input_events: Arc<AtomicU64>,
-    last_input_update: Arc<Mutex<Instant>>,
+    clipboard_events: Arc<AtomicU64>,
+    counters_dirty: Arc<AtomicBool>,
 }
 
 impl ReceiverTrayHandle {
@@ -72,11 +74,21 @@ impl ReceiverTrayHandle {
             command_tx,
         };
         let handle = tray.assume_sni_available(true).spawn().await?;
+        let input_events = Arc::new(AtomicU64::new(0));
+        let clipboard_events = Arc::new(AtomicU64::new(0));
+        let counters_dirty = Arc::new(AtomicBool::new(false));
+        spawn_counter_updates(
+            handle.clone(),
+            input_events.clone(),
+            clipboard_events.clone(),
+            counters_dirty.clone(),
+        );
         Ok((
             Self {
                 handle,
-                input_events: Arc::new(AtomicU64::new(0)),
-                last_input_update: Arc::new(Mutex::new(Instant::now() - COUNTER_UPDATE_INTERVAL)),
+                input_events,
+                clipboard_events,
+                counters_dirty,
             },
             command_rx,
         ))
@@ -107,11 +119,13 @@ impl ReceiverTrayHandle {
 
     pub async fn connected(&self, peer: String) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = TrayState::Connected;
             tray.connected_peer = Some(peer);
             tray.connections = tray.connections.saturating_add(1);
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = None;
         })
         .await;
@@ -119,6 +133,7 @@ impl ReceiverTrayHandle {
 
     pub async fn disconnected(&self, error: Option<String>) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = if error.is_some() {
                 TrayState::Error
@@ -127,6 +142,7 @@ impl ReceiverTrayHandle {
             };
             tray.connected_peer = None;
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = error;
         })
         .await;
@@ -134,34 +150,25 @@ impl ReceiverTrayHandle {
 
     pub async fn disconnected_by_user(&self) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = TrayState::Paused;
             tray.connected_peer = None;
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = None;
         })
         .await;
     }
 
-    pub async fn input_event(&self) {
-        let total = self.input_events.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut last_update = self.last_input_update.lock().await;
-        if last_update.elapsed() < COUNTER_UPDATE_INTERVAL {
-            return;
-        }
-        *last_update = Instant::now();
-        drop(last_update);
-
-        self.update(move |tray| tray.input_events = total).await;
+    pub fn input_event(&self) {
+        self.input_events.fetch_add(1, Ordering::Relaxed);
+        self.counters_dirty.store(true, Ordering::Release);
     }
 
-    pub async fn clipboard_event(&self) {
-        let input_events = self.input_events.load(Ordering::Relaxed);
-        self.update(|tray| {
-            tray.input_events = input_events;
-            tray.clipboard_events = tray.clipboard_events.saturating_add(1);
-        })
-        .await;
+    pub fn clipboard_event(&self) {
+        self.clipboard_events.fetch_add(1, Ordering::Relaxed);
+        self.counters_dirty.store(true, Ordering::Release);
     }
 
     pub async fn input_forwarding(&self, enabled: bool) {
@@ -241,8 +248,35 @@ impl ReceiverTrayHandle {
     }
 
     async fn update(&self, update: impl FnOnce(&mut ReceiverTray)) {
-        let _ = self.handle.update(update).await;
+        let _ = time::timeout(TRAY_UPDATE_TIMEOUT, self.handle.update(update)).await;
     }
+}
+
+fn spawn_counter_updates(
+    handle: ksni::Handle<ReceiverTray>,
+    input_events: Arc<AtomicU64>,
+    clipboard_events: Arc<AtomicU64>,
+    counters_dirty: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = time::interval(COUNTER_UPDATE_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !counters_dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            let input_events = input_events.load(Ordering::Relaxed);
+            let clipboard_events = clipboard_events.load(Ordering::Relaxed);
+            let update = handle.update(move |tray| {
+                tray.input_events = input_events;
+                tray.clipboard_events = clipboard_events;
+            });
+            if time::timeout(TRAY_UPDATE_TIMEOUT, update).await.is_err() {
+                counters_dirty.store(true, Ordering::Release);
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
