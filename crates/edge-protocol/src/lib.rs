@@ -304,6 +304,9 @@ pub enum RoleEvent {
         failure_detail: Option<String>,
     },
     Commit(RoleState),
+    Applied {
+        role_epoch: u64,
+    },
     Abort(RoleState),
     SetPaused {
         paused: bool,
@@ -563,6 +566,7 @@ mod tests {
                 transition: RoleTransitionState::Stable,
                 ..state
             })),
+            Frame::Role(RoleEvent::Applied { role_epoch: 7 }),
             Frame::input(7, InputEvent::AllKeysUp),
             Frame::control(
                 7,

@@ -933,6 +933,7 @@ async fn run_linux_controller_session(
     let mut pending_readiness: Option<ConnectorRoleReadiness> = None;
     let mut transition_deadline: Option<tokio::time::Instant> = None;
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let mut pending_role_persistence: Option<(u64, String)> = None;
     let audio_route_store = AudioRouteStore::new(default_state_dir().join("audio.toml"));
     let stored_audio_route = audio_route_store
         .load()
@@ -1631,15 +1632,22 @@ async fn run_linux_controller_session(
                                 RoleDecision::Commit(commit) => {
                                     let controller = commit.controller_fingerprint.as_deref()
                                         .context("role commit omitted controller identity")?;
-                                    role_store
-                                        .save(&CommittedRole::new(controller))
-                                        .await
-                                        .context("failed to persist committed role before handover")?;
                                     write_secure_frame_writer(
                                         &mut writer,
                                         &Frame::Role(RoleEvent::Commit(commit.clone())),
                                     )
                                     .await?;
+                                    pending_role_persistence = Some((
+                                        commit.role_epoch,
+                                        controller.to_string(),
+                                    ));
+                                    append_portable_log(
+                                        log_path,
+                                        format!(
+                                            "role epoch {} committed in memory; waiting for peer apply confirmation before persisting {controller}",
+                                            commit.role_epoch,
+                                        ),
+                                    );
                                     role_epoch = commit.role_epoch;
                                     local_is_controller = controller == local_fingerprint;
                                     input_epoch.suspend();
@@ -1682,6 +1690,33 @@ async fn run_linux_controller_session(
                                     }
                                 }
                             }
+                        }
+                        Frame::Role(RoleEvent::Applied { role_epoch: applied_epoch }) => {
+                            let Some((expected_epoch, controller)) =
+                                pending_role_persistence.take()
+                            else {
+                                tracing::debug!(applied_epoch, "ignored unexpected role apply confirmation");
+                                continue;
+                            };
+                            if applied_epoch != expected_epoch || applied_epoch != role_epoch {
+                                pending_role_persistence = Some((expected_epoch, controller));
+                                tracing::debug!(
+                                    applied_epoch,
+                                    expected_epoch,
+                                    "ignored stale role apply confirmation"
+                                );
+                                continue;
+                            }
+                            role_store
+                                .save(&CommittedRole::new(&controller))
+                                .await
+                                .context("failed to persist peer-confirmed role handover")?;
+                            append_portable_log(
+                                log_path,
+                                format!(
+                                    "peer applied role epoch {applied_epoch}; persisted controller {controller}"
+                                ),
+                            );
                         }
                         Frame::Error(error) => {
                             anyhow::bail!("Linux peer error: {}: {}", error.code, error.message);
@@ -3877,12 +3912,11 @@ async fn handle_controller(
                             tracing::debug!(%error, "ignored invalid or stale role commit");
                             continue;
                         }
-                        let controller = commit.controller_fingerprint.as_deref()
-                            .context("role commit omitted controller identity")?;
-                        role_store
-                            .save(&CommittedRole::new(controller))
-                            .await
-                            .context("failed to mirror committed role")?;
+                        let controller = commit
+                            .controller_fingerprint
+                            .as_deref()
+                            .context("role commit omitted controller identity")?
+                            .to_string();
                         role_epoch = commit.role_epoch;
                         local_is_controller = controller == local_fingerprint;
                         capture_input_active = false;
@@ -3898,6 +3932,15 @@ async fn handle_controller(
                         {
                             capture.arm().await?;
                         }
+                        role_store
+                            .save(&CommittedRole::new(&controller))
+                            .await
+                            .context("failed to mirror applied role")?;
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Role(RoleEvent::Applied { role_epoch }),
+                        )
+                        .await?;
                         if let Some(tray) = tray {
                             tray.role_assignment(
                                 config.device_name.clone(),
@@ -3973,7 +4016,9 @@ async fn handle_controller(
                         }
                     }
                     Frame::Role(
-                        RoleEvent::Request { .. } | RoleEvent::Ready { .. },
+                        RoleEvent::Request { .. }
+                        | RoleEvent::Ready { .. }
+                        | RoleEvent::Applied { .. },
                     ) => {
                         tracing::warn!("ignored connector-only role event from connector");
                     }

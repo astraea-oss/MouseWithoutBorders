@@ -1,11 +1,13 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     num::NonZeroU32,
     os::unix::net::UnixStream,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    time::Duration,
 };
 
 use ashpd::{
@@ -24,9 +26,15 @@ use reis::{
     ei::{self, button::ButtonState, keyboard::KeyState},
     event::{DeviceCapability, EiEvent},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time,
+};
 
 use crate::{LinuxInputError, Result};
+
+const PORTAL_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
+const PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureEvent {
@@ -100,9 +108,16 @@ impl PortalCaptureBackend {
                     "failed to start portal capture thread: {error}"
                 ))
             })?;
-        ready_rx.await.map_err(|_| {
-            LinuxInputError::LibeiInit("portal capture task ended during preflight".to_string())
-        })??;
+        time::timeout(PORTAL_PREFLIGHT_TIMEOUT, ready_rx)
+            .await
+            .map_err(|_| {
+                LinuxInputError::LibeiInit(
+                    "InputCapture portal preflight timed out after three seconds".to_string(),
+                )
+            })?
+            .map_err(|_| {
+                LinuxInputError::LibeiInit("portal capture task ended during preflight".to_string())
+            })??;
         Ok(Self {
             command_tx,
             event_rx,
@@ -232,20 +247,21 @@ async fn run_portal_capture(
             command = command_rx.recv() => {
                 match command {
                     Some(CaptureCommand::Arm(response)) => {
-                        let result = input_capture.enable(&session, Default::default()).await.map_err(portal_error);
+                        let result = portal_command("Enable", input_capture.enable(&session, Default::default())).await;
                         let _ = response.send(result);
                     }
                     Some(CaptureCommand::Release { cursor_position, response }) => {
                         let result = if let Some(id) = activation_id.take() {
-                            input_capture
-                                .release(
+                            portal_command(
+                                "Release",
+                                input_capture.release(
                                     &session,
                                     ReleaseOptions::default()
                                         .set_activation_id(id)
                                         .set_cursor_position(cursor_position),
-                                )
-                                .await
-                                .map_err(portal_error)
+                                ),
+                            )
+                            .await
                         } else {
                             Ok(())
                         };
@@ -253,7 +269,7 @@ async fn run_portal_capture(
                     }
                     Some(CaptureCommand::Disarm(response)) => {
                         activation_id = None;
-                        let result = input_capture.disable(&session, Default::default()).await.map_err(portal_error);
+                        let result = portal_command("Disable", input_capture.disable(&session, Default::default())).await;
                         let _ = response.send(result);
                     }
                     Some(CaptureCommand::Shutdown) | None => break,
@@ -349,6 +365,20 @@ async fn run_portal_capture(
     let _ = input_capture.disable(&session, Default::default()).await;
     let _ = session.close().await;
     Ok(())
+}
+
+async fn portal_command<T>(
+    name: &'static str,
+    command: impl Future<Output = std::result::Result<T, PortalError>>,
+) -> Result<T> {
+    time::timeout(PORTAL_COMMAND_TIMEOUT, command)
+        .await
+        .map_err(|_| {
+            LinuxInputError::LibeiInit(format!(
+                "InputCapture portal {name} call timed out after two seconds"
+            ))
+        })?
+        .map_err(portal_error)
 }
 
 async fn create_and_start_session(
