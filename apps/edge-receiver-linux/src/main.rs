@@ -2105,6 +2105,33 @@ async fn recv_portal_capture_event(
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn request_connector_control_after_capture_failure(
+    writer: &mut ScheduledNoiseWriter,
+    connector_fingerprint: &str,
+    connector_name: &str,
+    tray: Option<&ReceiverTrayHandle>,
+    log_path: &Path,
+    detail: impl std::fmt::Display,
+) -> Result<()> {
+    let message = format!(
+        "Linux input capture unavailable ({detail}); returning control to {connector_name}"
+    );
+    tracing::warn!(%message);
+    append_portable_log(log_path, &message);
+    write_secure_frame_writer(
+        writer,
+        &Frame::Role(RoleEvent::Request {
+            controller_fingerprint: connector_fingerprint.to_string(),
+        }),
+    )
+    .await?;
+    if let Some(tray) = tray {
+        tray.role_failure(message).await;
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn linux_release_cursor(
     screen_info: Option<&ScreenInfo>,
@@ -3011,6 +3038,27 @@ async fn handle_controller(
                         )
                         .await
                         .ok();
+                        capture_input_active = false;
+                        capture = None;
+                        if local_is_controller
+                            && role_switch_available
+                            && !session_paused
+                            && role_request_deadline.is_none()
+                        {
+                            request_connector_control_after_capture_failure(
+                                &mut writer,
+                                controller_fingerprint,
+                                controller_name,
+                                tray,
+                                log_path,
+                                error,
+                            )
+                            .await?;
+                            role_request_deadline = Some(
+                                tokio::time::Instant::now() + Duration::from_secs(5),
+                            );
+                            continue;
+                        }
                         anyhow::bail!("Linux capture backend failed: {error}");
                     }
                     None if capture.is_some() && local_is_controller => {
@@ -3768,22 +3816,29 @@ async fn handle_controller(
                         session_paused = state.paused;
                         local_is_controller = state.controller_fingerprint.as_deref()
                             == Some(local_fingerprint);
+                        let mut capture_failure = None;
                         if local_is_controller {
                             backend.all_keys_up().await.ok();
                             if capture.is_none() {
-                                capture = Some(
-                                    PortalCaptureBackend::preflight(opposite_edge(
-                                        state.listener_position,
-                                    ))
-                                    .await
-                                    .context("listener capture preflight failed")?,
-                                );
+                                match PortalCaptureBackend::preflight(opposite_edge(
+                                    state.listener_position,
+                                ))
+                                .await
+                                {
+                                    Ok(backend) => capture = Some(backend),
+                                    Err(error) => capture_failure = Some(error.to_string()),
+                                }
                             }
                             if input_forwarding_enabled
                                 && !session_paused
                                 && let Some(capture) = &capture
+                                && capture_failure.is_none()
+                                && let Err(error) = capture.arm().await
                             {
-                                capture.arm().await?;
+                                capture_failure = Some(error.to_string());
+                            }
+                            if capture_failure.is_some() {
+                                capture = None;
                             }
                         } else {
                             if let Some(capture) = &capture {
@@ -3815,6 +3870,27 @@ async fn handle_controller(
                                 role_switch_available && !session_paused,
                             )
                             .await;
+                        }
+                        if let Some(error) = capture_failure {
+                            if role_switch_available && !session_paused {
+                                request_connector_control_after_capture_failure(
+                                    &mut writer,
+                                    controller_fingerprint,
+                                    controller_name,
+                                    tray,
+                                    log_path,
+                                    error,
+                                )
+                                .await?;
+                                role_request_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
+                            } else if let Some(tray) = tray {
+                                tray.role_failure(format!(
+                                    "Linux input capture unavailable: {error}"
+                                ))
+                                .await;
+                            }
                         }
                         tracing::info!(
                             role_epoch,
@@ -3925,12 +4001,33 @@ async fn handle_controller(
                         role_request_deadline = None;
                         input_epoch.suspend();
                         backend.all_keys_up().await.ok();
+                        let mut capture_failure = None;
                         if local_is_controller
                             && input_forwarding_enabled
                             && !session_paused
                             && let Some(capture) = &capture
+                            && let Err(error) = capture.arm().await
                         {
-                            capture.arm().await?;
+                            capture_failure = Some(error.to_string());
+                        }
+                        if let Some(error) = capture_failure {
+                            capture = None;
+                            if role_switch_available && !session_paused {
+                                request_connector_control_after_capture_failure(
+                                    &mut writer,
+                                    controller_fingerprint,
+                                    controller_name,
+                                    tray,
+                                    log_path,
+                                    error,
+                                )
+                                .await?;
+                                role_request_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
+                                continue;
+                            }
+                            anyhow::bail!("failed to apply Linux controller role: {error}");
                         }
                         role_store
                             .save(&CommittedRole::new(&controller))
