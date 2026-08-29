@@ -75,7 +75,8 @@ impl PortalCaptureBackend {
     pub async fn preflight(edge: Edge) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (ready_tx, ready_rx) = oneshot::channel();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
         let zone_set = Arc::new(AtomicU32::new(0));
         let task_zone_set = zone_set.clone();
         std::thread::Builder::new()
@@ -93,13 +94,27 @@ impl PortalCaptureBackend {
                         return;
                     }
                 };
-                if let Err(error) = runtime.block_on(run_portal_capture(
+                let capture = run_portal_capture(
                     edge,
                     command_rx,
                     event_tx.clone(),
-                    ready_tx,
+                    ready_tx.clone(),
                     task_zone_set,
-                )) {
+                );
+                let startup_cancel = async move {
+                    if startup_cancel_rx.await.is_err() {
+                        futures_util::future::pending::<()>().await;
+                    }
+                };
+                let result = runtime.block_on(async {
+                    tokio::select! {
+                        result = capture => result,
+                        () = startup_cancel => Ok(()),
+                    }
+                });
+                if let Err(error) = result {
+                    let detail = error.to_string();
+                    let _ = ready_tx.send(Err(LinuxInputError::LibeiInit(detail.clone())));
                     let _ = event_tx.send(CaptureEvent::BackendFailed(error.to_string()));
                 }
             })
@@ -108,16 +123,25 @@ impl PortalCaptureBackend {
                     "failed to start portal capture thread: {error}"
                 ))
             })?;
-        time::timeout(PORTAL_PREFLIGHT_TIMEOUT, ready_rx)
-            .await
-            .map_err(|_| {
-                LinuxInputError::LibeiInit(
-                    "InputCapture portal preflight timed out after three seconds".to_string(),
-                )
-            })?
-            .map_err(|_| {
-                LinuxInputError::LibeiInit("portal capture task ended during preflight".to_string())
-            })??;
+        match time::timeout(PORTAL_PREFLIGHT_TIMEOUT, ready_rx.recv()).await {
+            Ok(Some(result)) => result?,
+            Ok(None) => {
+                return Err(LinuxInputError::LibeiInit(
+                    "InputCapture portal task ended during preflight".to_string(),
+                ));
+            }
+            Err(_) => {
+                // Cancelling the setup future is important: returning while its dedicated
+                // thread remains blocked leaks both the thread and (on affected XDPH
+                // versions) the compositor-side capture session. Repeated role attempts
+                // would eventually wedge the portal for every application.
+                let _ = startup_cancel_tx.send(());
+                return Err(LinuxInputError::LibeiInit(
+                    "InputCapture portal stopped responding during preflight; restart xdg-desktop-portal-hyprland before retrying"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(Self {
             command_tx,
             event_rx,
@@ -187,7 +211,7 @@ async fn run_portal_capture(
     edge: Edge,
     mut command_rx: mpsc::Receiver<CaptureCommand>,
     event_tx: mpsc::UnboundedSender<CaptureEvent>,
-    ready_tx: oneshot::Sender<Result<()>>,
+    ready_tx: mpsc::UnboundedSender<Result<()>>,
     zone_set_state: Arc<AtomicU32>,
 ) -> Result<()> {
     let input_capture = InputCapture::new().await.map_err(portal_error)?;

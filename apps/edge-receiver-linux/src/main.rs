@@ -2262,6 +2262,11 @@ async fn run_receiver(
 
     let mut connection_enabled = true;
     let mut pairing_armed = initial_pairing_armed;
+    // Keep one compositor capture session across transport reconnects. Creating a
+    // fresh portal session for every short network interruption is wasteful and
+    // triggers session leaks in affected xdg-desktop-portal-hyprland releases.
+    #[cfg(target_os = "linux")]
+    let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
     loop {
         let (stream, addr) = tokio::select! {
             command = recv_tray_command(&mut tray_commands) => {
@@ -2627,6 +2632,8 @@ async fn run_receiver(
             &peer_fingerprint,
             &identity.fingerprint(),
             &hello.device_name,
+            #[cfg(target_os = "linux")]
+            &mut capture,
         )
         .await
         {
@@ -2650,6 +2657,11 @@ async fn run_receiver(
                 tracing::warn!(%err, "controller session ended");
                 append_portable_log(&log_path, format!("controller session ended: {err:#}"));
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(capture_backend) = &capture {
+            capture_backend.release(None).await.ok();
+            capture_backend.disarm().await.ok();
         }
         backend.all_keys_up().await.ok();
     }
@@ -2835,6 +2847,7 @@ async fn handle_controller(
     controller_fingerprint: &str,
     local_fingerprint: &str,
     controller_name: &str,
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
 
@@ -2882,7 +2895,6 @@ async fn handle_controller(
     };
     let mut local_is_controller = false;
     let mut capture_input_active = false;
-    let mut capture: Option<PortalCaptureBackend> = None;
     let mut prepared_role: Option<edge_protocol::RoleState> = None;
     let mut role_request_deadline: Option<tokio::time::Instant> = None;
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
@@ -2970,7 +2982,7 @@ async fn handle_controller(
                     None => {}
                 }
             }
-            event = recv_portal_capture_event(&mut capture) => {
+            event = recv_portal_capture_event(capture) => {
                 match event {
                     Some(CaptureEvent::Activated { edge, normalized_position, .. })
                         if local_is_controller && input_forwarding_enabled && !session_paused =>
@@ -3039,7 +3051,7 @@ async fn handle_controller(
                         .await
                         .ok();
                         capture_input_active = false;
-                        capture = None;
+                        *capture = None;
                         if local_is_controller
                             && role_switch_available
                             && !session_paused
@@ -3825,7 +3837,7 @@ async fn handle_controller(
                                 ))
                                 .await
                                 {
-                                    Ok(backend) => capture = Some(backend),
+                                    Ok(backend) => *capture = Some(backend),
                                     Err(error) => capture_failure = Some(error.to_string()),
                                 }
                             }
@@ -3838,7 +3850,7 @@ async fn handle_controller(
                                 capture_failure = Some(error.to_string());
                             }
                             if capture_failure.is_some() {
-                                capture = None;
+                                *capture = None;
                             }
                         } else {
                             if let Some(capture) = &capture {
@@ -3953,7 +3965,7 @@ async fn handle_controller(
                             ))
                             .await
                             {
-                                Ok(backend) => capture = Some(backend),
+                                Ok(backend) => *capture = Some(backend),
                                 Err(error) => {
                                     capture_ready = false;
                                     failure_detail = Some(format!(
@@ -4011,7 +4023,7 @@ async fn handle_controller(
                             capture_failure = Some(error.to_string());
                         }
                         if let Some(error) = capture_failure {
-                            capture = None;
+                            *capture = None;
                             if role_switch_available && !session_paused {
                                 request_connector_control_after_capture_failure(
                                     &mut writer,
