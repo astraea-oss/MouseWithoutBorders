@@ -2227,6 +2227,27 @@ async fn run_connected_inner(
                     Frame::Audio(AudioControl::State { state, detail }) => {
                         tracing::info!(?state, ?detail, "Linux audio state changed");
                         append_portable_log(log_path, format!("Linux audio state changed: {state:?}{}", detail.as_deref().map(|detail| format!(": {detail}")).unwrap_or_default()));
+                        if state == AudioStreamState::Error
+                            && audio_source.as_deref() == Some(local_fingerprint.as_str())
+                            && !audio_restart_attempted
+                            && !session_paused
+                        {
+                            audio_restart_attempted = true;
+                            _audio_sender = None;
+                            pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                            append_portable_log(
+                                log_path,
+                                "Linux playback failed; renegotiating Windows audio once",
+                            );
+                            update_windows_tray_audio_route(
+                                edge_windows_input::WindowsAudioChoice::Local,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                "Audio: Restarting",
+                                log_path,
+                            );
+                            continue;
+                        }
                         if state == AudioStreamState::Streaming
                             && let Some(receiver) = &_audio_receiver
                         {

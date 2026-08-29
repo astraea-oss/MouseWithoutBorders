@@ -281,6 +281,7 @@ impl LinuxAudioReceiver {
             let started = tokio::time::Instant::now();
             let mut last_media = started;
             let mut received_media = false;
+            let mut media_stalled = false;
             let reason = 'receive: loop {
                 tokio::select! {
                     received = socket.recv_from(&mut buffer) => {
@@ -289,6 +290,10 @@ impl LinuxAudioReceiver {
                                 Ok(packet) if packet.flags & FLAG_PROBE == 0 => {
                                     received_media = true;
                                     last_media = tokio::time::Instant::now();
+                                    if media_stalled {
+                                        tracing::info!("Linux audio media recovered after a UDP gap");
+                                        media_stalled = false;
+                                    }
                                     if jitter.push(packet) {
                                         for _ in 0..8 {
                                             let Some(packet) = jitter.pop_ready() else { break; };
@@ -322,8 +327,16 @@ impl LinuxAudioReceiver {
                         }
                     }
                     _ = watchdog.tick() => {
-                        if received_media && last_media.elapsed() > Duration::from_secs(2) {
-                            break "no authenticated audio received for 2 seconds".to_string();
+                        if received_media
+                            && !media_stalled
+                            && last_media.elapsed() > Duration::from_secs(2)
+                        {
+                            // UDP can disappear briefly on Wi-Fi while the encrypted
+                            // control session remains healthy. Keep pacat and the
+                            // negotiated keys alive so playback resumes naturally when
+                            // media returns instead of permanently killing the route.
+                            media_stalled = true;
+                            tracing::warn!("Linux audio media paused after a UDP gap; waiting for recovery");
                         }
                         if !received_media && started.elapsed() > Duration::from_secs(8) {
                             break "audio source did not start within 8 seconds".to_string();
