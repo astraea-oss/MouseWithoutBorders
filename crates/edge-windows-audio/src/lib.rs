@@ -3,11 +3,12 @@ mod implementation {
     use std::{
         cell::UnsafeCell,
         collections::VecDeque,
-        net::SocketAddr,
+        net::{IpAddr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
+        thread,
         time::{Duration, Instant},
     };
 
@@ -18,9 +19,56 @@ mod implementation {
     };
     use edge_audio::{
         AudioPacket, CHANNELS, FLAG_PROBE, FRAME_MS, JitterBuffer, MAX_DATAGRAM_BYTES,
-        PacketCipher, PcmCodec, SAMPLE_RATE, SAMPLES_PER_CHANNEL, SessionSecrets,
+        PacketCipher, PcmCodec, PcmConcealer, SAMPLE_RATE, SAMPLES_PER_CHANNEL, SessionSecrets,
     };
-    use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time};
+    use tokio::{
+        net::UdpSocket,
+        sync::{mpsc, oneshot},
+        task::JoinHandle,
+        time,
+    };
+    use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat, initialize_mta};
+
+    /// Authenticates the UDP endpoint observed on the wire before capture starts.
+    pub async fn establish_peer(
+        socket: &UdpSocket,
+        cipher: &PacketCipher,
+        advertised_destination: SocketAddr,
+        expected_ip: IpAddr,
+        timeout: Duration,
+    ) -> Result<SocketAddr> {
+        let probe = cipher.seal(&AudioPacket {
+            sequence: u64::MAX,
+            sample_timestamp: 0,
+            flags: FLAG_PROBE,
+            payload: Vec::new(),
+        })?;
+        let deadline = time::Instant::now() + timeout;
+        let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+        loop {
+            socket
+                .send_to(&probe, advertised_destination)
+                .await
+                .context("failed to send Windows audio UDP probe")?;
+            let now = time::Instant::now();
+            if now >= deadline {
+                anyhow::bail!("timed out establishing the authenticated UDP audio path");
+            }
+            let wait = (deadline - now).min(Duration::from_millis(250));
+            match time::timeout(wait, socket.recv_from(&mut buffer)).await {
+                Ok(Ok((length, source))) if source.ip() == expected_ip => {
+                    if let Ok(packet) = cipher.open(&buffer[..length])
+                        && packet.flags & FLAG_PROBE != 0
+                        && packet.payload.is_empty()
+                    {
+                        return Ok(source);
+                    }
+                }
+                Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(error)) => return Err(error).context("failed to receive audio UDP probe"),
+            }
+        }
+    }
 
     const OUTPUT_PREBUFFER_MS: u32 = 30;
     const OUTPUT_TARGET_MS: u32 = 60;
@@ -328,45 +376,174 @@ mod implementation {
         }
     }
 
-    #[derive(Default)]
-    struct PcmConcealer {
-        last_sample: [f32; CHANNELS],
-        recovering: bool,
-    }
-
-    impl PcmConcealer {
-        fn decode(&mut self, packet: Option<&[u8]>) -> edge_audio::Result<Vec<f32>> {
-            let Some(packet) = packet else {
-                self.recovering = true;
-                let mut concealed = Vec::with_capacity(SAMPLES_PER_CHANNEL * CHANNELS);
-                for frame in 0..SAMPLES_PER_CHANNEL {
-                    let gain = 1.0 - (frame + 1) as f32 / SAMPLES_PER_CHANNEL as f32;
-                    concealed.push(self.last_sample[0] * gain);
-                    concealed.push(self.last_sample[1] * gain);
-                }
-                self.last_sample = [0.0; CHANNELS];
-                return Ok(concealed);
-            };
-
-            let mut pcm = PcmCodec::decode(Some(packet))?;
-            if self.recovering {
-                let fade_frames = 48.min(SAMPLES_PER_CHANNEL);
-                for frame in 0..fade_frames {
-                    let gain = (frame + 1) as f32 / fade_frames as f32;
-                    pcm[frame * CHANNELS] *= gain;
-                    pcm[frame * CHANNELS + 1] *= gain;
-                }
-                self.recovering = false;
-            }
-            self.last_sample = [pcm[pcm.len() - CHANNELS], pcm[pcm.len() - CHANNELS + 1]];
-            Ok(pcm)
-        }
-    }
-
     pub struct WindowsAudioReceiver {
         task: Option<JoinHandle<String>>,
         linux_streaming: Arc<AtomicBool>,
         stats: Arc<PlaybackStats>,
+    }
+
+    pub struct WindowsAudioSender {
+        task: Option<JoinHandle<String>>,
+        stop: Arc<AtomicBool>,
+        capture_thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WindowsAudioSender {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+            // WASAPI capture is event-driven and observes `stop` within 500 ms.
+            // Do not block the async runtime while it winds down.
+            self.capture_thread.take();
+        }
+    }
+
+    impl WindowsAudioSender {
+        pub async fn start(
+            socket: Arc<UdpSocket>,
+            destination: SocketAddr,
+            secrets: SessionSecrets,
+        ) -> Result<Self> {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (capture_tx, mut capture_rx) =
+                mpsc::channel::<std::result::Result<Vec<u8>, String>>(8);
+            let capture_stop = stop.clone();
+            let capture_thread = thread::Builder::new()
+                .name("edge-kvm-wasapi-loopback".to_string())
+                .spawn(move || {
+                    if let Err(error) = capture_windows_loopback(capture_tx.clone(), &capture_stop)
+                    {
+                        let _ = capture_tx.blocking_send(Err(format!("{error:#}")));
+                    }
+                })
+                .context("failed to start Windows audio capture thread")?;
+
+            let cipher = PacketCipher::new(&secrets);
+            let (first_packet_tx, first_packet_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let mut sequence = 1_u64;
+                let mut timestamp = 0_u32;
+                let mut payload = Vec::with_capacity(edge_audio::PCM_BYTES_PER_FRAME);
+                let mut first_packet_tx = Some(first_packet_tx);
+                loop {
+                    let Some(captured) = capture_rx.recv().await else {
+                        break "Windows audio capture stopped".to_string();
+                    };
+                    let frame = match captured {
+                        Ok(frame) => frame,
+                        Err(error) => break format!("Windows audio capture failed: {error}"),
+                    };
+                    if let Err(error) = PcmCodec::encode_f32le_into(&frame, &mut payload) {
+                        break format!("Windows PCM encoding failed: {error}");
+                    }
+                    let datagram = match cipher.seal_payload(sequence, timestamp, 0, &payload) {
+                        Ok(datagram) => datagram,
+                        Err(error) => break format!("Windows audio encryption failed: {error}"),
+                    };
+                    if let Err(error) = socket.send_to(&datagram, destination).await {
+                        break format!("Windows audio UDP send failed: {error}");
+                    }
+                    if let Some(started) = first_packet_tx.take() {
+                        let _ = started.send(());
+                    }
+                    sequence = sequence.wrapping_add(1);
+                    timestamp = timestamp.wrapping_add(SAMPLES_PER_CHANNEL as u32);
+                }
+            });
+            let mut sender = Self {
+                task: Some(task),
+                stop,
+                capture_thread: Some(capture_thread),
+            };
+            match time::timeout(Duration::from_secs(3), first_packet_rx).await {
+                Ok(Ok(())) => Ok(sender),
+                Ok(Err(_)) => {
+                    let reason = sender.failure_reason().await;
+                    anyhow::bail!(reason)
+                }
+                Err(_) => {
+                    sender.stop.store(true, Ordering::Release);
+                    anyhow::bail!("Windows loopback capture produced no media for 3 seconds")
+                }
+            }
+        }
+
+        pub fn is_finished(&self) -> bool {
+            self.task.as_ref().is_none_or(|task| task.is_finished())
+        }
+
+        pub async fn failure_reason(&mut self) -> String {
+            self.stop.store(true, Ordering::Release);
+            let Some(task) = self.task.take() else {
+                return "Windows audio sender stopped without a result".to_string();
+            };
+            match task.await {
+                Ok(reason) => reason,
+                Err(error) => format!("Windows audio sender task failed: {error}"),
+            }
+        }
+    }
+
+    fn capture_windows_loopback(
+        tx: mpsc::Sender<std::result::Result<Vec<u8>, String>>,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        initialize_mta()
+            .ok()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let enumerator = DeviceEnumerator::new().map_err(|error| anyhow::anyhow!(error))?;
+        let device = enumerator
+            .get_default_device(&Direction::Render)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut client = device
+            .get_iaudioclient()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
+        let (_, minimum_period) = client
+            .get_device_period()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        client
+            .initialize_client(
+                &format,
+                &Direction::Render,
+                &StreamMode::EventsShared {
+                    autoconvert: true,
+                    buffer_duration_hns: minimum_period,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let event = client
+            .set_get_eventhandle()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let capture = client
+            .get_audiocaptureclient()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut samples = VecDeque::new();
+        let frame_bytes = edge_audio::SAMPLES_PER_FRAME * size_of::<f32>();
+        client
+            .start_stream()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        while !stop.load(Ordering::Acquire) {
+            if event.wait_for_event(500).is_err() {
+                continue;
+            }
+            capture
+                .read_from_device_to_deque(&mut samples)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            while samples.len() >= frame_bytes {
+                let frame = samples.drain(..frame_bytes).collect::<Vec<_>>();
+                if tx.blocking_send(Ok(frame)).is_err() {
+                    client.stop_stream().ok();
+                    return Ok(());
+                }
+            }
+        }
+        client
+            .stop_stream()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(())
     }
 
     impl Drop for WindowsAudioReceiver {

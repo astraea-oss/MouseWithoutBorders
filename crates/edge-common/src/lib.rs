@@ -96,8 +96,21 @@ pub enum AudioLocalPlayback {
     Mirror,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioRoutePreference {
+    Disabled,
+    LocalToPeer,
+    PeerToLocal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// Explicit direction for new configs. `None` means migrate the legacy
+    /// `enabled` flag as peer-to-local on the connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<AudioRoutePreference>,
+    #[serde(default)]
     pub enabled: bool,
     pub local_playback: AudioLocalPlayback,
     pub jitter_target_ms: u32,
@@ -106,6 +119,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
+            route: Some(AudioRoutePreference::Disabled),
             enabled: false,
             local_playback: AudioLocalPlayback::Redirect,
             jitter_target_ms: 60,
@@ -392,6 +406,7 @@ impl ConfigFile {
         };
 
         let audio = self.audio.unwrap_or_else(|| AudioConfig {
+            route: None,
             enabled: legacy_role == Some(Role::Controller),
             ..AudioConfig::default()
         });
@@ -438,6 +453,7 @@ impl AppConfig {
             input: InputConfig::default(),
             clipboard: ClipboardConfig::default(),
             audio: AudioConfig {
+                route: Some(AudioRoutePreference::PeerToLocal),
                 enabled: true,
                 ..AudioConfig::default()
             },
@@ -749,12 +765,17 @@ mod tests {
         assert!(actual.clipboard.images_enabled);
         assert_eq!(actual.clipboard.max_image_bytes, 4_194_304);
         assert!(!actual.audio.enabled);
+        assert_eq!(actual.audio.route, Some(AudioRoutePreference::Disabled));
         assert_eq!(actual.audio.local_playback, AudioLocalPlayback::Redirect);
     }
 
     #[test]
     fn new_controller_configs_enable_audio() {
         assert!(AppConfig::controller_default().audio.enabled);
+        assert_eq!(
+            AppConfig::controller_default().audio.route,
+            Some(AudioRoutePreference::PeerToLocal)
+        );
     }
 
     #[test]
@@ -768,6 +789,7 @@ listen = "0.0.0.0:42420"
         )
         .unwrap();
         assert!(!config.audio.enabled);
+        assert_eq!(config.audio.route, None);
         assert_eq!(config.audio.jitter_target_ms, 60);
     }
 
@@ -801,6 +823,7 @@ backend = "auto"
         assert!(config.clipboard.enabled);
         assert!(config.clipboard.images_enabled);
         assert!(config.audio.enabled);
+        assert_eq!(config.audio.route, None);
     }
 
     #[test]
@@ -816,6 +839,7 @@ backend = "auto"
         assert!(config.clipboard.enabled);
         assert!(config.clipboard.images_enabled);
         assert!(!config.audio.enabled);
+        assert_eq!(config.audio.route, None);
     }
 
     #[tokio::test]

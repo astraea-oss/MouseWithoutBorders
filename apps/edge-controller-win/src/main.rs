@@ -22,24 +22,24 @@ use edge_clipboard::{
 };
 use edge_common::PeerPosition;
 use edge_common::{
-    AppConfig, Role, TransportMode, default_state_dir, detect_primary_local_ip, init_tracing,
-    portable_config_path,
+    AppConfig, AudioRoutePreference, Role, TransportMode, default_state_dir,
+    detect_primary_local_ip, init_tracing, portable_config_path,
 };
 use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session, pairing_code};
 #[cfg(windows)]
 use edge_geometry::{Point, Rect, Size, normalized_perpendicular};
 use edge_protocol::Edge;
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello,
-    INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, NodeCapability,
-    OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent,
-    RoleState, RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
+    AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStopReason, AudioStreamState,
+    CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame,
+    Heartbeat, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton,
+    NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent,
+    RoleEvent, RoleState, RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
 };
 use edge_runtime::{
-    CommittedRole, InputDirectionCapabilities, InputEpochGate, LivenessConfig, LivenessEvent,
-    LivenessTracker, RoleCoordinator, RoleDecision, RoleStore, SecureFrameReader,
-    SecureFrameSession, SecureFrameWriter, select_initial_controller,
+    AudioRouteStore, CommittedAudioRoute, CommittedRole, InputDirectionCapabilities,
+    InputEpochGate, LivenessConfig, LivenessEvent, LivenessTracker, RoleCoordinator, RoleDecision,
+    RoleStore, SecureFrameReader, SecureFrameSession, SecureFrameWriter, select_initial_controller,
 };
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput};
 use tokio::{
@@ -269,13 +269,14 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         input_forwarding_enabled = enabled;
                         update_windows_tray_input_forwarding(enabled, &controller_log);
                     }
-                    TrayCommandOutcome::AudioChanged(enabled) => {
-                        config.audio.enabled = enabled;
+                    TrayCommandOutcome::AudioChanged(choice) => {
+                        config.audio.enabled =
+                            choice != edge_windows_input::WindowsAudioChoice::Off;
                         update_windows_tray_audio(
-                            enabled,
-                            if enabled && connection_enabled {
+                            config.audio.enabled,
+                            if config.audio.enabled && connection_enabled {
                                 "Audio: Starting"
-                            } else if enabled {
+                            } else if config.audio.enabled {
                                 "Audio: Paused"
                             } else {
                                 "Audio: Off"
@@ -527,6 +528,25 @@ fn update_windows_tray_audio(enabled: bool, status: &str, log_path: &Path) {
 }
 
 #[cfg(windows)]
+fn update_windows_tray_audio_route(
+    choice: edge_windows_input::WindowsAudioChoice,
+    local_available: bool,
+    peer_available: bool,
+    status: &str,
+    log_path: &Path,
+) {
+    if let Err(err) =
+        edge_windows_input::update_tray_audio_route(choice, local_available, peer_available, status)
+    {
+        tracing::warn!(%err, ?choice, status, "failed to update Windows tray audio route");
+        append_portable_log(
+            log_path,
+            format!("failed to update Windows tray audio route to {status}: {err}"),
+        );
+    }
+}
+
+#[cfg(windows)]
 fn update_windows_tray_input_forwarding(enabled: bool, log_path: &Path) {
     if let Err(err) = edge_windows_input::update_tray_input_forwarding(enabled) {
         tracing::warn!(%err, enabled, "failed to update Windows tray input forwarding state");
@@ -545,7 +565,7 @@ enum TrayCommandOutcome {
     Reconnect,
     Pair,
     InputForwardingChanged(bool),
-    AudioChanged(bool),
+    AudioChanged(edge_windows_input::WindowsAudioChoice),
     ControllerRequested(edge_windows_input::WindowsControllerChoice),
 }
 
@@ -593,18 +613,9 @@ fn handle_pending_windows_tray_commands(
                 append_portable_log(log_path, format!("input forwarding toggled to {enabled}"));
                 return Ok(TrayCommandOutcome::InputForwardingChanged(enabled));
             }
-            edge_windows_input::WindowsTrayCommand::ToggleAudio => {
-                let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
-                    tracing::warn!(%err, "failed to reload config for audio toggle");
-                    config.clone()
-                });
-                updated.audio.enabled = !updated.audio.enabled;
-                updated.save_blocking(config_path)?;
-                append_portable_log(
-                    log_path,
-                    format!("audio streaming toggled to {}", updated.audio.enabled),
-                );
-                return Ok(TrayCommandOutcome::AudioChanged(updated.audio.enabled));
+            edge_windows_input::WindowsTrayCommand::SetAudio(choice) => {
+                append_portable_log(log_path, format!("audio route requested: {choice:?}"));
+                return Ok(TrayCommandOutcome::AudioChanged(choice));
             }
             edge_windows_input::WindowsTrayCommand::SetController(choice) => {
                 append_portable_log(log_path, format!("controller role requested: {choice:?}"));
@@ -920,12 +931,14 @@ async fn connect_session(
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                AUDIO_ROUTE_EXTENSION.to_string(),
             ],
             node_capabilities: vec![
                 NodeCapability::InputCaptureV1,
                 NodeCapability::InputInjectV1,
                 NodeCapability::RoleSwitchV1,
                 NodeCapability::ScreenInfoBothSidesV1,
+                NodeCapability::AudioCaptureV1,
                 NodeCapability::AudioPlaybackV1,
             ],
         }),
@@ -1126,9 +1139,16 @@ async fn run_connected_inner(
     mut tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
 ) -> Result<ConnectedSessionExit> {
     let connection_status = connection.status();
-    let peer_supports_audio = initial_receiver
+    let peer_supports_audio_capture = initial_receiver
         .node_capabilities
         .contains(&NodeCapability::AudioCaptureV1);
+    let peer_supports_audio_playback = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::AudioPlaybackV1);
+    let peer_supports_audio_route = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == AUDIO_ROUTE_EXTENSION);
     let peer_supports_input_toggle = initial_receiver
         .extensions
         .iter()
@@ -1176,6 +1196,7 @@ async fn run_connected_inner(
     let mut pending_role_readiness: Option<(bool, bool, Option<String>)> = None;
     let mut transition_deadline: Option<tokio::time::Instant> = None;
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let audio_route_store = AudioRouteStore::new(default_state_dir().join("audio.toml"));
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
     append_portable_log(
         log_path,
@@ -1219,34 +1240,71 @@ async fn run_connected_inner(
     let mut receiver_liveness = LivenessTracker::new(liveness_config, tokio::time::Instant::now());
     let peer_ip = connection.peer_addr.ip();
     let mut _audio_receiver: Option<edge_windows_audio::WindowsAudioReceiver> = None;
+    let mut _audio_sender: Option<edge_windows_audio::WindowsAudioSender> = None;
+    let mut pending_audio_socket: Option<std::sync::Arc<UdpSocket>> = None;
     let mut audio_restart_attempted = false;
-    let mut audio_enabled = runtime_config.audio.enabled;
-    if peer_supports_audio && !session_paused {
+    let stored_audio_route = audio_route_store
+        .load()
+        .await
+        .context("failed to load committed audio route")?
+        .filter(|route| route.belongs_to(&local_fingerprint, &peer_fingerprint));
+    let mut audio_source = match stored_audio_route.as_ref() {
+        Some(route) => route.source_fingerprint.clone(),
+        None => match runtime_config.audio.route {
+            Some(AudioRoutePreference::Disabled) => None,
+            Some(AudioRoutePreference::LocalToPeer) => Some(local_fingerprint.clone()),
+            Some(AudioRoutePreference::PeerToLocal) => Some(peer_fingerprint.clone()),
+            None if runtime_config.audio.enabled => Some(peer_fingerprint.clone()),
+            None => None,
+        },
+    };
+    if audio_source.as_deref() == Some(local_fingerprint.as_str())
+        && (!peer_supports_audio_playback || !peer_supports_audio_route)
+        || audio_source.as_deref() == Some(peer_fingerprint.as_str())
+            && !peer_supports_audio_capture
+    {
+        audio_source = None;
+    }
+    if stored_audio_route.is_none() {
+        let committed = audio_source.clone().map_or_else(
+            CommittedAudioRoute::disabled,
+            CommittedAudioRoute::from_source,
+        );
+        audio_route_store
+            .save(&committed)
+            .await
+            .context("failed to persist initial audio route")?;
+    }
+    let mut audio_enabled = audio_source.is_some();
+    let audio_choice = windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint);
+    update_windows_tray_audio_route(
+        audio_choice,
+        peer_supports_audio_playback && peer_supports_audio_route,
+        peer_supports_audio_capture,
+        if audio_enabled {
+            "Audio: Starting"
+        } else {
+            "Audio: Off"
+        },
+        log_path,
+    );
+    if !session_paused {
         append_portable_log(
             log_path,
-            format!("requesting Linux audio enabled={audio_enabled}"),
+            format!("committing audio source {audio_source:?}"),
         );
-        update_windows_tray_audio(
-            audio_enabled,
-            if audio_enabled {
-                "Audio: Starting"
-            } else {
-                "Audio: Off"
-            },
-            log_path,
-        );
-        write_secure_frame_writer(
+        send_windows_audio_route(
             &mut writer,
-            &Frame::Audio(AudioControl::SetEnabled {
-                enabled: audio_enabled,
-            }),
+            peer_supports_audio_route,
+            &audio_source,
+            &peer_fingerprint,
         )
         .await?;
+        if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+            pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+        }
     } else if session_paused {
         update_windows_tray_audio(audio_enabled, "Audio: Paused", log_path);
-    } else {
-        append_portable_log(log_path, "receiver does not advertise AudioV1");
-        update_windows_tray_audio(audio_enabled, "Audio: Unsupported by receiver", log_path);
     }
     if peer_supports_input_toggle {
         write_secure_frame_writer(
@@ -1288,7 +1346,7 @@ async fn run_connected_inner(
                 )
                 .await
                 .ok();
-                if peer_supports_audio {
+                if audio_enabled {
                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                 }
                 tracing::info!("shutdown requested");
@@ -1321,37 +1379,32 @@ async fn run_connected_inner(
                         .expect("finished Windows audio receiver disappeared")
                         .failure_reason()
                         .await;
-                    if audio_enabled && peer_supports_audio && !audio_restart_attempted {
+                    if audio_source.as_deref() == Some(peer_fingerprint.as_str()) && !audio_restart_attempted {
                         audio_restart_attempted = true;
                         update_windows_tray_audio(true, "Audio: Restarting", log_path);
                         append_portable_log(log_path, format!("Windows audio media stopped ({failure}); requesting one restart"));
-                        write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
+                        send_windows_audio_route(&mut writer, peer_supports_audio_route, &audio_source, &peer_fingerprint).await?;
                     } else {
                         update_windows_tray_audio(audio_enabled, &format!("Audio error: {failure}"), log_path);
                         append_portable_log(log_path, format!("Windows audio transport stopped: {failure}"));
                         write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::TransportFailure })).await.ok();
                     }
                 }
+                if _audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
+                    let failure = _audio_sender.as_mut().expect("finished Windows audio sender disappeared").failure_reason().await;
+                    _audio_sender = None;
+                    append_portable_log(log_path, format!("Windows audio capture stopped: {failure}"));
+                    if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !audio_restart_attempted {
+                        audio_restart_attempted = true;
+                        pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                    } else {
+                        update_windows_tray_audio(true, &format!("Audio error: {failure}"), log_path);
+                    }
+                }
             },
             _ = config_refresh.tick() => {
                 match AppConfig::load(config_path).await {
                     Ok(updated) => {
-                        if updated.audio.enabled != audio_enabled {
-                            audio_enabled = updated.audio.enabled;
-                            audio_restart_attempted = false;
-                            if !audio_enabled {
-                                _audio_receiver = None;
-                            }
-                            update_windows_tray_audio(
-                                audio_enabled,
-                                if audio_enabled && peer_supports_audio { "Audio: Starting" } else if audio_enabled { "Audio: Unsupported by receiver" } else { "Audio: Off" },
-                                log_path,
-                            );
-                            append_portable_log(log_path, format!("applied saved audio setting enabled={audio_enabled}"));
-                            if peer_supports_audio && !session_paused {
-                                write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: audio_enabled })).await?;
-                            }
-                        }
                         runtime_config = updated;
                     }
                     Err(error) => tracing::warn!(%error, "failed to reload controller config"),
@@ -1468,7 +1521,7 @@ async fn run_connected_inner(
                             )
                             .await
                             .ok();
-                            if peer_supports_audio {
+                            if audio_enabled {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                             }
                             return Ok(ConnectedSessionExit::Quit);
@@ -1488,10 +1541,12 @@ async fn run_connected_inner(
                                     &Frame::Role(RoleEvent::SetPaused { paused: true }),
                                 )
                                 .await?;
-                                if peer_supports_audio {
+                                if audio_enabled {
                                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
                                 }
                                 _audio_receiver = None;
+                                _audio_sender = None;
+                                pending_audio_socket = None;
                                 edge_windows_input::update_tray_role(
                                     &local_name,
                                     &peer_name,
@@ -1508,10 +1563,11 @@ async fn run_connected_inner(
                             )
                             .await
                             .ok();
-                            if peer_supports_audio {
+                            if audio_enabled {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
                             }
                             _audio_receiver = None;
+                            _audio_sender = None;
                             edge_windows_input::force_release_to_local();
                             return Ok(ConnectedSessionExit::Disconnect);
                         }
@@ -1529,12 +1585,16 @@ async fn run_connected_inner(
                                 edge_windows_input::set_forwarding_enabled(
                                     local_is_controller && *input_forwarding_enabled,
                                 );
-                                if audio_enabled && peer_supports_audio {
-                                    write_secure_frame_writer(
+                                if audio_enabled {
+                                    send_windows_audio_route(
                                         &mut writer,
-                                        &Frame::Audio(AudioControl::SetEnabled { enabled: true }),
-                                    )
-                                    .await?;
+                                        peer_supports_audio_route,
+                                        &audio_source,
+                                        &peer_fingerprint,
+                                    ).await?;
+                                    if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                        pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                                    }
                                 }
                                 edge_windows_input::update_tray_role(
                                     &local_name,
@@ -1582,14 +1642,46 @@ async fn run_connected_inner(
                                 .await?;
                             }
                         }
-                        TrayCommandOutcome::AudioChanged(enabled) => {
-                            audio_enabled = enabled;
+                        TrayCommandOutcome::AudioChanged(choice) => {
+                            let requested_source = match choice {
+                                edge_windows_input::WindowsAudioChoice::Off => None,
+                                edge_windows_input::WindowsAudioChoice::Local if peer_supports_audio_playback && peer_supports_audio_route => Some(local_fingerprint.clone()),
+                                edge_windows_input::WindowsAudioChoice::Peer if peer_supports_audio_capture => Some(peer_fingerprint.clone()),
+                                _ => {
+                                    update_windows_tray_audio_route(
+                                        windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                                        peer_supports_audio_playback && peer_supports_audio_route,
+                                        peer_supports_audio_capture,
+                                        "Audio: Direction unavailable",
+                                        log_path,
+                                    );
+                                    continue;
+                                }
+                            };
+                            audio_source = requested_source;
+                            audio_enabled = audio_source.is_some();
                             audio_restart_attempted = false;
-                            if !enabled { _audio_receiver = None; }
-                            runtime_config.audio.enabled = enabled;
-                            update_windows_tray_audio(enabled, if enabled { "Audio: Starting" } else { "Audio: Off" }, log_path);
-                            if peer_supports_audio {
-                                write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled })).await?;
+                            _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
+                            runtime_config.audio.enabled = audio_enabled;
+                            let committed = audio_source.clone().map_or_else(CommittedAudioRoute::disabled, CommittedAudioRoute::from_source);
+                            audio_route_store.save(&committed).await?;
+                            update_windows_tray_audio_route(
+                                choice,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                if audio_enabled { "Audio: Starting" } else { "Audio: Off" },
+                                log_path,
+                            );
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
                             }
                         }
                         TrayCommandOutcome::ControllerRequested(choice) => {
@@ -1902,16 +1994,22 @@ async fn run_connected_inner(
                             input_epoch.suspend();
                             injector.all_keys_up().ok();
                             _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
                         } else {
                             edge_windows_input::set_forwarding_enabled(
                                 local_is_controller && *input_forwarding_enabled,
                             );
-                            if audio_enabled && peer_supports_audio {
-                                write_secure_frame_writer(
+                            if audio_enabled {
+                                send_windows_audio_route(
                                     &mut writer,
-                                    &Frame::Audio(AudioControl::SetEnabled { enabled: true }),
-                                )
-                                .await?;
+                                    peer_supports_audio_route,
+                                    &audio_source,
+                                    &peer_fingerprint,
+                                ).await?;
+                                if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                    pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                                }
                             }
                         }
                         write_secure_frame_writer(
@@ -1941,9 +2039,11 @@ async fn run_connected_inner(
                     }
                     Frame::Error(err) => anyhow::bail!("peer error: {}: {}", err.code, err.message),
                     Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
-                        if audio_enabled && codecs.contains(&AudioCodec::PcmS16Stereo48Khz) {
+                        if audio_source.as_deref() == Some(peer_fingerprint.as_str())
+                            && codecs.contains(&AudioCodec::PcmS16Stereo48Khz)
+                        {
                             update_windows_tray_audio(true, "Audio: Starting", log_path);
-                            append_portable_log(log_path, format!("received Linux audio offer on UDP port {udp_port}"));
+                            append_portable_log(log_path, format!("received peer audio offer on UDP port {udp_port}"));
                             let secrets = SessionSecrets::generate();
                             let bind_addr = if peer_ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                             match UdpSocket::bind(bind_addr).await {
@@ -1966,7 +2066,7 @@ async fn run_connected_inner(
                                     ).await {
                                         Ok(receiver) => {
                                             _audio_receiver = Some(receiver);
-                                            tracing::info!(udp_port, "started Linux audio receiver");
+                                            tracing::info!(udp_port, "started peer audio receiver");
                                             append_portable_log(log_path, format!("opened Windows audio output on UDP port {windows_udp_port} and sent UDP probe"));
                                         }
                                         Err(error) => {
@@ -1985,6 +2085,96 @@ async fn run_connected_inner(
                             }
                         }
                     }
+                    Frame::Audio(AudioControl::Start {
+                        udp_port,
+                        session_id,
+                        session_salt,
+                        session_key,
+                        codec: AudioCodec::PcmS16Stereo48Khz,
+                        ..
+                    }) if audio_source.as_deref() == Some(local_fingerprint.as_str()) => {
+                        let Some(socket) = pending_audio_socket.take() else {
+                            tracing::warn!("ignored audio start without a pending local offer");
+                            continue;
+                        };
+                        let secrets = SessionSecrets { session_id, session_salt, session_key };
+                        let cipher = edge_audio::PacketCipher::new(&secrets);
+                        match edge_windows_audio::establish_peer(
+                            &socket,
+                            &cipher,
+                            std::net::SocketAddr::new(peer_ip, udp_port),
+                            peer_ip,
+                            Duration::from_secs(5),
+                        ).await {
+                            Ok(destination) => match edge_windows_audio::WindowsAudioSender::start(
+                                socket, destination, secrets,
+                            ).await {
+                                Ok(sender) => {
+                                    _audio_sender = Some(sender);
+                                    update_windows_tray_audio_route(
+                                        edge_windows_input::WindowsAudioChoice::Local,
+                                        peer_supports_audio_playback && peer_supports_audio_route,
+                                        peer_supports_audio_capture,
+                                        "Audio: Streaming",
+                                        log_path,
+                                    );
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Streaming,
+                                        detail: None,
+                                    })).await?;
+                                }
+                                Err(error) => {
+                                    update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::CaptureFailure })).await.ok();
+                                }
+                            },
+                            Err(error) => {
+                                update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
+                            }
+                        }
+                    }
+                    Frame::Audio(AudioControl::RequestRoute { source_fingerprint }) => {
+                        let valid = source_fingerprint.as_deref().is_none_or(|source| {
+                            source == local_fingerprint && peer_supports_audio_playback && peer_supports_audio_route
+                                || source == peer_fingerprint && peer_supports_audio_capture
+                        });
+                        if valid {
+                            audio_source = source_fingerprint;
+                            audio_enabled = audio_source.is_some();
+                            _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
+                            let committed = audio_source.clone().map_or_else(CommittedAudioRoute::disabled, CommittedAudioRoute::from_source);
+                            audio_route_store.save(&committed).await?;
+                            let choice = windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint);
+                            update_windows_tray_audio_route(
+                                choice,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                if audio_enabled { "Audio: Starting" } else { "Audio: Off" },
+                                log_path,
+                            );
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                            }
+                        } else {
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                        }
+                    }
+                    Frame::Audio(AudioControl::SetRoute { .. }) => {
+                        tracing::warn!("ignored connector-authoritative audio route from listener");
+                    }
                     Frame::Audio(AudioControl::State { state, detail }) => {
                         tracing::info!(?state, ?detail, "Linux audio state changed");
                         append_portable_log(log_path, format!("Linux audio state changed: {state:?}{}", detail.as_deref().map(|detail| format!(": {detail}")).unwrap_or_default()));
@@ -1999,32 +2189,50 @@ async fn run_connected_inner(
                             AudioStreamState::Streaming => "Audio: Streaming".to_string(),
                             AudioStreamState::Error => format!("Audio error: {}", detail.as_deref().unwrap_or("unknown error")),
                         };
-                        update_windows_tray_audio(audio_enabled, &status, log_path);
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            &status,
+                            log_path,
+                        );
                     }
-                    Frame::Audio(AudioControl::Stop { .. } | AudioControl::SetEnabled { enabled: false }) => {
-                        audio_enabled = false;
+                    Frame::Audio(AudioControl::Stop { reason }) => {
                         _audio_receiver = None;
-                        runtime_config.audio.enabled = false;
-                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| runtime_config.clone());
-                        updated.audio.enabled = false;
-                        if let Err(error) = updated.save_blocking(config_path) {
-                            tracing::warn!(%error, "failed to persist Linux audio toggle");
-                        }
-                        update_windows_tray_audio(false, "Audio: Off", log_path);
+                        _audio_sender = None;
+                        pending_audio_socket = None;
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            &format!("Audio stopped: {reason:?}"),
+                            log_path,
+                        );
                     }
-                    Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
-                        audio_enabled = true;
-                        audio_restart_attempted = false;
-                        runtime_config.audio.enabled = true;
-                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| runtime_config.clone());
-                        updated.audio.enabled = true;
-                        if let Err(error) = updated.save_blocking(config_path) {
-                            tracing::warn!(%error, "failed to persist Linux audio toggle");
-                        }
-                        update_windows_tray_audio(true, "Audio: Starting", log_path);
-                        if peer_supports_audio {
-                            write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
-                        }
+                    Frame::Audio(AudioControl::SetEnabled { enabled }) => {
+                        audio_source = enabled.then(|| peer_fingerprint.clone());
+                        audio_enabled = enabled;
+                        _audio_receiver = None;
+                        _audio_sender = None;
+                        pending_audio_socket = None;
+                        let committed = audio_source.clone().map_or_else(
+                            CommittedAudioRoute::disabled,
+                            CommittedAudioRoute::from_source,
+                        );
+                        audio_route_store.save(&committed).await?;
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            if enabled { "Audio: Starting" } else { "Audio: Off" },
+                            log_path,
+                        );
+                        send_windows_audio_route(
+                            &mut writer,
+                            peer_supports_audio_route,
+                            &audio_source,
+                            &peer_fingerprint,
+                        ).await?;
                     }
                     Frame::Audio(other) => tracing::debug!(?other, "audio control frame"),
                     other => tracing::debug!(?other, "receiver frame"),
@@ -2072,6 +2280,57 @@ fn frame_with_role_epoch(frame: Frame, role_epoch: u64) -> Frame {
         }
         frame => frame,
     }
+}
+
+#[cfg(windows)]
+fn windows_audio_choice(
+    source: &Option<String>,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> edge_windows_input::WindowsAudioChoice {
+    match source.as_deref() {
+        Some(source) if source == local_fingerprint => {
+            edge_windows_input::WindowsAudioChoice::Local
+        }
+        Some(source) if source == peer_fingerprint => edge_windows_input::WindowsAudioChoice::Peer,
+        _ => edge_windows_input::WindowsAudioChoice::Off,
+    }
+}
+
+#[cfg(windows)]
+async fn send_windows_audio_offer(
+    writer: &mut ScheduledNoiseWriter,
+) -> Result<std::sync::Arc<UdpSocket>> {
+    let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let udp_port = socket.local_addr()?.port();
+    write_secure_frame_writer(
+        writer,
+        &Frame::Audio(AudioControl::Offer {
+            udp_port,
+            codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+        }),
+    )
+    .await?;
+    Ok(socket)
+}
+
+#[cfg(windows)]
+async fn send_windows_audio_route(
+    writer: &mut ScheduledNoiseWriter,
+    peer_supports_route: bool,
+    source: &Option<String>,
+    peer_fingerprint: &str,
+) -> Result<()> {
+    let control = if peer_supports_route {
+        AudioControl::SetRoute {
+            source_fingerprint: source.clone(),
+        }
+    } else {
+        AudioControl::SetEnabled {
+            enabled: source.as_deref() == Some(peer_fingerprint),
+        }
+    };
+    write_secure_frame_writer(writer, &Frame::Audio(control)).await
 }
 
 #[cfg(windows)]

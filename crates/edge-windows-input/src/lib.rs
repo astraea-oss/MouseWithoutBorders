@@ -60,9 +60,16 @@ pub enum WindowsTrayCommand {
     Disconnect,
     Reconnect,
     ToggleInputForwarding,
-    ToggleAudio,
+    SetAudio(WindowsAudioChoice),
     SetController(WindowsControllerChoice),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsAudioChoice {
+    Off,
+    Local,
+    Peer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +216,26 @@ pub fn update_tray_audio(enabled: bool, status: &str) -> Result<()> {
 
 #[cfg(not(windows))]
 pub fn update_tray_audio(_enabled: bool, _status: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn update_tray_audio_route(
+    choice: WindowsAudioChoice,
+    local_available: bool,
+    peer_available: bool,
+    status: &str,
+) -> Result<()> {
+    tray::update_audio_route(choice, local_available, peer_available, status)
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_audio_route(
+    _choice: WindowsAudioChoice,
+    _local_available: bool,
+    _peer_available: bool,
+    _status: &str,
+) -> Result<()> {
     Ok(())
 }
 
@@ -2523,7 +2550,8 @@ mod tray {
     };
 
     use crate::{
-        Result, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand, WindowsTrayContext,
+        Result, WindowsAudioChoice, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand,
+        WindowsTrayContext,
     };
 
     const TRAY_ID: u32 = 1;
@@ -2531,12 +2559,14 @@ mod tray {
     const ID_SETTINGS: usize = 1001;
     const ID_RELEASE: usize = 1002;
     const ID_QUIT: usize = 1003;
-    const ID_AUDIO: usize = 1004;
+    const ID_AUDIO_OFF: usize = 1004;
     const ID_CONNECTION: usize = 1005;
     const ID_INPUT_FORWARDING: usize = 1006;
     const ID_PAIR: usize = 1007;
     const ID_LOCAL_CONTROLLER: usize = 1008;
     const ID_PEER_CONTROLLER: usize = 1009;
+    const ID_AUDIO_LOCAL: usize = 1010;
+    const ID_AUDIO_PEER: usize = 1011;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
@@ -2544,7 +2574,9 @@ mod tray {
     static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
     static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
-    static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
+    static TRAY_AUDIO_CHOICE: AtomicUsize = AtomicUsize::new(0);
+    static TRAY_AUDIO_LOCAL_AVAILABLE: AtomicBool = AtomicBool::new(false);
+    static TRAY_AUDIO_PEER_AVAILABLE: AtomicBool = AtomicBool::new(false);
     static TRAY_INPUT_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(true);
     static TRAY_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
     static TRAY_INJECTED_INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -2667,7 +2699,28 @@ mod tray {
     }
 
     pub fn update_audio(enabled: bool, status: &str) -> Result<()> {
-        TRAY_AUDIO_ENABLED.store(enabled, Ordering::Relaxed);
+        let _ = enabled;
+        let mut audio_status = TRAY_AUDIO_STATUS
+            .lock()
+            .expect("tray audio status poisoned");
+        *audio_status = to_wide(status);
+        Ok(())
+    }
+
+    pub fn update_audio_route(
+        choice: WindowsAudioChoice,
+        local_available: bool,
+        peer_available: bool,
+        status: &str,
+    ) -> Result<()> {
+        let choice = match choice {
+            WindowsAudioChoice::Off => 0,
+            WindowsAudioChoice::Local => 1,
+            WindowsAudioChoice::Peer => 2,
+        };
+        TRAY_AUDIO_CHOICE.store(choice, Ordering::Relaxed);
+        TRAY_AUDIO_LOCAL_AVAILABLE.store(local_available, Ordering::Relaxed);
+        TRAY_AUDIO_PEER_AVAILABLE.store(peer_available, Ordering::Relaxed);
         let mut audio_status = TRAY_AUDIO_STATUS
             .lock()
             .expect("tray audio status poisoned");
@@ -2755,7 +2808,15 @@ mod tray {
                 }
             }
             ID_INPUT_FORWARDING => send_tray_command(WindowsTrayCommand::ToggleInputForwarding),
-            ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
+            ID_AUDIO_OFF => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Off))
+            }
+            ID_AUDIO_LOCAL => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Local))
+            }
+            ID_AUDIO_PEER => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Peer))
+            }
             ID_LOCAL_CONTROLLER => send_tray_command(WindowsTrayCommand::SetController(
                 WindowsControllerChoice::Local,
             )),
@@ -2874,7 +2935,33 @@ mod tray {
         } else {
             "Reconnect"
         });
-        let audio = to_wide("Audio streaming");
+        let local_audio = to_wide(&format!(
+            "{} → {}",
+            if context.local_device_name.is_empty() {
+                "This computer"
+            } else {
+                &context.local_device_name
+            },
+            if context.peer_device_name.is_empty() {
+                "Peer"
+            } else {
+                &context.peer_device_name
+            },
+        ));
+        let peer_audio = to_wide(&format!(
+            "{} → {}",
+            if context.peer_device_name.is_empty() {
+                "Peer"
+            } else {
+                &context.peer_device_name
+            },
+            if context.local_device_name.is_empty() {
+                "this computer"
+            } else {
+                &context.local_device_name
+            },
+        ));
+        let audio_off = to_wide("Audio off");
         let input_forwarding = to_wide("Forward mouse and keyboard");
         let quit = to_wide("Quit edge-kvm");
         let role = TRAY_ROLE.lock().expect("tray role poisoned").clone();
@@ -2964,11 +3051,26 @@ mod tray {
             } else {
                 MF_CHECKED
             };
-        let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
+        let audio_choice = TRAY_AUDIO_CHOICE.load(Ordering::Relaxed);
+        let audio_off_flags = MF_STRING | if audio_choice == 0 { MF_CHECKED } else { 0 };
+        let audio_local_flags = MF_STRING
+            | if audio_choice == 1 { MF_CHECKED } else { 0 }
+            | if TRAY_AUDIO_LOCAL_AVAILABLE.load(Ordering::Relaxed)
+                && TRAY_CONNECTED.load(Ordering::Relaxed)
+            {
+                0
+            } else {
+                MF_DISABLED
+            };
+        let audio_peer_flags = MF_STRING
+            | if audio_choice == 2 { MF_CHECKED } else { 0 }
+            | if TRAY_AUDIO_PEER_AVAILABLE.load(Ordering::Relaxed)
+                && TRAY_CONNECTED.load(Ordering::Relaxed)
+            {
+                0
+            } else {
+                MF_DISABLED
+            };
         let input_forwarding_flags = if TRAY_INPUT_FORWARDING_ENABLED.load(Ordering::Relaxed) {
             MF_STRING | MF_CHECKED
         } else {
@@ -3013,7 +3115,14 @@ mod tray {
                 ID_INPUT_FORWARDING,
                 input_forwarding.as_ptr(),
             );
-            AppendMenuW(menu, audio_flags, ID_AUDIO, audio.as_ptr());
+            AppendMenuW(
+                menu,
+                audio_local_flags,
+                ID_AUDIO_LOCAL,
+                local_audio.as_ptr(),
+            );
+            AppendMenuW(menu, audio_peer_flags, ID_AUDIO_PEER, peer_audio.as_ptr());
+            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());

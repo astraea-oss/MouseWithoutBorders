@@ -11,7 +11,10 @@ use tokio::{
     time::Instant,
 };
 
+mod audio_route;
 mod role;
+
+pub use audio_route::{AudioRouteStore, CommittedAudioRoute};
 
 pub use role::{
     CommittedRole, InputDirectionCapabilities, RoleCoordinator, RoleDecision, RoleStateError,

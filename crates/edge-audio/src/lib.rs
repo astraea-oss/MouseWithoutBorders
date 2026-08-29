@@ -208,6 +208,43 @@ impl PcmCodec {
     }
 }
 
+/// Smooths one missing PCM frame and fades the next real frame back in.
+/// Receivers on every platform use the same concealment behaviour.
+#[derive(Default)]
+pub struct PcmConcealer {
+    last_sample: [f32; CHANNELS],
+    recovering: bool,
+}
+
+impl PcmConcealer {
+    pub fn decode(&mut self, packet: Option<&[u8]>) -> Result<Vec<f32>> {
+        let Some(packet) = packet else {
+            self.recovering = true;
+            let mut concealed = Vec::with_capacity(SAMPLES_PER_FRAME);
+            for frame in 0..SAMPLES_PER_CHANNEL {
+                let gain = 1.0 - (frame + 1) as f32 / SAMPLES_PER_CHANNEL as f32;
+                concealed.push(self.last_sample[0] * gain);
+                concealed.push(self.last_sample[1] * gain);
+            }
+            self.last_sample = [0.0; CHANNELS];
+            return Ok(concealed);
+        };
+
+        let mut pcm = PcmCodec::decode(Some(packet))?;
+        if self.recovering {
+            let fade_frames = 48.min(SAMPLES_PER_CHANNEL);
+            for frame in 0..fade_frames {
+                let gain = (frame + 1) as f32 / fade_frames as f32;
+                pcm[frame * CHANNELS] *= gain;
+                pcm[frame * CHANNELS + 1] *= gain;
+            }
+            self.recovering = false;
+        }
+        self.last_sample = [pcm[pcm.len() - CHANNELS], pcm[pcm.len() - CHANNELS + 1]];
+        Ok(pcm)
+    }
+}
+
 #[derive(Debug)]
 pub struct JitterBuffer {
     packets: BTreeMap<u64, AudioPacket>,

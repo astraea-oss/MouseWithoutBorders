@@ -21,8 +21,8 @@ use edge_clipboard::{
     IncomingImageTransfer, OutgoingImageTransfer,
 };
 use edge_common::{
-    AppConfig, AudioLocalPlayback, Role, TransportMode, default_state_dir, detect_primary_local_ip,
-    init_tracing, portable_config_path,
+    AppConfig, AudioLocalPlayback, AudioRoutePreference, Role, TransportMode, default_state_dir,
+    detect_primary_local_ip, init_tracing, portable_config_path,
 };
 #[cfg(target_os = "linux")]
 use edge_crypto::initiate_noise_session;
@@ -39,17 +39,17 @@ use edge_linux_input::{
     write_clipboard_text,
 };
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason,
-    ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH,
-    INPUT_TOGGLE_EXTENSION, InputEvent, NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION,
-    PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError, RoleEvent, ScreenInfo,
-    decode_frame, encode_frame,
+    AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
+    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
+    INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, NodeCapability, OutputInfo,
+    PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError,
+    RoleEvent, ScreenInfo, decode_frame, encode_frame,
 };
 #[cfg(target_os = "linux")]
 use edge_runtime::{
-    CommittedRole, InputDirectionCapabilities, InputEpochGate, LivenessConfig, LivenessEvent,
-    LivenessTracker, RoleCoordinator, RoleDecision, RoleStore, select_initial_controller,
-    validate_commit, validate_prepare,
+    AudioRouteStore, CommittedAudioRoute, CommittedRole, InputDirectionCapabilities,
+    InputEpochGate, LivenessConfig, LivenessEvent, LivenessTracker, RoleCoordinator, RoleDecision,
+    RoleStore, select_initial_controller, validate_commit, validate_prepare,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput, run_settings_window};
@@ -424,12 +424,16 @@ struct LinuxPeerConnection {
     local_fingerprint: String,
     peer_name: String,
     peer_fingerprint: String,
+    peer_ip: std::net::IpAddr,
     initial_role_state: edge_protocol::RoleState,
     local_screen_info: Option<ScreenInfo>,
     peer_screen_info: Option<ScreenInfo>,
     peer_supports_input_capture: bool,
     peer_supports_input_injection: bool,
     peer_supports_role_switch: bool,
+    peer_supports_audio_capture: bool,
+    peer_supports_audio_playback: bool,
+    peer_supports_audio_route: bool,
     peer_supports_images: bool,
 }
 
@@ -484,7 +488,7 @@ async fn run_linux_connector(
                 TrayCommandEvent::Command(
                     TrayCommand::Disconnect
                     | TrayCommand::ToggleInputForwarding
-                    | TrayCommand::ToggleAudio
+                    | TrayCommand::SetAudio(_)
                     | TrayCommand::SetController(_),
                 )
                 | TrayCommandEvent::Closed => {}
@@ -548,7 +552,7 @@ async fn run_linux_connector(
                             TrayCommandEvent::Command(
                                 TrayCommand::Reconnect
                                 | TrayCommand::ToggleInputForwarding
-                                | TrayCommand::ToggleAudio
+                                | TrayCommand::SetAudio(_)
                                 | TrayCommand::SetController(_),
                             )
                             | TrayCommandEvent::Closed => {}
@@ -617,6 +621,7 @@ async fn connect_linux_peer(
         .await
         .with_context(|| format!("connection to {endpoint} timed out"))?
         .with_context(|| format!("failed to connect to {endpoint}"))?;
+    let peer_ip = stream.peer_addr()?.ip();
     configure_controller_socket(&stream)?;
     let expected_fingerprint = (!pairing_armed && !config.peer.pinned_fingerprint.is_empty())
         .then_some(config.peer.pinned_fingerprint.as_str());
@@ -641,6 +646,7 @@ async fn connect_linux_peer(
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                AUDIO_ROUTE_EXTENSION.to_string(),
             ],
             node_capabilities: vec![
                 NodeCapability::InputCaptureV1,
@@ -648,6 +654,7 @@ async fn connect_linux_peer(
                 NodeCapability::RoleSwitchV1,
                 NodeCapability::ScreenInfoBothSidesV1,
                 NodeCapability::AudioCaptureV1,
+                NodeCapability::AudioPlaybackV1,
             ],
         }),
     )
@@ -739,6 +746,16 @@ async fn connect_linux_peer(
     let peer_supports_role_switch = hello
         .node_capabilities
         .contains(&NodeCapability::RoleSwitchV1);
+    let peer_supports_audio_capture = hello
+        .node_capabilities
+        .contains(&NodeCapability::AudioCaptureV1);
+    let peer_supports_audio_playback = hello
+        .node_capabilities
+        .contains(&NodeCapability::AudioPlaybackV1);
+    let peer_supports_audio_route = hello
+        .extensions
+        .iter()
+        .any(|extension| extension == AUDIO_ROUTE_EXTENSION);
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
     let persisted = role_store.load().await.unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to read committed role state; using fresh-pair selection");
@@ -807,12 +824,16 @@ async fn connect_linux_peer(
         local_fingerprint,
         peer_name: hello.device_name,
         peer_fingerprint,
+        peer_ip,
         initial_role_state,
         local_screen_info,
         peer_screen_info,
         peer_supports_input_capture,
         peer_supports_input_injection,
         peer_supports_role_switch,
+        peer_supports_audio_capture,
+        peer_supports_audio_playback,
+        peer_supports_audio_route,
         peer_supports_images,
     })
 }
@@ -855,12 +876,16 @@ async fn run_linux_controller_session(
         local_fingerprint,
         peer_name,
         peer_fingerprint,
+        peer_ip,
         initial_role_state,
         local_screen_info,
         peer_screen_info,
         peer_supports_input_capture,
         peer_supports_input_injection,
         peer_supports_role_switch,
+        peer_supports_audio_capture,
+        peer_supports_audio_playback,
+        peer_supports_audio_route,
         peer_supports_images,
     } = connection;
     if let Some(info) = &peer_screen_info {
@@ -908,9 +933,57 @@ async fn run_linux_controller_session(
     let mut pending_readiness: Option<ConnectorRoleReadiness> = None;
     let mut transition_deadline: Option<tokio::time::Instant> = None;
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let audio_route_store = AudioRouteStore::new(default_state_dir().join("audio.toml"));
+    let stored_audio_route = audio_route_store
+        .load()
+        .await
+        .context("failed to load committed audio route")?
+        .filter(|route| route.belongs_to(&local_fingerprint, &peer_fingerprint));
+    let mut audio_source = match stored_audio_route.as_ref() {
+        Some(route) => route.source_fingerprint.clone(),
+        None => match config.audio.route {
+            Some(AudioRoutePreference::Disabled) => None,
+            Some(AudioRoutePreference::LocalToPeer) => Some(local_fingerprint.clone()),
+            Some(AudioRoutePreference::PeerToLocal) => Some(peer_fingerprint.clone()),
+            None if config.audio.enabled => Some(peer_fingerprint.clone()),
+            None => None,
+        },
+    };
+    if audio_source.as_deref() == Some(local_fingerprint.as_str())
+        && (!peer_supports_audio_playback || !peer_supports_audio_route)
+        || audio_source.as_deref() == Some(peer_fingerprint.as_str())
+            && !peer_supports_audio_capture
+    {
+        audio_source = None;
+    }
+    if stored_audio_route.is_none() {
+        let committed = audio_source.clone().map_or_else(
+            CommittedAudioRoute::disabled,
+            CommittedAudioRoute::from_source,
+        );
+        audio_route_store.save(&committed).await?;
+    }
+    let audio_socket = Arc::new(
+        UdpSocket::bind(if peer_ip.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?,
+    );
+    let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
+    let mut audio_receiver: Option<edge_linux_audio::LinuxAudioReceiver> = None;
+    let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
+    let mut audio_start_task: Option<AbortOnDropTask> = None;
+    let mut audio_start_generation = 0_u64;
     if let Some(tray) = tray {
         tray.input_forwarding(input_forwarding_enabled).await;
-        tray.audio_available(false).await;
+        tray.audio_route(
+            linux_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+            peer_supports_audio_playback && peer_supports_audio_route,
+            peer_supports_audio_capture,
+        )
+        .await;
         tray.session_paused(session_paused).await;
         tray.role_assignment(
             local_name.clone(),
@@ -922,6 +995,16 @@ async fn run_linux_controller_session(
     }
 
     let (reader, mut writer) = SecureFrameSession::new(session).split();
+    send_linux_audio_route(
+        &mut writer,
+        peer_supports_audio_route,
+        &audio_source,
+        &peer_fingerprint,
+    )
+    .await?;
+    if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+        send_linux_audio_offer(&mut writer, &audio_socket).await?;
+    }
     let mut frame_rx = spawn_controller_reader(reader);
     let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
     let mut clipboard_watcher = config
@@ -993,6 +1076,30 @@ async fn run_linux_controller_session(
                             anyhow::bail!("Linux peer stopped responding for five seconds");
                         }
                         None => {}
+                    }
+                    if audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Error,
+                                detail: Some("Linux audio capture stopped unexpectedly".to_string()),
+                            }),
+                        ).await.ok();
+                    }
+                    if audio_receiver.as_ref().is_some_and(|receiver| receiver.is_finished())
+                        && let Some(receiver) = audio_receiver.take()
+                    {
+                        let failure = receiver.failure_reason().await;
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Audio(AudioControl::State {
+                                state: AudioStreamState::Error,
+                                detail: Some(failure),
+                            }),
+                        ).await.ok();
                     }
                 }
                 _ = &mut heartbeat => {
@@ -1105,6 +1212,37 @@ async fn run_linux_controller_session(
                         None => {}
                     }
                 }
+                Some(started) = audio_start_rx.recv(), if audio_start_task.is_some() => {
+                    if started.generation != audio_start_generation {
+                        if let Ok((_, sender)) = started.result {
+                            sender.stop().await.ok();
+                        }
+                        continue;
+                    }
+                    audio_start_task = None;
+                    match started.result {
+                        Ok((destination, sender)) => {
+                            audio_sender = Some(sender);
+                            append_portable_log(log_path, format!("authenticated peer audio UDP endpoint: {destination}"));
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::State {
+                                    state: AudioStreamState::Streaming,
+                                    detail: None,
+                                }),
+                            ).await?;
+                        }
+                        Err(error) => {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::State {
+                                    state: AudioStreamState::Error,
+                                    detail: Some(error),
+                                }),
+                            ).await?;
+                        }
+                    }
+                }
                 command = recv_tray_command(tray_commands) => {
                     match command {
                         TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
@@ -1172,6 +1310,45 @@ async fn run_linux_controller_session(
                                 }
                             }
                         }
+                        TrayCommandEvent::Command(TrayCommand::SetAudio(choice)) => {
+                            let requested_source = match choice {
+                                tray::AudioChoice::Off => None,
+                                tray::AudioChoice::Local if peer_supports_audio_playback && peer_supports_audio_route => Some(local_fingerprint.clone()),
+                                tray::AudioChoice::Peer if peer_supports_audio_capture => Some(peer_fingerprint.clone()),
+                                _ => {
+                                    tracing::warn!(?choice, "requested audio direction is unavailable");
+                                    continue;
+                                }
+                            };
+                            audio_source = requested_source;
+                            drop(audio_start_task.take());
+                            audio_start_generation = audio_start_generation.wrapping_add(1);
+                            if let Some(sender) = audio_sender.take() {
+                                sender.stop().await.ok();
+                            }
+                            audio_receiver = None;
+                            let committed = audio_source.clone().map_or_else(
+                                CommittedAudioRoute::disabled,
+                                CommittedAudioRoute::from_source,
+                            );
+                            audio_route_store.save(&committed).await?;
+                            send_linux_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                send_linux_audio_offer(&mut writer, &audio_socket).await?;
+                            }
+                            if let Some(tray) = tray {
+                                tray.audio_route(
+                                    choice,
+                                    peer_supports_audio_playback && peer_supports_audio_route,
+                                    peer_supports_audio_capture,
+                                ).await;
+                            }
+                        }
                         TrayCommandEvent::Command(TrayCommand::Disconnect) => {
                             if !coordinator.is_transitioning() {
                                 coordinator.set_paused(true)?;
@@ -1183,6 +1360,18 @@ async fn run_linux_controller_session(
                                 }
                                 input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
+                                drop(audio_start_task.take());
+                                audio_start_generation = audio_start_generation.wrapping_add(1);
+                                if let Some(sender) = audio_sender.take() {
+                                    sender.stop().await.ok();
+                                }
+                                audio_receiver = None;
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::Stop {
+                                        reason: edge_protocol::AudioStopReason::UserRequest,
+                                    }),
+                                ).await.ok();
                                 write_secure_frame_writer(
                                     &mut writer,
                                     &Frame::Role(RoleEvent::SetPaused { paused: true }),
@@ -1209,6 +1398,15 @@ async fn run_linux_controller_session(
                                 &Frame::Role(RoleEvent::SetPaused { paused: false }),
                             )
                             .await?;
+                            send_linux_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                send_linux_audio_offer(&mut writer, &audio_socket).await?;
+                            }
                             if local_is_controller
                                 && input_forwarding_enabled
                                 && let Some(capture) = &capture
@@ -1230,8 +1428,7 @@ async fn run_linux_controller_session(
                             break Ok(ControllerSessionExit::QuitRequested);
                         }
                         TrayCommandEvent::Command(
-                            TrayCommand::ArmPairing
-                            | TrayCommand::ToggleAudio,
+                            TrayCommand::ArmPairing,
                         )
                         | TrayCommandEvent::Closed => {}
                     }
@@ -1515,6 +1712,12 @@ async fn run_linux_controller_session(
                                 }
                                 input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
+                                drop(audio_start_task.take());
+                                audio_start_generation = audio_start_generation.wrapping_add(1);
+                                if let Some(sender) = audio_sender.take() {
+                                    sender.stop().await.ok();
+                                }
+                                audio_receiver = None;
                             } else if local_is_controller
                                 && input_forwarding_enabled
                                 && let Some(capture) = &capture
@@ -1526,6 +1729,17 @@ async fn run_linux_controller_session(
                                 &Frame::Role(RoleEvent::SetPaused { paused }),
                             )
                             .await?;
+                            if !paused {
+                                send_linux_audio_route(
+                                    &mut writer,
+                                    peer_supports_audio_route,
+                                    &audio_source,
+                                    &peer_fingerprint,
+                                ).await?;
+                                if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                    send_linux_audio_offer(&mut writer, &audio_socket).await?;
+                                }
+                            }
                             if let Some(tray) = tray {
                                 tray.session_paused(paused).await;
                                 tray.role_assignment(
@@ -1537,7 +1751,185 @@ async fn run_linux_controller_session(
                                 .await;
                             }
                         }
-                        Frame::Audio(_) | Frame::Hello(_) | Frame::Pairing(_) => {}
+                        Frame::Audio(AudioControl::RequestRoute { source_fingerprint }) => {
+                            let valid = source_fingerprint.as_deref().is_none_or(|source| {
+                                source == local_fingerprint && peer_supports_audio_playback && peer_supports_audio_route
+                                    || source == peer_fingerprint && peer_supports_audio_capture
+                            });
+                            if valid {
+                                audio_source = source_fingerprint;
+                                drop(audio_start_task.take());
+                                audio_start_generation = audio_start_generation.wrapping_add(1);
+                                if let Some(sender) = audio_sender.take() {
+                                    sender.stop().await.ok();
+                                }
+                                audio_receiver = None;
+                                let committed = audio_source.clone().map_or_else(
+                                    CommittedAudioRoute::disabled,
+                                    CommittedAudioRoute::from_source,
+                                );
+                                audio_route_store.save(&committed).await?;
+                                send_linux_audio_route(
+                                    &mut writer,
+                                    peer_supports_audio_route,
+                                    &audio_source,
+                                    &peer_fingerprint,
+                                ).await?;
+                                if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                    send_linux_audio_offer(&mut writer, &audio_socket).await?;
+                                }
+                                if let Some(tray) = tray {
+                                    tray.audio_route(
+                                        linux_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                                        peer_supports_audio_playback && peer_supports_audio_route,
+                                        peer_supports_audio_capture,
+                                    ).await;
+                                }
+                            } else {
+                                send_linux_audio_route(
+                                    &mut writer,
+                                    peer_supports_audio_route,
+                                    &audio_source,
+                                    &peer_fingerprint,
+                                ).await?;
+                            }
+                        }
+                        Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
+                            if audio_source.as_deref() != Some(peer_fingerprint.as_str())
+                                || !codecs.contains(&AudioCodec::PcmS16Stereo48Khz)
+                            {
+                                continue;
+                            }
+                            let secrets = SessionSecrets::generate();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::Start {
+                                    udp_port: audio_socket.local_addr()?.port(),
+                                    session_id: secrets.session_id,
+                                    session_salt: secrets.session_salt,
+                                    session_key: secrets.session_key,
+                                    codec: AudioCodec::PcmS16Stereo48Khz,
+                                    frame_ms: edge_audio::FRAME_MS,
+                                    jitter_target_ms: config.audio.jitter_target_ms as u16,
+                                }),
+                            ).await?;
+                            match edge_linux_audio::LinuxAudioReceiver::start(
+                                audio_socket.clone(),
+                                std::net::SocketAddr::new(peer_ip, udp_port),
+                                secrets,
+                                config.audio.jitter_target_ms,
+                            ).await {
+                                Ok(receiver) => {
+                                    audio_receiver = Some(receiver);
+                                    write_secure_frame_writer(
+                                        &mut writer,
+                                        &Frame::Audio(AudioControl::State {
+                                            state: AudioStreamState::Streaming,
+                                            detail: None,
+                                        }),
+                                    ).await?;
+                                }
+                                Err(error) => {
+                                    write_secure_frame_writer(
+                                        &mut writer,
+                                        &Frame::Audio(AudioControl::State {
+                                            state: AudioStreamState::Error,
+                                            detail: Some(error.to_string()),
+                                        }),
+                                    ).await?;
+                                }
+                            }
+                        }
+                        Frame::Audio(AudioControl::Start {
+                            udp_port,
+                            session_id,
+                            session_salt,
+                            session_key,
+                            codec,
+                            frame_ms,
+                            ..
+                        }) => {
+                            if audio_source.as_deref() != Some(local_fingerprint.as_str())
+                                || udp_port == 0
+                                || codec != AudioCodec::PcmS16Stereo48Khz
+                                || frame_ms != edge_audio::FRAME_MS
+                            {
+                                continue;
+                            }
+                            if let Some(sender) = audio_sender.take() {
+                                sender.stop().await.ok();
+                            }
+                            drop(audio_start_task.take());
+                            audio_start_generation = audio_start_generation.wrapping_add(1);
+                            let generation = audio_start_generation;
+                            let secrets = SessionSecrets { session_id, session_salt, session_key };
+                            let advertised_destination = std::net::SocketAddr::new(peer_ip, udp_port);
+                            let redirect = config.audio.local_playback == AudioLocalPlayback::Redirect;
+                            let start_socket = audio_socket.clone();
+                            let state_dir = default_state_dir();
+                            let result_tx = audio_start_tx.clone();
+                            audio_start_task = Some(AbortOnDropTask(tokio::spawn(async move {
+                                let result = async {
+                                    let cipher = edge_audio::PacketCipher::new(&secrets);
+                                    let destination = edge_linux_audio::establish_peer(
+                                        &start_socket,
+                                        &cipher,
+                                        advertised_destination,
+                                        peer_ip,
+                                        Duration::from_secs(3),
+                                    ).await?;
+                                    let sender = edge_linux_audio::LinuxAudioSender::start(
+                                        start_socket,
+                                        destination,
+                                        secrets,
+                                        &state_dir,
+                                        redirect,
+                                    ).await?;
+                                    Ok::<_, anyhow::Error>((destination, sender))
+                                }.await.map_err(|error| format!("{error:#}"));
+                                let _ = result_tx.send(AudioStartResult { generation, result });
+                            })));
+                        }
+                        Frame::Audio(AudioControl::Stop { .. }) => {
+                            drop(audio_start_task.take());
+                            audio_start_generation = audio_start_generation.wrapping_add(1);
+                            if let Some(sender) = audio_sender.take() {
+                                sender.stop().await.ok();
+                            }
+                            audio_receiver = None;
+                        }
+                        Frame::Audio(AudioControl::SetEnabled { enabled }) => {
+                            audio_source = enabled.then(|| peer_fingerprint.clone());
+                            drop(audio_start_task.take());
+                            audio_start_generation = audio_start_generation.wrapping_add(1);
+                            if let Some(sender) = audio_sender.take() {
+                                sender.stop().await.ok();
+                            }
+                            audio_receiver = None;
+                            let committed = audio_source.clone().map_or_else(
+                                CommittedAudioRoute::disabled,
+                                CommittedAudioRoute::from_source,
+                            );
+                            audio_route_store.save(&committed).await?;
+                            send_linux_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if let Some(tray) = tray {
+                                tray.audio_route(
+                                    linux_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                                    peer_supports_audio_playback && peer_supports_audio_route,
+                                    peer_supports_audio_capture,
+                                ).await;
+                            }
+                        }
+                        Frame::Audio(
+                            AudioControl::SetRoute { .. }
+                            | AudioControl::State { .. }
+                        ) => {}
+                        Frame::Hello(_) | Frame::Pairing(_) => {}
                     }
                 }
                 _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {
@@ -1558,6 +1950,11 @@ async fn run_linux_controller_session(
         capture.release(None).await.ok();
         capture.disarm().await.ok();
     }
+    drop(audio_start_task.take());
+    if let Some(sender) = audio_sender.take() {
+        sender.stop().await.ok();
+    }
+    drop(audio_receiver.take());
     injector.all_keys_up().await.ok();
     outcome
 }
@@ -1614,6 +2011,53 @@ async fn begin_connector_role_switch(
         }
     }
     Ok(Some(readiness))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_audio_choice(
+    source: &Option<String>,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> tray::AudioChoice {
+    match source.as_deref() {
+        Some(source) if source == local_fingerprint => tray::AudioChoice::Local,
+        Some(source) if source == peer_fingerprint => tray::AudioChoice::Peer,
+        _ => tray::AudioChoice::Off,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn send_linux_audio_offer(
+    writer: &mut ScheduledNoiseWriter,
+    socket: &UdpSocket,
+) -> Result<()> {
+    write_secure_frame_writer(
+        writer,
+        &Frame::Audio(AudioControl::Offer {
+            udp_port: socket.local_addr()?.port(),
+            codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+        }),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn send_linux_audio_route(
+    writer: &mut ScheduledNoiseWriter,
+    peer_supports_route: bool,
+    source: &Option<String>,
+    peer_fingerprint: &str,
+) -> Result<()> {
+    let control = if peer_supports_route {
+        AudioControl::SetRoute {
+            source_fingerprint: source.clone(),
+        }
+    } else {
+        AudioControl::SetEnabled {
+            enabled: source.as_deref() == Some(peer_fingerprint),
+        }
+    };
+    write_secure_frame_writer(writer, &Frame::Audio(control)).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1794,8 +2238,8 @@ async fn run_receiver(
                         tracing::info!("reconnect requested from tray");
                         append_portable_log(&log_path, "reconnect requested from tray");
                     }
-                    TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
-                        tracing::info!("audio toggle ignored while no controller is connected");
+                    TrayCommandEvent::Command(TrayCommand::SetAudio(_)) => {
+                        tracing::info!("audio route ignored while no peer is connected");
                     }
                     TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
                         tracing::info!(
@@ -1907,6 +2351,7 @@ async fn run_receiver(
                     CLIPBOARD_IMAGE_EXTENSION.to_string(),
                     INPUT_TOGGLE_EXTENSION.to_string(),
                     PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                    AUDIO_ROUTE_EXTENSION.to_string(),
                 ],
                 node_capabilities: vec![
                     NodeCapability::InputCaptureV1,
@@ -1914,6 +2359,7 @@ async fn run_receiver(
                     NodeCapability::RoleSwitchV1,
                     NodeCapability::ScreenInfoBothSidesV1,
                     NodeCapability::AudioCaptureV1,
+                    NodeCapability::AudioPlaybackV1,
                 ],
             }),
         )
@@ -2038,9 +2484,16 @@ async fn run_receiver(
             tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
                 .await;
         }
-        let controller_supports_audio = hello
+        let controller_supports_audio_playback = hello
             .node_capabilities
             .contains(&NodeCapability::AudioPlaybackV1);
+        let controller_supports_audio_capture = hello
+            .node_capabilities
+            .contains(&NodeCapability::AudioCaptureV1);
+        let controller_supports_audio_route = hello
+            .extensions
+            .iter()
+            .any(|extension| extension == AUDIO_ROUTE_EXTENSION);
         let controller_supports_input_capture = hello
             .node_capabilities
             .contains(&NodeCapability::InputCaptureV1);
@@ -2059,7 +2512,12 @@ async fn run_receiver(
             .iter()
             .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
         if let Some(tray) = &tray {
-            tray.audio_available(controller_supports_audio).await;
+            tray.audio_route(
+                tray::AudioChoice::Off,
+                controller_supports_audio_playback,
+                controller_supports_audio_capture && controller_supports_audio_route,
+            )
+            .await;
         }
 
         let requested_monitor = config.input.inject.output.as_str();
@@ -2096,7 +2554,9 @@ async fn run_receiver(
             screen_info,
             audio_socket,
             addr.ip(),
-            controller_supports_audio,
+            controller_supports_audio_playback,
+            controller_supports_audio_capture,
+            controller_supports_audio_route,
             controller_supports_input_toggle,
             controller_supports_images,
             controller_supports_input_capture,
@@ -2302,7 +2762,9 @@ async fn handle_controller(
     screen_info: Option<ScreenInfo>,
     audio_socket: Arc<UdpSocket>,
     controller_ip: std::net::IpAddr,
-    controller_supports_audio: bool,
+    controller_supports_audio_playback: bool,
+    controller_supports_audio_capture: bool,
+    controller_supports_audio_route: bool,
     controller_supports_input_toggle: bool,
     controller_supports_images: bool,
     controller_supports_input_capture: bool,
@@ -2337,10 +2799,11 @@ async fn handle_controller(
         .enabled
         .then(spawn_clipboard_change_watcher);
     let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
+    let mut audio_receiver: Option<edge_linux_audio::LinuxAudioReceiver> = None;
     let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
     let mut audio_start_task: Option<AbortOnDropTask> = None;
     let mut audio_start_generation = 0_u64;
-    let mut audio_requested = config.audio.enabled;
+    let mut audio_source: Option<String> = None;
     let mut input_forwarding_enabled = true;
     let mut session_paused = false;
     let mut role_epoch = INITIAL_ROLE_EPOCH;
@@ -2363,6 +2826,12 @@ async fn handle_controller(
     let role_store = RoleStore::new(default_state_dir().join("role.toml"));
     if let Some(tray) = tray {
         tray.input_forwarding(true).await;
+        tray.audio_route(
+            tray::AudioChoice::Off,
+            controller_supports_audio_playback,
+            controller_supports_audio_capture && controller_supports_audio_route,
+        )
+        .await;
     }
 
     loop {
@@ -2560,6 +3029,19 @@ async fn handle_controller(
                     .await
                     .ok();
                 }
+                if audio_receiver.as_ref().is_some_and(|receiver| receiver.is_finished())
+                    && let Some(receiver) = audio_receiver.take()
+                {
+                    let failure = receiver.failure_reason().await;
+                    tracing::warn!(%failure, "Linux audio playback stopped unexpectedly");
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Audio(AudioControl::State {
+                            state: AudioStreamState::Error,
+                            detail: Some(failure),
+                        }),
+                    ).await.ok();
+                }
             }
             Some(started) = audio_start_rx.recv(), if audio_start_task.is_some() => {
                 if started.generation != audio_start_generation {
@@ -2616,6 +3098,7 @@ async fn handle_controller(
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
+                        drop(audio_receiver.take());
                         return Ok(ControllerSessionExit::QuitRequested);
                     }
                     TrayCommandEvent::Command(TrayCommand::Disconnect) => {
@@ -2626,6 +3109,7 @@ async fn handle_controller(
                             if let Some(sender) = audio_sender.take() {
                                 sender.stop().await.ok();
                             }
+                            audio_receiver = None;
                             backend.all_keys_up().await.ok();
                             if let Some(capture) = &capture {
                                 capture.release(None).await.ok();
@@ -2652,6 +3136,7 @@ async fn handle_controller(
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
+                        drop(audio_receiver.take());
                         backend.all_keys_up().await.ok();
                         write_secure_frame_writer(
                             &mut writer,
@@ -2759,37 +3244,28 @@ async fn handle_controller(
                             .await?;
                         }
                     }
-                    TrayCommandEvent::Command(TrayCommand::ToggleAudio) => {
-                        if !controller_supports_audio {
-                            tracing::warn!("audio toggle ignored because the peer lacks audio playback");
-                            append_portable_log(
-                                log_path,
-                                "audio toggle ignored because the peer lacks audio playback",
-                            );
-                            continue;
-                        }
-                        audio_requested = !audio_requested;
-                        persist_receiver_audio_enabled(
-                            config_path,
-                            config,
-                            audio_requested,
-                            log_path,
-                        )
-                        .await;
-                        if !audio_requested {
-                            drop(audio_start_task.take());
-                            audio_start_generation = audio_start_generation.wrapping_add(1);
-                            if let Some(sender) = audio_sender.take() {
-                                sender.stop().await.ok();
+                    TrayCommandEvent::Command(TrayCommand::SetAudio(choice)) => {
+                        let source_fingerprint = match choice {
+                            tray::AudioChoice::Off => None,
+                            tray::AudioChoice::Local if controller_supports_audio_playback => {
+                                Some(local_fingerprint.to_string())
                             }
-                        }
-                        write_secure_frame_writer(
-                            &mut writer,
-                            &Frame::Audio(AudioControl::SetEnabled {
-                                enabled: audio_requested,
-                            }),
-                        )
-                        .await?;
+                            tray::AudioChoice::Peer if controller_supports_audio_capture && controller_supports_audio_route => {
+                                Some(controller_fingerprint.to_string())
+                            }
+                            _ => {
+                                tracing::warn!(?choice, "requested audio direction is unavailable");
+                                continue;
+                            }
+                        };
+                        let control = if controller_supports_audio_route {
+                            AudioControl::RequestRoute { source_fingerprint }
+                        } else {
+                            AudioControl::SetEnabled {
+                                enabled: source_fingerprint.as_deref() == Some(local_fingerprint),
+                            }
+                        };
+                        write_secure_frame_writer(&mut writer, &Frame::Audio(control)).await?;
                     }
                     TrayCommandEvent::Closed => {
                         tracing::warn!("tray command channel closed; continuing session without tray commands");
@@ -3013,7 +3489,11 @@ async fn handle_controller(
                         frame_ms,
                         jitter_target_ms: _,
                     }) => {
-                        append_portable_log(log_path, "received Windows audio start request");
+                        if audio_source.as_deref() != Some(local_fingerprint) {
+                            tracing::warn!("ignored audio start while this machine is not the source");
+                            continue;
+                        }
+                        append_portable_log(log_path, "received peer audio start request");
                         if udp_port == 0
                             || codec != AudioCodec::PcmS16Stereo48Khz
                             || frame_ms != edge_audio::FRAME_MS
@@ -3086,23 +3566,52 @@ async fn handle_controller(
                             let _ = result_tx.send(AudioStartResult { generation, result });
                         })));
                     }
-                    Frame::Audio(AudioControl::SetEnabled { enabled: false }) => {
-                        audio_requested = false;
+                    Frame::Audio(AudioControl::SetRoute { source_fingerprint }) => {
+                        let valid = source_fingerprint.as_deref().is_none_or(|source| {
+                            source == local_fingerprint && controller_supports_audio_playback
+                                || source == controller_fingerprint
+                                    && controller_supports_audio_capture
+                                    && controller_supports_audio_route
+                        });
+                        if !valid {
+                            anyhow::bail!("connector committed an unsupported audio route");
+                        }
+                        audio_source = source_fingerprint;
                         drop(audio_start_task.take());
                         audio_start_generation = audio_start_generation.wrapping_add(1);
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
-                        persist_receiver_audio_enabled(config_path, config, false, log_path).await;
-                        append_portable_log(log_path, "Linux audio streaming disabled");
-                        write_secure_frame_writer(
-                            &mut writer,
-                            &Frame::Audio(AudioControl::State {
-                                state: AudioStreamState::Disabled,
-                                detail: None,
-                            }),
-                        )
-                        .await?;
+                        audio_receiver = None;
+                        let choice = match audio_source.as_deref() {
+                            Some(source) if source == local_fingerprint => tray::AudioChoice::Local,
+                            Some(source) if source == controller_fingerprint => tray::AudioChoice::Peer,
+                            _ => tray::AudioChoice::Off,
+                        };
+                        if let Some(tray) = tray {
+                            tray.audio_route(
+                                choice,
+                                controller_supports_audio_playback,
+                                controller_supports_audio_capture && controller_supports_audio_route,
+                            ).await;
+                        }
+                        if audio_source.as_deref() == Some(local_fingerprint) && !session_paused {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::Offer {
+                                    udp_port: audio_socket.local_addr()?.port(),
+                                    codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+                                }),
+                            ).await?;
+                        } else if audio_source.is_none() {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::State {
+                                    state: AudioStreamState::Disabled,
+                                    detail: None,
+                                }),
+                            ).await?;
+                        }
                     }
                     Frame::Audio(AudioControl::Stop { reason }) => {
                         drop(audio_start_task.take());
@@ -3110,7 +3619,8 @@ async fn handle_controller(
                         if let Some(sender) = audio_sender.take() {
                             sender.stop().await.ok();
                         }
-                        append_portable_log(log_path, format!("Linux audio stopped by controller: {reason:?}"));
+                        audio_receiver = None;
+                        append_portable_log(log_path, format!("audio stopped by connector: {reason:?}"));
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::Audio(AudioControl::State {
@@ -3120,20 +3630,89 @@ async fn handle_controller(
                         )
                         .await?;
                     }
-                    Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
-                        audio_requested = true;
-                        persist_receiver_audio_enabled(config_path, config, true, log_path).await;
-                        append_portable_log(log_path, "Linux audio streaming enabled; sending UDP offer");
+                    Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
+                        if audio_source.as_deref() != Some(controller_fingerprint)
+                            || !codecs.contains(&AudioCodec::PcmS16Stereo48Khz)
+                        {
+                            continue;
+                        }
+                        let secrets = SessionSecrets::generate();
                         write_secure_frame_writer(
                             &mut writer,
-                            &Frame::Audio(AudioControl::Offer {
+                            &Frame::Audio(AudioControl::Start {
                                 udp_port: audio_socket.local_addr()?.port(),
-                                codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+                                session_id: secrets.session_id,
+                                session_salt: secrets.session_salt,
+                                session_key: secrets.session_key,
+                                codec: AudioCodec::PcmS16Stereo48Khz,
+                                frame_ms: edge_audio::FRAME_MS,
+                                jitter_target_ms: config.audio.jitter_target_ms as u16,
                             }),
-                        )
-                        .await?;
+                        ).await?;
+                        match edge_linux_audio::LinuxAudioReceiver::start(
+                            audio_socket.clone(),
+                            std::net::SocketAddr::new(controller_ip, udp_port),
+                            secrets,
+                            config.audio.jitter_target_ms,
+                        ).await {
+                            Ok(receiver) => {
+                                audio_receiver = Some(receiver);
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Streaming,
+                                        detail: None,
+                                    }),
+                                ).await?;
+                            }
+                            Err(error) => {
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Error,
+                                        detail: Some(error.to_string()),
+                                    }),
+                                ).await?;
+                            }
+                        }
                     }
-                    Frame::Audio(AudioControl::State { .. } | AudioControl::Offer { .. }) => {}
+                    Frame::Audio(AudioControl::RequestRoute { .. }) => {
+                        tracing::warn!("ignored connector-only audio route request from connector");
+                    }
+                    Frame::Audio(AudioControl::SetEnabled { enabled }) => {
+                        audio_source = enabled.then(|| local_fingerprint.to_string());
+                        drop(audio_start_task.take());
+                        audio_start_generation = audio_start_generation.wrapping_add(1);
+                        if let Some(sender) = audio_sender.take() {
+                            sender.stop().await.ok();
+                        }
+                        audio_receiver = None;
+                        if let Some(tray) = tray {
+                            tray.audio_route(
+                                if enabled { tray::AudioChoice::Local } else { tray::AudioChoice::Off },
+                                controller_supports_audio_playback,
+                                false,
+                            ).await;
+                        }
+                        if enabled && !session_paused {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::Offer {
+                                    udp_port: audio_socket.local_addr()?.port(),
+                                    codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+                                }),
+                            ).await?;
+                        } else {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::Audio(AudioControl::State {
+                                    state: AudioStreamState::Disabled,
+                                    detail: None,
+                                }),
+                            ).await?;
+                        }
+                    }
+                    Frame::Audio(AudioControl::State { .. }) => {}
                     Frame::Role(RoleEvent::SessionState(state)) => {
                         if state.controller_fingerprint.as_deref().is_some_and(|controller| {
                             controller != controller_fingerprint && controller != local_fingerprint
@@ -3372,6 +3951,7 @@ async fn handle_controller(
                             if let Some(sender) = audio_sender.take() {
                                 sender.stop().await.ok();
                             }
+                            audio_receiver = None;
                             input_epoch.suspend();
                             backend.all_keys_up().await.ok();
                             if let Some(capture) = &capture {
@@ -3436,7 +4016,9 @@ async fn handle_controller(
     _screen_info: Option<ScreenInfo>,
     _audio_socket: Arc<UdpSocket>,
     _controller_ip: std::net::IpAddr,
-    _controller_supports_audio: bool,
+    _controller_supports_audio_playback: bool,
+    _controller_supports_audio_capture: bool,
+    _controller_supports_audio_route: bool,
     _controller_supports_input_toggle: bool,
     _controller_supports_images: bool,
     _controller_supports_input_capture: bool,
@@ -3447,29 +4029,6 @@ async fn handle_controller(
     _controller_name: &str,
 ) -> Result<ControllerSessionExit> {
     anyhow::bail!("Linux receiver sessions are available only on Linux")
-}
-
-async fn persist_receiver_audio_enabled(
-    config_path: &Path,
-    fallback: &AppConfig,
-    enabled: bool,
-    log_path: &Path,
-) {
-    let mut updated = match AppConfig::load(config_path).await {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(%error, "failed to reload receiver config before saving audio state");
-            fallback.clone()
-        }
-    };
-    updated.audio.enabled = enabled;
-    if let Err(error) = updated.save(config_path).await {
-        tracing::warn!(%error, "failed to persist receiver audio state");
-        append_portable_log(
-            log_path,
-            format!("failed to persist receiver audio state enabled={enabled}: {error}"),
-        );
-    }
 }
 
 #[derive(Default)]

@@ -8,12 +8,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, FLAG_PROBE, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL,
-    SAMPLES_PER_FRAME, SessionSecrets,
+    AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
+    PcmConcealer, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     process::{Child, Command},
     sync::oneshot,
@@ -239,6 +239,119 @@ pub struct LinuxAudioSender {
     routing: AudioRoutingGuard,
 }
 
+pub struct LinuxAudioReceiver {
+    task: Option<JoinHandle<String>>,
+}
+
+impl Drop for LinuxAudioReceiver {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl LinuxAudioReceiver {
+    pub async fn start(
+        socket: Arc<UdpSocket>,
+        source_endpoint: SocketAddr,
+        secrets: SessionSecrets,
+        jitter_target_ms: u32,
+    ) -> Result<Self> {
+        let mut playback = spawn_playback()?;
+        let mut stdin = playback.stdin.take().context("pacat stdin was not piped")?;
+        let cipher = PacketCipher::new(&secrets);
+        let probe = cipher.seal(&AudioPacket {
+            sequence: 0,
+            sample_timestamp: 0,
+            flags: FLAG_PROBE,
+            payload: Vec::new(),
+        })?;
+        socket
+            .send_to(&probe, source_endpoint)
+            .await
+            .context("failed to send Linux playback UDP probe")?;
+
+        let task = tokio::spawn(async move {
+            let mut jitter = JitterBuffer::new(jitter_target_ms);
+            let mut concealer = PcmConcealer::default();
+            let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+            let mut probe_retry = tokio::time::interval(Duration::from_millis(250));
+            let mut watchdog = tokio::time::interval(Duration::from_millis(500));
+            let started = tokio::time::Instant::now();
+            let mut last_media = started;
+            let mut received_media = false;
+            let reason = 'receive: loop {
+                tokio::select! {
+                    received = socket.recv_from(&mut buffer) => {
+                        match received {
+                            Ok((length, source)) if source.ip() == source_endpoint.ip() => match cipher.open(&buffer[..length]) {
+                                Ok(packet) if packet.flags & FLAG_PROBE == 0 => {
+                                    received_media = true;
+                                    last_media = tokio::time::Instant::now();
+                                    if jitter.push(packet) {
+                                        for _ in 0..8 {
+                                            let Some(packet) = jitter.pop_ready() else { break; };
+                                            let pcm = match concealer.decode(packet.as_ref().map(|packet| packet.payload.as_slice())) {
+                                                Ok(pcm) => pcm,
+                                                Err(error) => {
+                                                    tracing::debug!(%error, "rejected PCM audio frame");
+                                                    continue;
+                                                }
+                                            };
+                                            let encoded = match PcmCodec::encode(&pcm) {
+                                                Ok(encoded) => encoded,
+                                                Err(error) => break 'receive format!("Linux PCM playback encoding failed: {error}"),
+                                            };
+                                            if let Err(error) = stdin.write_all(&encoded).await {
+                                                break 'receive format!("Linux audio playback failed: {error}");
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => tracing::debug!(%error, "rejected Linux audio datagram"),
+                            },
+                            Ok(_) => {}
+                            Err(error) => break format!("Linux audio UDP receive failed: {error}"),
+                        }
+                    }
+                    _ = probe_retry.tick(), if !received_media => {
+                        if let Err(error) = socket.send_to(&probe, source_endpoint).await {
+                            break format!("Linux audio UDP probe retry failed: {error}");
+                        }
+                    }
+                    _ = watchdog.tick() => {
+                        if received_media && last_media.elapsed() > Duration::from_secs(2) {
+                            break "no authenticated audio received for 2 seconds".to_string();
+                        }
+                        if !received_media && started.elapsed() > Duration::from_secs(8) {
+                            break "audio source did not start within 8 seconds".to_string();
+                        }
+                    }
+                }
+            };
+            let _ = playback.kill().await;
+            reason
+        });
+        Ok(Self { task: Some(task) })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+
+    pub async fn failure_reason(mut self) -> String {
+        let Some(task) = self.task.take() else {
+            return "Linux audio receiver stopped without a result".to_string();
+        };
+        match task.await {
+            Ok(reason) => reason,
+            Err(error) => format!("Linux audio receiver task failed: {error}"),
+        }
+    }
+}
+
 impl Drop for LinuxAudioSender {
     fn drop(&mut self) {
         self.task.abort();
@@ -341,6 +454,26 @@ fn spawn_capture(source: &str) -> Result<Child> {
     command
         .spawn()
         .context("failed to start parec; install PipeWire PulseAudio tools")
+}
+
+fn spawn_playback() -> Result<Child> {
+    let mut command = Command::new("pacat");
+    command
+        .args([
+            "--playback",
+            "--format=s16le",
+            "--rate=48000",
+            "--channels=2",
+            "--latency-msec=20",
+            "--raw",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+        .spawn()
+        .context("failed to start pacat; install PipeWire PulseAudio tools")
 }
 
 #[cfg(test)]

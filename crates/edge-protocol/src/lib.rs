@@ -9,6 +9,7 @@ pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
 pub const INPUT_TOGGLE_EXTENSION: &str = "input-toggle-v1";
 pub const PAIRING_CONFIRMATION_EXTENSION: &str = "pairing-confirmation-v1";
+pub const AUDIO_ROUTE_EXTENSION: &str = "audio-route-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -135,6 +136,14 @@ pub enum AudioStopReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioControl {
+    /// Listener asks the connector to commit a route. `None` disables audio.
+    RequestRoute {
+        source_fingerprint: Option<String>,
+    },
+    /// Connector-authoritative committed route. `None` disables audio.
+    SetRoute {
+        source_fingerprint: Option<String>,
+    },
     Offer {
         udp_port: u16,
         codecs: Vec<AudioCodec>,
@@ -389,7 +398,7 @@ mod tests {
 
     #[test]
     fn audio_control_round_trip() {
-        let frame = Frame::Audio(AudioControl::Start {
+        let start = Frame::Audio(AudioControl::Start {
             udp_port: 42_421,
             session_id: [7; 16],
             session_salt: [8; 4],
@@ -398,7 +407,11 @@ mod tests {
             frame_ms: 5,
             jitter_target_ms: 60,
         });
-        assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        assert_eq!(decode_frame(&encode_frame(&start).unwrap()).unwrap(), start);
+        for source_fingerprint in [None, Some("source-fingerprint".to_string())] {
+            let route = Frame::Audio(AudioControl::SetRoute { source_fingerprint });
+            assert_eq!(decode_frame(&encode_frame(&route).unwrap()).unwrap(), route);
+        }
     }
 
     #[test]

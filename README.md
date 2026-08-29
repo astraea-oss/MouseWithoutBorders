@@ -61,9 +61,8 @@ listener_position = "left"
 ```
 
 Keep `transport = "listen"` and `preferred_role = "receiver"` on the other
-Linux computer. Pair from both tray menus. Linux-to-Linux audio is shown as
-unavailable because Linux playback is not implemented; input and clipboard are
-independent of audio.
+Linux computer. Pair from both tray menus. Audio can then be routed in either
+direction, independently of which computer currently controls input.
 
 Once connected, right-click either tray and select which named computer should
 control the other. The connector serializes the handover, releases held input,
@@ -77,9 +76,9 @@ The executable is still named `edge-receiver-linux` as a compatibility entry
 point. A role-neutral package name will follow a deprecation window; retaining
 the current name keeps existing scripts and portable layouts stable meanwhile.
 
-Linux audio streaming uses the PipeWire-Pulse command-line tools `pactl` and
-`parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside
-`pipewire-pulse`. Verify routing without a Windows connection:
+Linux audio capture and playback use the PipeWire-Pulse command-line tools
+`pactl`, `parec`, and `pacat`. On Arch/CachyOS these are normally provided by
+`libpulse` alongside `pipewire-pulse`. Verify capture routing without a peer:
 
 ```bash
 ./edge-receiver-linux --test-audio-route
@@ -202,12 +201,13 @@ To verify Windows playback without Linux, run:
 .\edge-controller-win.exe --test-audio
 ```
 
-Linux system-audio streaming is enabled by default for new Windows node
-configs. Legacy Windows configs without an `[audio]` section are migrated on
-startup; an explicit existing preference is preserved. Use Settings or the
-checked `Audio streaming` tray action to change it while connected. The
-initial format is encrypted 48 kHz stereo PCM over UDP, requiring roughly
-1.54 Mbps.
+Peer-to-Windows system-audio streaming is the default for new Windows node
+configs. Legacy `enabled = true/false` values are migrated as a fallback; new
+configs store `route = "local-to-peer"`, `"peer-to-local"`, or `"disabled"`.
+The tray exposes the same three choices using the paired device names and saves
+the committed source in portable `state/audio.toml`. Windows capture uses WASAPI
+loopback and Linux playback uses PipeWire-Pulse. The initial format is encrypted
+48 kHz stereo PCM over UDP, requiring roughly 1.54 Mbps.
 
 ## End-to-end test
 

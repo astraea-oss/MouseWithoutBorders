@@ -18,13 +18,20 @@ pub enum TrayCommand {
     Disconnect,
     Reconnect,
     ToggleInputForwarding,
-    ToggleAudio,
+    SetAudio(AudioChoice),
     SetController(ControllerChoice),
     Quit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerChoice {
+    Local,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioChoice {
+    Off,
     Local,
     Peer,
 }
@@ -53,7 +60,9 @@ impl ReceiverTrayHandle {
             input_events: 0,
             clipboard_events: 0,
             input_forwarding_enabled: true,
-            audio_available: true,
+            audio_choice: AudioChoice::Off,
+            local_audio_available: false,
+            peer_audio_available: false,
             local_device_name: None,
             peer_device_name: None,
             local_is_controller: true,
@@ -173,9 +182,18 @@ impl ReceiverTrayHandle {
         .await;
     }
 
-    pub async fn audio_available(&self, available: bool) {
-        self.update(move |tray| tray.audio_available = available)
-            .await;
+    pub async fn audio_route(
+        &self,
+        choice: AudioChoice,
+        local_available: bool,
+        peer_available: bool,
+    ) {
+        self.update(move |tray| {
+            tray.audio_choice = choice;
+            tray.local_audio_available = local_available;
+            tray.peer_audio_available = peer_available;
+        })
+        .await;
     }
 
     pub async fn role_assignment(
@@ -259,7 +277,9 @@ pub struct ReceiverTray {
     input_events: u64,
     clipboard_events: u64,
     input_forwarding_enabled: bool,
-    audio_available: bool,
+    audio_choice: AudioChoice,
+    local_audio_available: bool,
+    peer_audio_available: bool,
     local_device_name: Option<String>,
     peer_device_name: Option<String>,
     local_is_controller: bool,
@@ -373,22 +393,7 @@ impl ksni::Tray for ReceiverTray {
             }
             .into(),
         );
-        items.push(
-            StandardItem {
-                label: if self.audio_available {
-                    "Audio streaming".to_string()
-                } else {
-                    "Audio unavailable for this direction".to_string()
-                },
-                icon_name: "audio-volume-high".to_string(),
-                enabled: self.state == TrayState::Connected && self.audio_available,
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(TrayCommand::ToggleAudio);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
+        items.push(self.audio_items());
         items.push(
             StandardItem {
                 label: "Settings...".to_string(),
@@ -417,6 +422,47 @@ impl ksni::Tray for ReceiverTray {
 }
 
 impl ReceiverTray {
+    fn audio_items(&self) -> ksni::MenuItem<Self> {
+        use ksni::menu::{RadioGroup, RadioItem};
+
+        let local = self.local_device_name.as_deref().unwrap_or("This computer");
+        let peer = self.peer_device_name.as_deref().unwrap_or("Peer");
+        let connected = self.state == TrayState::Connected;
+        RadioGroup {
+            selected: match self.audio_choice {
+                AudioChoice::Local => 0,
+                AudioChoice::Peer => 1,
+                AudioChoice::Off => 2,
+            },
+            select: Box::new(|tray: &mut Self, selected| {
+                let choice = match selected {
+                    0 => AudioChoice::Local,
+                    1 => AudioChoice::Peer,
+                    _ => AudioChoice::Off,
+                };
+                let _ = tray.command_tx.send(TrayCommand::SetAudio(choice));
+            }),
+            options: vec![
+                RadioItem {
+                    label: format!("{local} → {peer}"),
+                    enabled: connected && self.local_audio_available,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: format!("{peer} → {local}"),
+                    enabled: connected && self.peer_audio_available,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: "Audio off".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            ],
+        }
+        .into()
+    }
+
     fn controller_items(&self) -> ksni::MenuItem<Self> {
         use ksni::menu::{RadioGroup, RadioItem};
 
@@ -610,7 +656,9 @@ mod tests {
             input_events: 2,
             clipboard_events: 3,
             input_forwarding_enabled: true,
-            audio_available: true,
+            audio_choice: AudioChoice::Off,
+            local_audio_available: true,
+            peer_audio_available: true,
             local_device_name: Some("Desk".to_string()),
             peer_device_name: Some("Studio".to_string()),
             local_is_controller: true,
@@ -745,5 +793,22 @@ mod tests {
         };
         assert_eq!(roles.selected, 1);
         assert!(roles.options.iter().all(|option| !option.enabled));
+    }
+
+    #[test]
+    fn audio_actions_are_directional_named_and_capability_gated() {
+        let mut tray = test_tray(TrayState::Connected, None);
+        tray.audio_choice = AudioChoice::Peer;
+        tray.local_audio_available = false;
+        let ksni::MenuItem::RadioGroup(audio) = &tray.menu()[14] else {
+            panic!("audio actions are not a radio group");
+        };
+        assert_eq!(audio.selected, 1);
+        assert_eq!(audio.options[0].label, "Desk → Studio");
+        assert_eq!(audio.options[1].label, "Studio → Desk");
+        assert_eq!(audio.options[2].label, "Audio off");
+        assert!(!audio.options[0].enabled);
+        assert!(audio.options[1].enabled);
+        assert!(audio.options[2].enabled);
     }
 }

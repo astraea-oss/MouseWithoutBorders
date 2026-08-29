@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, AudioLocalPlayback, GameCompatibilityMode, PeerPosition, Role, parse_listen_port,
-    update_listen_port, validate_device_name, validate_host, validate_port,
+    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
+    parse_listen_port, update_listen_port, validate_device_name, validate_host, validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -270,7 +270,7 @@ struct SettingsApp {
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
     clipboard_images_enabled: bool,
-    audio_enabled: bool,
+    audio_route: AudioRoutePreference,
     audio_play_local: bool,
     save_message: Option<String>,
     error_message: Option<String>,
@@ -303,7 +303,15 @@ impl SettingsApp {
             position: input.config.layout.listener_position,
             game_compatibility: input.config.input.capture.game_compatibility,
             clipboard_images_enabled: input.config.clipboard.images_enabled,
-            audio_enabled: input.config.audio.enabled,
+            audio_route: input
+                .config
+                .audio
+                .route
+                .unwrap_or(if input.config.audio.enabled {
+                    AudioRoutePreference::PeerToLocal
+                } else {
+                    AudioRoutePreference::Disabled
+                }),
             audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
             original: input.config,
             save_message: None,
@@ -321,8 +329,7 @@ impl SettingsApp {
                 Ok(()) => {
                     self.original = config.clone();
                     self.save_message = Some(
-                        "Saved. Audio changes apply immediately; connection changes apply on reconnect."
-                            .to_string(),
+                        "Saved. Connection and audio-route changes apply on reconnect.".to_string(),
                     );
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));
@@ -347,7 +354,8 @@ impl SettingsApp {
         config.device_name = self.device_name.trim().to_string();
         config.input.capture.game_compatibility = self.game_compatibility;
         config.clipboard.images_enabled = self.clipboard_images_enabled;
-        config.audio.enabled = self.audio_enabled;
+        config.audio.route = Some(self.audio_route);
+        config.audio.enabled = self.audio_route != AudioRoutePreference::Disabled;
         config.audio.local_playback = if self.audio_play_local {
             AudioLocalPlayback::Mirror
         } else {
@@ -467,7 +475,29 @@ impl eframe::App for SettingsApp {
                 ui.end_row();
 
                 ui.label("Audio streaming");
-                ui.checkbox(&mut self.audio_enabled, "Enabled on connection");
+                egui::ComboBox::from_id_salt("audio_route")
+                    .selected_text(audio_route_label(
+                        self.audio_route,
+                        &self.device_name,
+                        &self.original.peer.name,
+                    ))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::LocalToPeer,
+                            format!("{} → {}", self.device_name, self.original.peer.name),
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::PeerToLocal,
+                            format!("{} → {}", self.original.peer.name, self.device_name),
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::Disabled,
+                            "Audio off",
+                        );
+                    });
                 ui.end_row();
 
                 ui.label("Local playback");
@@ -502,6 +532,14 @@ fn position_label(position: PeerPosition) -> &'static str {
         PeerPosition::Right => "Right",
         PeerPosition::Top => "Top",
         PeerPosition::Bottom => "Bottom",
+    }
+}
+
+fn audio_route_label(route: AudioRoutePreference, local_name: &str, peer_name: &str) -> String {
+    match route {
+        AudioRoutePreference::LocalToPeer => format!("{local_name} → {peer_name}"),
+        AudioRoutePreference::PeerToLocal => format!("{peer_name} → {local_name}"),
+        AudioRoutePreference::Disabled => "Audio off".to_string(),
     }
 }
 
