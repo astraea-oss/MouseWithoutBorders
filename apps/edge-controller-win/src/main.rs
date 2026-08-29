@@ -2146,6 +2146,12 @@ async fn run_connected_inner(
                             ).await {
                                 Ok(sender) => {
                                     _audio_sender = Some(sender);
+                                    append_portable_log(
+                                        log_path,
+                                        format!(
+                                            "Windows loopback audio is streaming to {destination}"
+                                        ),
+                                    );
                                     update_windows_tray_audio_route(
                                         edge_windows_input::WindowsAudioChoice::Local,
                                         peer_supports_audio_playback && peer_supports_audio_route,
@@ -2159,11 +2165,19 @@ async fn run_connected_inner(
                                     })).await?;
                                 }
                                 Err(error) => {
+                                    append_portable_log(
+                                        log_path,
+                                        format!("failed to start Windows loopback capture: {error:#}"),
+                                    );
                                     update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
                                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::CaptureFailure })).await.ok();
                                 }
                             },
                             Err(error) => {
+                                append_portable_log(
+                                    log_path,
+                                    format!("failed to establish Windows audio UDP path: {error:#}"),
+                                );
                                 update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
                             }
                         }

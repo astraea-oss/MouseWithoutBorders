@@ -507,7 +507,11 @@ mod implementation {
         client
             .initialize_client(
                 &format,
-                &Direction::Render,
+                // The endpoint is a render device, but the stream direction must
+                // be Capture for WASAPI to enable loopback mode. Passing Render
+                // creates an ordinary playback stream and makes
+                // get_audiocaptureclient fail before the first audio frame.
+                &Direction::Capture,
                 &StreamMode::EventsShared {
                     autoconvert: true,
                     buffer_duration_hns: minimum_period,
