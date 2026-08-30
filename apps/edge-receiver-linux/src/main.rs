@@ -449,7 +449,9 @@ async fn run_linux_connector(
     let identity = IdentityKey::load_or_create(default_state_dir().join("identity.toml"))
         .await
         .context("failed to load Linux connector identity")?;
-    let mut pairing_armed = initial_pairing_armed;
+    // First-time setup should lead directly to the mutual confirmation dialog.
+    // Keep replacement of an existing identity behind the explicit pair action.
+    let mut pairing_armed = initial_pairing_armed || config.peer.pinned_fingerprint.is_empty();
     let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
     let (tray, mut tray_commands) = if enable_tray {
         let (tray, commands) = ReceiverTrayHandle::spawn(
@@ -2402,6 +2404,7 @@ async fn run_receiver(
 
         let pin_status = pins.status(&hello.device_name, &peer_fingerprint);
         let controller_trusted = pin_status.is_trusted();
+        let session_pairing_armed = pairing_armed || matches!(pin_status, PinStatus::Unknown);
         let controller_supports_pairing_confirmation = hello
             .extensions
             .iter()
@@ -2438,7 +2441,7 @@ async fn run_receiver(
                 &mut session,
                 &Frame::Pairing(PairingEvent::Status {
                     trusted: controller_trusted,
-                    armed: pairing_armed,
+                    armed: session_pairing_armed,
                 }),
             )
             .await?;
@@ -2456,9 +2459,8 @@ async fn run_receiver(
                 }
             };
             if !controller_trusted || !peer_trusted {
-                if !pairing_armed || !peer_armed {
-                    let message =
-                        "pairing must be enabled from the tray on both computers before connecting";
+                if !session_pairing_armed || !peer_armed {
+                    let message = "the saved peer identity changed; choose 'Pair or replace peer...' on both computers";
                     reject_pairing(&mut session, "pairing_not_armed", message).await;
                     if let Some(tray) = &tray {
                         tray.error(message.to_string()).await;

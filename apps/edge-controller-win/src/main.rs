@@ -165,7 +165,10 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     #[cfg(windows)]
     {
         if run_tray {
-            let mut pairing_armed = args.pair;
+            // A brand-new peer has no identity to replace, so begin the
+            // confirmation flow automatically. Replacing an existing identity
+            // still requires the explicit tray action or --pair.
+            let mut pairing_armed = args.pair || config.peer.pinned_fingerprint.is_empty();
             let (mut connection, pairing_consumed, connect_status) = connect_for_tray(
                 &config,
                 &identity,
@@ -390,7 +393,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         &identity,
         &config_path,
         &controller_log,
-        args.pair,
+        args.pair || config.peer.pinned_fingerprint.is_empty(),
         &mut pairing_consumed,
     )
     .await?;

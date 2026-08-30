@@ -337,7 +337,8 @@ impl SettingsApp {
                 Ok(()) => {
                     self.original = config.clone();
                     self.save_message = Some(
-                        "Saved. Connection and audio-route changes apply on reconnect.".to_string(),
+                        "Saved. Restart edge-kvm on this computer to apply connection-mode changes. First-time pairing starts automatically."
+                            .to_string(),
                     );
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));

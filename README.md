@@ -176,13 +176,14 @@ for existing scripts and portable layouts; its role is no longer fixed.
 
 ### Pairing and changed keys
 
-Normal reconnects use the saved identity keys automatically. For a first
-connection, or after intentionally resetting either computer's `state` folder:
+Normal reconnects use the saved identity keys automatically. On a first
+connection, pairing starts automatically: compare the six-digit code shown on
+both computers and select `Pair` on both only when the codes match.
 
-1. Choose `Pair or replace peer...` from the Linux tray.
-2. Choose `Pair or replace peer...` from the Windows tray.
-3. Compare the six-digit code shown on both computers.
-4. Select `Pair` on both only when the codes match.
+After intentionally resetting either computer's `state` folder, choose
+`Pair or replace peer...` from both tray menus before reconnecting. This
+explicit step is required because the new identity replaces a previously
+trusted one.
 
 Neither saved key is replaced until both computers approve. A changed key is
 shown with an additional warning. For scripted startup, `--pair` arms the same
