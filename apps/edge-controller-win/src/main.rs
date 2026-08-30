@@ -587,6 +587,7 @@ fn handle_pending_windows_tray_commands(
                 append_portable_log(log_path, "opening settings window");
                 edge_ui::spawn_settings_window(SettingsUiInput {
                     role: Role::Controller,
+                    can_choose_transport: false,
                     config_path: config_path.to_path_buf(),
                     local_ip: detect_primary_local_ip(),
                     pairing: controller_pairing_state(&config),

@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use edge_common::{
     AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
-    parse_listen_port, update_listen_port, validate_device_name, validate_host, validate_port,
+    TransportMode, parse_listen_port, update_listen_port, validate_device_name, validate_host,
+    validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -18,6 +19,9 @@ static SETTINGS_CONTEXT: OnceLock<Mutex<Option<eframe::egui::Context>>> = OnceLo
 
 pub struct SettingsUiInput {
     pub role: Role,
+    /// The Linux node supports both connection directions. The Windows entry
+    /// point is currently connector-only, so it displays the mode read-only.
+    pub can_choose_transport: bool,
     pub config_path: PathBuf,
     pub config: AppConfig,
     pub local_ip: Option<IpAddr>,
@@ -267,6 +271,8 @@ struct SettingsApp {
     device_name: String,
     peer_host: String,
     port: String,
+    transport: TransportMode,
+    can_choose_transport: bool,
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
     clipboard_images_enabled: bool,
@@ -280,9 +286,9 @@ struct SettingsApp {
 impl SettingsApp {
     fn new(input: SettingsUiInput, result: Arc<Mutex<SettingsUiResult>>) -> Self {
         let peer = input.config.peer.clone();
-        let port = match input.role {
-            Role::Controller => peer.port,
-            Role::Receiver => input
+        let port = match input.config.transport {
+            TransportMode::Connect => peer.port,
+            TransportMode::Listen => input
                 .config
                 .listen
                 .as_deref()
@@ -300,6 +306,8 @@ impl SettingsApp {
             device_name: input.config.device_name.clone(),
             peer_host: peer.host,
             port: port.to_string(),
+            transport: input.config.transport,
+            can_choose_transport: input.can_choose_transport,
             position: input.config.layout.listener_position,
             game_compatibility: input.config.input.capture.game_compatibility,
             clipboard_images_enabled: input.config.clipboard.images_enabled,
@@ -352,6 +360,7 @@ impl SettingsApp {
 
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
+        config.transport = self.transport;
         config.input.capture.game_compatibility = self.game_compatibility;
         config.clipboard.images_enabled = self.clipboard_images_enabled;
         config.audio.route = Some(self.audio_route);
@@ -362,14 +371,14 @@ impl SettingsApp {
             AudioLocalPlayback::Redirect
         };
 
-        match self.role {
-            Role::Controller => {
+        match self.transport {
+            TransportMode::Connect => {
                 validate_host(&self.peer_host)?;
                 config.peer.host = self.peer_host.trim().to_string();
                 config.peer.port = port;
                 config.layout.listener_position = self.position;
             }
-            Role::Receiver => {
+            TransportMode::Listen => {
                 config.listen = Some(update_listen_port(config.listen.as_deref(), port));
             }
         }
@@ -434,11 +443,41 @@ impl eframe::App for SettingsApp {
                 ui.add_enabled(false, egui::TextEdit::singleline(&mut self.local_ip));
                 ui.end_row();
 
+                ui.label("Connection mode");
+                ui.add_enabled_ui(self.can_choose_transport, |ui| {
+                    egui::ComboBox::from_id_salt("connection_mode")
+                        .selected_text(transport_label(self.transport))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.transport,
+                                TransportMode::Connect,
+                                "Connect to the other computer",
+                            );
+                            ui.selectable_value(
+                                &mut self.transport,
+                                TransportMode::Listen,
+                                "Wait for the other computer",
+                            );
+                        });
+                });
+                ui.end_row();
+
+                ui.label("");
+                ui.small(match self.transport {
+                    TransportMode::Connect => {
+                        "This computer starts the connection. Enter the other computer's IP below."
+                    }
+                    TransportMode::Listen => {
+                        "This computer waits. Set the other computer to Connect."
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Peer IP");
-                if self.role == Role::Controller {
+                if self.transport == TransportMode::Connect {
                     ui.text_edit_singleline(&mut self.peer_host);
                 } else {
-                    let mut receiver_peer = "Not used by receiver".to_string();
+                    let mut receiver_peer = "Not needed while waiting".to_string();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut receiver_peer));
                 }
                 ui.end_row();
@@ -448,7 +487,7 @@ impl eframe::App for SettingsApp {
                 ui.end_row();
 
                 ui.label("Screen location");
-                if self.role == Role::Controller {
+                if self.transport == TransportMode::Connect {
                     egui::ComboBox::from_id_salt("screen_location")
                         .selected_text(position_label(self.position))
                         .show_ui(ui, |ui| {
@@ -458,7 +497,7 @@ impl eframe::App for SettingsApp {
                             ui.selectable_value(&mut self.position, PeerPosition::Bottom, "Bottom");
                         });
                 } else {
-                    let mut text = "Set on controller".to_string();
+                    let mut text = "Set on connecting computer".to_string();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
                 }
                 ui.end_row();
@@ -532,6 +571,13 @@ fn position_label(position: PeerPosition) -> &'static str {
         PeerPosition::Right => "Right",
         PeerPosition::Top => "Top",
         PeerPosition::Bottom => "Bottom",
+    }
+}
+
+fn transport_label(transport: TransportMode) -> &'static str {
+    match transport {
+        TransportMode::Connect => "Connect to the other computer",
+        TransportMode::Listen => "Wait for the other computer",
     }
 }
 

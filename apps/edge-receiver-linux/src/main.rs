@@ -196,6 +196,7 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
     if args.settings {
         let settings_input = SettingsUiInput {
             role: config.preferred_role,
+            can_choose_transport: true,
             config_path,
             config,
             local_ip: detect_primary_local_ip(),
