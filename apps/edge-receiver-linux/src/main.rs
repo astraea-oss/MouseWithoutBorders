@@ -1508,10 +1508,13 @@ async fn run_linux_controller_session(
                             if input.role_epoch == role_epoch
                                 && !local_is_controller
                                 && input_forwarding_enabled
-                                && !session_paused =>
+                            && !session_paused =>
                         {
                             if input.event == InputEvent::AllKeysUp {
-                                input_epoch.suspend();
+                                // AllKeysUp resets held keys/buttons but does not
+                                // mean the pointer left this computer. Capture
+                                // backends may emit it when a focused window
+                                // closes (for example after Ctrl+W).
                                 injector.all_keys_up().await?;
                                 continue;
                             }
@@ -3503,7 +3506,8 @@ async fn handle_controller(
                         let event = input.event;
                         if event == InputEvent::AllKeysUp {
                             stats.all_keys_up = stats.all_keys_up.saturating_add(1);
-                            input_epoch.suspend();
+                            // Keep accepting pointer input in the current epoch.
+                            // Only an explicit control event ends remote entry.
                             backend.all_keys_up().await?;
                             if let Some(tray) = tray {
                                 tray.input_event();

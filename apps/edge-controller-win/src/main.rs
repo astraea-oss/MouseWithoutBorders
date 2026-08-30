@@ -1769,7 +1769,8 @@ async fn run_connected_inner(
                         if input.event == InputEvent::AllKeysUp {
                             injector.all_keys_up()?;
                             edge_windows_input::record_tray_injected_input();
-                            input_epoch.suspend();
+                            // This is a held-key reset, not a pointer-leave
+                            // transition. Continue accepting this input epoch.
                             continue;
                         }
                         if !*input_forwarding_enabled || !input_epoch.accepts_input() {
