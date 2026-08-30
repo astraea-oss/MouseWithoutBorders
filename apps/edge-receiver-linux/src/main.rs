@@ -2788,6 +2788,12 @@ async fn restart_after_settings(
             .context("failed to stop node after saving settings");
     }
 
+    // A service manager will replace the stopped main process. Do not race it
+    // by launching a second unmanaged copy from the settings helper.
+    if std::env::var_os("EDGE_KVM_SERVICE_MANAGED").is_some() {
+        return Ok(());
+    }
+
     let parent_process = PathBuf::from(format!("/proc/{parent_pid}"));
     for _ in 0..50 {
         if !parent_process.exists() {
