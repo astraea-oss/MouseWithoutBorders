@@ -484,6 +484,10 @@ async fn run_linux_connector(
     };
     let mut connection_enabled = true;
     let connector_pause = Arc::new(AtomicBool::new(false));
+    // Keep one compositor capture session across transport reconnects. Creating a
+    // fresh portal session for every short network interruption is wasteful and
+    // triggers session leaks in affected xdg-desktop-portal-hyprland releases.
+    let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
 
     loop {
         if !connection_enabled {
@@ -591,6 +595,7 @@ async fn run_linux_connector(
             &mut tray_commands,
             &connector_pause,
             &log_path,
+            &mut capture,
         )
         .await
         {
@@ -887,6 +892,7 @@ async fn run_linux_controller_session(
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
     connector_pause: &AtomicBool,
     log_path: &Path,
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
 
@@ -934,20 +940,23 @@ async fn run_linux_controller_session(
     let role_switch_available =
         peer_supports_role_switch && peer_supports_input_capture && peer_supports_input_injection;
     let mut input_forwarding_enabled = initial_role_state.controller_fingerprint.is_some();
-    let mut capture = if local_is_controller && peer_supports_input_injection {
-        let backend = PortalCaptureBackend::preflight(edge)
-            .await
-            .context("Linux controller capture preflight failed")?;
+    if local_is_controller && peer_supports_input_injection {
+        if capture.is_none() {
+            *capture = Some(
+                PortalCaptureBackend::preflight(edge)
+                    .await
+                    .context("Linux controller capture preflight failed")?,
+            );
+        }
         if input_forwarding_enabled && !session_paused {
-            backend
+            capture
+                .as_ref()
+                .expect("capture was initialized above")
                 .arm()
                 .await
                 .context("failed to arm Linux controller capture")?;
         }
-        Some(backend)
-    } else {
-        None
-    };
+    }
     let mut return_watcher = RemoteReturnWatcher::new(local_screen_info.clone());
     let mut input_epoch = InputEpochGate::default();
     let mut pending_readiness: Option<ConnectorRoleReadiness> = None;
@@ -1144,7 +1153,7 @@ async fn run_linux_controller_session(
                             ),
                     );
                 }
-                event = recv_portal_capture_event(&mut capture) => {
+                event = recv_portal_capture_event(capture) => {
                     match event {
                         Some(CaptureEvent::Activated {
                             edge,
@@ -1323,7 +1332,7 @@ async fn run_linux_controller_session(
                                     requested,
                                     &local_fingerprint,
                                     &mut coordinator,
-                                    &mut capture,
+                                    capture,
                                     &injector,
                                     &mut writer,
                                     edge,
@@ -1625,7 +1634,7 @@ async fn run_linux_controller_session(
                                     &controller_fingerprint,
                                     &local_fingerprint,
                                     &mut coordinator,
-                                    &mut capture,
+                                    capture,
                                     &injector,
                                     &mut writer,
                                     edge,
@@ -2025,7 +2034,7 @@ async fn run_linux_controller_session(
     )
     .await
     .ok();
-    if let Some(capture) = &capture {
+    if let Some(capture) = capture.as_ref() {
         capture.release(None).await.ok();
         capture.disarm().await.ok();
     }
