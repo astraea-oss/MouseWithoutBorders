@@ -22,6 +22,9 @@ pub struct SettingsUiInput {
     /// The Linux node supports both connection directions. The Windows entry
     /// point is currently connector-only, so it displays the mode read-only.
     pub can_choose_transport: bool,
+    /// Close the settings window after a successful save so the caller can
+    /// restart the node with the new connection configuration.
+    pub restart_on_save: bool,
     pub config_path: PathBuf,
     pub config: AppConfig,
     pub local_ip: Option<IpAddr>,
@@ -273,6 +276,7 @@ struct SettingsApp {
     port: String,
     transport: TransportMode,
     can_choose_transport: bool,
+    restart_on_save: bool,
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
     clipboard_images_enabled: bool,
@@ -308,6 +312,7 @@ impl SettingsApp {
             port: port.to_string(),
             transport: input.config.transport,
             can_choose_transport: input.can_choose_transport,
+            restart_on_save: input.restart_on_save,
             position: input.config.layout.listener_position,
             game_compatibility: input.config.input.capture.game_compatibility,
             clipboard_images_enabled: input.config.clipboard.images_enabled,
@@ -328,7 +333,7 @@ impl SettingsApp {
         }
     }
 
-    fn save(&mut self) {
+    fn save(&mut self) -> bool {
         self.error_message = None;
         self.save_message = None;
 
@@ -336,17 +341,25 @@ impl SettingsApp {
             Ok(config) => match config.save_blocking(&self.config_path) {
                 Ok(()) => {
                     self.original = config.clone();
-                    self.save_message = Some(
-                        "Saved. Restart edge-kvm on this computer to apply connection-mode changes. First-time pairing starts automatically."
-                            .to_string(),
-                    );
+                    self.save_message = Some(if self.restart_on_save {
+                        "Saved. Restarting edge-kvm...".to_string()
+                    } else {
+                        "Saved. Connection changes apply on reconnect.".to_string()
+                    });
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));
                     }
+                    true
                 }
-                Err(err) => self.error_message = Some(err.to_string()),
+                Err(err) => {
+                    self.error_message = Some(err.to_string());
+                    false
+                }
             },
-            Err(err) => self.error_message = Some(err.to_string()),
+            Err(err) => {
+                self.error_message = Some(err.to_string());
+                false
+            }
         }
     }
 
@@ -559,8 +572,13 @@ impl eframe::App for SettingsApp {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Save").clicked() {
-                self.save();
+            let save_label = if self.restart_on_save {
+                "Save and restart"
+            } else {
+                "Save"
+            };
+            if ui.button(save_label).clicked() && self.save() && self.restart_on_save {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
     }

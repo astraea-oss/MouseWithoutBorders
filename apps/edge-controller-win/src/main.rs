@@ -591,6 +591,7 @@ fn handle_pending_windows_tray_commands(
                 edge_ui::spawn_settings_window(SettingsUiInput {
                     role: Role::Controller,
                     can_choose_transport: false,
+                    restart_on_save: false,
                     config_path: config_path.to_path_buf(),
                     local_ip: detect_primary_local_ip(),
                     pairing: controller_pairing_state(&config),

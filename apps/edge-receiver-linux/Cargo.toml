@@ -23,6 +23,7 @@ edge-protocol = { path = "../../crates/edge-protocol" }
 edge-runtime = { path = "../../crates/edge-runtime" }
 edge-ui = { path = "../../crates/edge-ui" }
 ksni = "0.3.5"
+libc = "0.2"
 socket2 = { version = "0.6.4", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true

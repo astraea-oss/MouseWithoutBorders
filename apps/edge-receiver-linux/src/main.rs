@@ -52,7 +52,10 @@ use edge_runtime::{
     RoleStore, select_initial_controller, validate_commit, validate_prepare,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
-use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput, run_settings_window};
+use edge_ui::{
+    PairingConfirmationInput, PairingUiState, SettingsUiInput, SettingsUiResult,
+    run_settings_window,
+};
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
 #[cfg(unix)]
@@ -105,6 +108,8 @@ struct Args {
     no_tray: bool,
     #[arg(long, hide = true)]
     settings: bool,
+    #[arg(long, hide = true)]
+    settings_parent_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -194,17 +199,24 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
     }
 
     if args.settings {
+        let restart_config_path = config_path.clone();
         let settings_input = SettingsUiInput {
             role: config.preferred_role,
             can_choose_transport: true,
+            restart_on_save: args.settings_parent_pid.is_some(),
             config_path,
             config,
             local_ip: detect_primary_local_ip(),
             pairing: PairingUiState::Idle,
         };
-        tokio::task::spawn_blocking(move || run_settings_window(settings_input))
+        let result = tokio::task::spawn_blocking(move || run_settings_window(settings_input))
             .await
             .context("settings window task failed")??;
+        if matches!(result, SettingsUiResult::Saved(_)) {
+            if let Some(parent_pid) = args.settings_parent_pid {
+                restart_after_settings(parent_pid, &restart_config_path, &receiver_log).await?;
+            }
+        }
         return Ok(());
     }
 
@@ -2723,6 +2735,8 @@ fn open_receiver_settings(config_path: &Path, log_path: &Path) {
 
     match Command::new(executable)
         .arg("--settings")
+        .arg("--settings-parent-pid")
+        .arg(std::process::id().to_string())
         .arg("--config")
         .arg(config_path)
         .spawn()
@@ -2739,6 +2753,35 @@ fn open_receiver_settings(config_path: &Path, log_path: &Path) {
             append_portable_log(log_path, format!("failed to start settings process: {err}"));
         }
     }
+}
+
+async fn restart_after_settings(
+    parent_pid: u32,
+    config_path: &Path,
+    log_path: &Path,
+) -> Result<()> {
+    append_portable_log(log_path, "settings saved; restarting node");
+    let result = unsafe { libc::kill(parent_pid as libc::pid_t, libc::SIGTERM) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to stop node after saving settings");
+    }
+
+    let parent_process = PathBuf::from(format!("/proc/{parent_pid}"));
+    for _ in 0..50 {
+        if !parent_process.exists() {
+            let executable = std::env::current_exe().context("failed to locate node executable")?;
+            Command::new(executable)
+                .arg("--config")
+                .arg(config_path)
+                .spawn()
+                .context("failed to restart node after saving settings")?;
+            return Ok(());
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!("node did not stop within five seconds after saving settings")
 }
 
 enum ControllerSessionExit {
