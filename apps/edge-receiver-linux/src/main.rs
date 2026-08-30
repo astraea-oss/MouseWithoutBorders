@@ -156,6 +156,11 @@ async fn main() -> Result<()> {
                         &receiver_log,
                         format!("receiver shutdown signal received: {signal}"),
                     );
+                    if signal == "SIGHUP"
+                        && std::env::var_os("EDGE_KVM_SERVICE_MANAGED").is_some()
+                    {
+                        anyhow::bail!("service-managed restart requested after settings change")
+                    }
                     Ok(())
                 }
                 Err(err) => Err(err).context("failed to install receiver shutdown signal handler"),
@@ -2782,7 +2787,13 @@ async fn restart_after_settings(
     log_path: &Path,
 ) -> Result<()> {
     append_portable_log(log_path, "settings saved; restarting node");
-    let result = unsafe { libc::kill(parent_pid as libc::pid_t, libc::SIGTERM) };
+    let service_managed = std::env::var_os("EDGE_KVM_SERVICE_MANAGED").is_some();
+    let signal = if service_managed {
+        libc::SIGHUP
+    } else {
+        libc::SIGTERM
+    };
+    let result = unsafe { libc::kill(parent_pid as libc::pid_t, signal) };
     if result != 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to stop node after saving settings");
@@ -2790,7 +2801,7 @@ async fn restart_after_settings(
 
     // A service manager will replace the stopped main process. Do not race it
     // by launching a second unmanaged copy from the settings helper.
-    if std::env::var_os("EDGE_KVM_SERVICE_MANAGED").is_some() {
+    if service_managed {
         return Ok(());
     }
 
