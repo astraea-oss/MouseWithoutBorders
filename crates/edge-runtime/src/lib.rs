@@ -123,7 +123,10 @@ impl Default for LivenessConfig {
         Self {
             active_heartbeat_interval: Duration::from_millis(250),
             idle_heartbeat_interval: Duration::from_secs(1),
-            soft_input_timeout: Duration::from_secs(1),
+            // Keep a full heartbeat interval of scheduling/network margin. The
+            // previous one-second timeout equalled the idle heartbeat interval,
+            // so a normally scheduled heartbeat could spuriously release input.
+            soft_input_timeout: Duration::from_secs(2),
             hard_session_timeout: Duration::from_secs(5),
         }
     }
@@ -411,6 +414,7 @@ mod tests {
         let config = LivenessConfig::default();
         assert_eq!(config.heartbeat_interval(true), Duration::from_millis(250));
         assert_eq!(config.heartbeat_interval(false), Duration::from_secs(1));
+        assert!(config.soft_input_timeout > config.idle_heartbeat_interval);
     }
 
     #[tokio::test(start_paused = true)]
@@ -419,7 +423,7 @@ mod tests {
         let mut tracker = LivenessTracker::new(LivenessConfig::default(), start);
 
         assert_eq!(tracker.poll(Instant::now(), true), None);
-        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::time::advance(Duration::from_millis(1_999)).await;
         assert_eq!(tracker.poll(Instant::now(), true), None);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(
@@ -427,7 +431,7 @@ mod tests {
             Some(LivenessEvent::SoftInputTimeout)
         );
         assert_eq!(tracker.poll(Instant::now(), true), None);
-        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
         assert_eq!(
             tracker.poll(Instant::now(), true),
             Some(LivenessEvent::HardSessionTimeout)
@@ -443,7 +447,7 @@ mod tests {
         assert_eq!(tracker.poll(Instant::now(), false), None);
         assert_eq!(tracker.poll(Instant::now(), true), None);
 
-        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::time::advance(Duration::from_millis(1_999)).await;
         assert_eq!(tracker.poll(Instant::now(), true), None);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(

@@ -1037,6 +1037,7 @@ async fn run_linux_controller_session(
     tokio::pin!(heartbeat);
     let mut heartbeat_sequence = 0_u64;
     let mut input_active = false;
+    let mut capture_released_for_liveness = false;
 
     let outcome: Result<ControllerSessionExit> = async {
         loop {
@@ -1074,7 +1075,13 @@ async fn run_linux_controller_session(
                     match peer_liveness.poll(tokio::time::Instant::now(), input_active) {
                         Some(LivenessEvent::SoftInputTimeout) => {
                             if local_is_controller && let Some(capture) = &capture {
-                                capture.release(None).await.ok();
+                                if let Err(error) = capture.release(None).await {
+                                    tracing::warn!(%error, "portal release failed during peer timeout");
+                                }
+                                if let Err(error) = capture.disarm().await {
+                                    tracing::warn!(%error, "portal disable failed during peer timeout");
+                                }
+                                capture_released_for_liveness = true;
                             } else {
                                 input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
@@ -1467,6 +1474,20 @@ async fn run_linux_controller_session(
                 frame = frame_rx.recv() => {
                     let frame = frame.context("Linux peer frame reader ended")??;
                     peer_liveness.observe_authenticated_frame(tokio::time::Instant::now());
+                    if capture_released_for_liveness
+                        && local_is_controller
+                        && input_forwarding_enabled
+                        && !session_paused
+                        && !coordinator.is_transitioning()
+                        && let Some(capture) = &capture
+                    {
+                        capture
+                            .arm()
+                            .await
+                            .context("failed to re-arm capture after peer recovered")?;
+                        capture_released_for_liveness = false;
+                        tracing::info!("peer recovered; re-armed Linux edge capture");
+                    }
                     writer.record_received(&frame);
                     match frame {
                         Frame::Heartbeat(_) => {}
