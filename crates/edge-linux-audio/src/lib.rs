@@ -16,7 +16,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     process::{Child, Command},
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -276,12 +276,28 @@ impl LinuxAudioReceiver {
             let mut jitter = JitterBuffer::new(jitter_target_ms);
             let mut concealer = PcmConcealer::default();
             let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+            // pacat deliberately paces writes to the physical audio device. Keep
+            // that backpressure off the UDP receive loop so short scheduler or
+            // sender bursts are absorbed here instead of overflowing the kernel
+            // socket queue and turning into audible packet loss.
+            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(64);
+            let mut playback_writer = tokio::spawn(async move {
+                while let Some(encoded) = playback_rx.recv().await {
+                    stdin
+                        .write_all(&encoded)
+                        .await
+                        .map_err(|error| format!("Linux audio playback failed: {error}"))?;
+                }
+                Ok::<(), String>(())
+            });
             let mut probe_retry = tokio::time::interval(Duration::from_millis(250));
             let mut watchdog = tokio::time::interval(Duration::from_millis(500));
             let started = tokio::time::Instant::now();
             let mut last_media = started;
             let mut received_media = false;
             let mut media_stalled = false;
+            let mut playback_queue_drops = 0_u64;
+            let mut last_queue_warning = started;
             let reason = 'receive: loop {
                 tokio::select! {
                     received = socket.recv_from(&mut buffer) => {
@@ -308,8 +324,22 @@ impl LinuxAudioReceiver {
                                                 Ok(encoded) => encoded,
                                                 Err(error) => break 'receive format!("Linux PCM playback encoding failed: {error}"),
                                             };
-                                            if let Err(error) = stdin.write_all(&encoded).await {
-                                                break 'receive format!("Linux audio playback failed: {error}");
+                                            match playback_tx.try_send(encoded) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    playback_queue_drops = playback_queue_drops.saturating_add(1);
+                                                    if last_queue_warning.elapsed() >= Duration::from_secs(1) {
+                                                        tracing::warn!(
+                                                            dropped_frames = playback_queue_drops,
+                                                            "Linux audio playback queue saturated; dropping newest frame"
+                                                        );
+                                                        playback_queue_drops = 0;
+                                                        last_queue_warning = tokio::time::Instant::now();
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    break 'receive "Linux audio playback queue closed".to_string();
+                                                }
                                             }
                                         }
                                     }
@@ -342,8 +372,16 @@ impl LinuxAudioReceiver {
                             break "audio source did not start within 8 seconds".to_string();
                         }
                     }
+                    result = &mut playback_writer => {
+                        break match result {
+                            Ok(Ok(())) => "Linux audio playback stopped unexpectedly".to_string(),
+                            Ok(Err(error)) => error,
+                            Err(error) => format!("Linux audio playback task failed: {error}"),
+                        };
+                    }
                 }
             };
+            playback_writer.abort();
             let _ = playback.kill().await;
             reason
         });
