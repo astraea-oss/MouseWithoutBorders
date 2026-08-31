@@ -949,12 +949,7 @@ async fn run_linux_controller_session(
             );
         }
         if input_forwarding_enabled && !session_paused {
-            capture
-                .as_ref()
-                .expect("capture was initialized above")
-                .arm()
-                .await
-                .context("failed to arm Linux controller capture")?;
+            arm_connector_capture(capture, "failed to arm Linux controller capture").await?;
         }
     }
     let mut return_watcher = RemoteReturnWatcher::new(local_screen_info.clone());
@@ -1078,9 +1073,12 @@ async fn run_linux_controller_session(
                         if local_is_controller
                             && input_forwarding_enabled
                             && !session_paused
-                            && let Some(capture) = &capture
                         {
-                            capture.arm().await.ok();
+                            arm_connector_capture(
+                                capture,
+                                "failed to re-arm capture after role switch timeout",
+                            )
+                            .await?;
                         }
                         if let Some(tray) = tray {
                             tray.role_failure("Role switch timed out".to_string()).await;
@@ -1227,11 +1225,10 @@ async fn run_linux_controller_session(
                             if local_is_controller
                                 && input_forwarding_enabled
                                 && !session_paused
-                                && let Some(capture) = &capture
                             {
-                                capture.arm().await.context(
+                                arm_connector_capture(capture,
                                     "monitor layout changed and capture could not be re-armed",
-                                )?;
+                                ).await?;
                             }
                         }
                         Some(CaptureEvent::BackendFailed(error)) => {
@@ -1241,9 +1238,15 @@ async fn run_linux_controller_session(
                             )
                             .await
                             .ok();
+                            // The backend object cannot recover once its EIS stream or
+                            // portal session has ended. Do not retain it across the next
+                            // transport reconnect; doing so creates an endless arm-fail
+                            // loop and can leave the compositor pointer captured.
+                            *capture = None;
                             anyhow::bail!("Linux capture backend failed: {error}");
                         }
                         None if capture.is_some() => {
+                            *capture = None;
                             anyhow::bail!("Linux capture backend stopped unexpectedly");
                         }
                         None => {}
@@ -1292,11 +1295,19 @@ async fn run_linux_controller_session(
                             {
                                 input_forwarding_enabled = !input_forwarding_enabled;
                                 input_active = false;
-                                if local_is_controller && let Some(capture) = &capture {
+                                if local_is_controller {
                                     if input_forwarding_enabled {
-                                        capture.arm().await?;
+                                        arm_connector_capture(
+                                            capture,
+                                            "failed to arm capture after enabling input forwarding",
+                                        )
+                                        .await?;
                                     } else {
-                                        capture.disarm().await?;
+                                        disarm_connector_capture(
+                                            capture,
+                                            "failed to disarm capture after disabling input forwarding",
+                                        )
+                                        .await?;
                                     }
                                 } else if !input_forwarding_enabled {
                                     injector.all_keys_up().await.ok();
@@ -1446,9 +1457,12 @@ async fn run_linux_controller_session(
                             }
                             if local_is_controller
                                 && input_forwarding_enabled
-                                && let Some(capture) = &capture
                             {
-                                capture.arm().await?;
+                                arm_connector_capture(
+                                    capture,
+                                    "failed to re-arm capture after resuming the session",
+                                )
+                                .await?;
                             }
                             if let Some(tray) = tray {
                                 tray.session_paused(false).await;
@@ -1493,12 +1507,12 @@ async fn run_linux_controller_session(
                         && input_forwarding_enabled
                         && !session_paused
                         && !coordinator.is_transitioning()
-                        && let Some(capture) = &capture
                     {
-                        capture
-                            .arm()
-                            .await
-                            .context("failed to re-arm capture after peer recovered")?;
+                        arm_connector_capture(
+                            capture,
+                            "failed to re-arm capture after peer recovered",
+                        )
+                        .await?;
                         capture_released_for_liveness = false;
                         tracing::info!("peer recovered; re-armed Linux edge capture");
                     }
@@ -1595,13 +1609,21 @@ async fn run_linux_controller_session(
                                 ControlEvent::SetInputForwarding { enabled } => {
                                     input_forwarding_enabled = enabled;
                                     input_active = false;
-                                    if local_is_controller && let Some(capture) = &capture {
+                                    if local_is_controller {
                                         if enabled {
                                             if !session_paused {
-                                                capture.arm().await?;
+                                                arm_connector_capture(
+                                                    capture,
+                                                    "failed to arm capture after peer enabled input forwarding",
+                                                )
+                                                .await?;
                                             }
                                         } else {
-                                            capture.disarm().await?;
+                                            disarm_connector_capture(
+                                                capture,
+                                                "failed to disarm capture after peer disabled input forwarding",
+                                            )
+                                            .await?;
                                         }
                                     } else if !enabled {
                                         input_epoch.suspend();
@@ -1708,9 +1730,12 @@ async fn run_linux_controller_session(
                                     if local_is_controller
                                         && input_forwarding_enabled
                                         && !session_paused
-                                        && let Some(capture) = &capture
                                     {
-                                        capture.arm().await?;
+                                        arm_connector_capture(
+                                            capture,
+                                            "failed to arm capture after role commit",
+                                        )
+                                        .await?;
                                     }
                                     if let Some(tray) = tray {
                                         tray.role_assignment(
@@ -1731,9 +1756,12 @@ async fn run_linux_controller_session(
                                     if local_is_controller
                                         && input_forwarding_enabled
                                         && !session_paused
-                                        && let Some(capture) = &capture
                                     {
-                                        capture.arm().await?;
+                                        arm_connector_capture(
+                                            capture,
+                                            "failed to re-arm capture after aborted role switch",
+                                        )
+                                        .await?;
                                     }
                                     if let Some(tray) = tray {
                                         tray.role_switching(false).await;
@@ -1808,9 +1836,12 @@ async fn run_linux_controller_session(
                                 audio_receiver = None;
                             } else if local_is_controller
                                 && input_forwarding_enabled
-                                && let Some(capture) = &capture
                             {
-                                capture.arm().await?;
+                                arm_connector_capture(
+                                    capture,
+                                    "failed to re-arm capture after peer resumed the session",
+                                )
+                                .await?;
                             }
                             write_secure_frame_writer(
                                 &mut writer,
@@ -2045,6 +2076,40 @@ async fn run_linux_controller_session(
     drop(audio_receiver.take());
     injector.all_keys_up().await.ok();
     outcome
+}
+
+#[cfg(target_os = "linux")]
+async fn arm_connector_capture(
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
+    context: &'static str,
+) -> Result<()> {
+    let Some(backend) = capture.as_ref() else {
+        anyhow::bail!("{context}: capture backend is unavailable");
+    };
+    if let Err(error) = backend.arm().await {
+        // Portal command errors (including InvalidSession) do not necessarily
+        // close the backend task, so channel liveness alone cannot tell us that
+        // this object is unusable. Drop it and preflight a new session after the
+        // transport reconnects.
+        *capture = None;
+        return Err(anyhow::Error::new(error).context(context));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn disarm_connector_capture(
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
+    context: &'static str,
+) -> Result<()> {
+    let Some(backend) = capture.as_ref() else {
+        return Ok(());
+    };
+    if let Err(error) = backend.disarm().await {
+        *capture = None;
+        return Err(anyhow::Error::new(error).context(context));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

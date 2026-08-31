@@ -266,7 +266,8 @@ async fn run_portal_capture(
 
     let _ = ready_tx.send(Ok(()));
 
-    loop {
+    let outcome = async {
+        loop {
         tokio::select! {
             command = command_rx.recv() => {
                 match command {
@@ -296,7 +297,7 @@ async fn run_portal_capture(
                         let result = portal_command("Disable", input_capture.disable(&session, Default::default())).await;
                         let _ = response.send(result);
                     }
-                    Some(CaptureCommand::Shutdown) | None => break,
+                    Some(CaptureCommand::Shutdown) | None => break Ok(()),
                 }
             }
             Some(activated) = activated_events.next() => {
@@ -383,12 +384,29 @@ async fn run_portal_capture(
                     }
                 }
             }
+            }
         }
     }
+    .await;
 
-    let _ = input_capture.disable(&session, Default::default()).await;
-    let _ = session.close().await;
-    Ok(())
+    // Always tear down the compositor capture, including when the EIS stream
+    // closes or event processing fails. Previously those early error returns
+    // skipped this cleanup and could leave Hyprland hiding/capturing the local
+    // pointer until the portal or compositor was restarted.
+    if let Some(id) = activation_id.take() {
+        let _ = portal_command(
+            "Release during shutdown",
+            input_capture.release(&session, ReleaseOptions::default().set_activation_id(id)),
+        )
+        .await;
+    }
+    let _ = portal_command(
+        "Disable during shutdown",
+        input_capture.disable(&session, Default::default()),
+    )
+    .await;
+    let _ = time::timeout(PORTAL_COMMAND_TIMEOUT, session.close()).await;
+    outcome
 }
 
 async fn portal_command<T>(
