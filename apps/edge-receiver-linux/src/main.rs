@@ -295,7 +295,7 @@ async fn run_capture_test(edge: Edge) -> Result<()> {
         .context("failed to arm the InputCapture portal")?;
 
     println!(
-        "Capture armed on the {edge:?} edge (zone set {}). Cross the edge to test; Ctrl+Alt+Pause releases locally; Ctrl+C exits.",
+        "Capture armed on the {edge:?} edge (zone set {}). Cross the edge to test; Ctrl+Alt+Esc or Ctrl+Alt+Pause releases locally; Ctrl+C exits.",
         backend.zone_set()
     );
     let mut counts = CaptureCounts::default();
@@ -307,6 +307,7 @@ async fn run_capture_test(edge: Edge) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = status_tick.tick() => {
+                backend.keep_alive();
                 if counts != displayed {
                     println!(
                         "events: activation={} motion={} button={} wheel={} keyboard={} release={} deactivation={} layout={}",
@@ -940,16 +941,27 @@ async fn run_linux_controller_session(
     let role_switch_available =
         peer_supports_role_switch && peer_supports_input_capture && peer_supports_input_injection;
     let mut input_forwarding_enabled = initial_role_state.controller_fingerprint.is_some();
+    let mut initial_capture_failure = None;
     if local_is_controller && peer_supports_input_injection {
         if capture.is_none() {
-            *capture = Some(
-                PortalCaptureBackend::preflight(edge)
-                    .await
-                    .context("Linux controller capture preflight failed")?,
-            );
+            match PortalCaptureBackend::preflight(edge).await {
+                Ok(backend) => *capture = Some(backend),
+                Err(error) => {
+                    initial_capture_failure = Some(format!(
+                        "Linux controller capture preflight failed: {error}"
+                    ));
+                }
+            }
         }
-        if input_forwarding_enabled && !session_paused {
-            arm_connector_capture(capture, "failed to arm Linux controller capture").await?;
+        if initial_capture_failure.is_none()
+            && input_forwarding_enabled
+            && !session_paused
+            && let Some(backend) = capture.as_ref()
+            && let Err(error) = backend.arm().await
+        {
+            initial_capture_failure =
+                Some(format!("failed to arm Linux controller capture: {error}"));
+            *capture = None;
         }
     }
     let mut return_watcher = RemoteReturnWatcher::new(local_screen_info.clone());
@@ -1020,6 +1032,27 @@ async fn run_linux_controller_session(
     }
 
     let (reader, mut writer) = SecureFrameSession::new(session).split();
+    if let Some(error) = initial_capture_failure {
+        if role_switch_available && !session_paused {
+            request_connector_control_after_capture_failure(
+                &mut writer,
+                &peer_fingerprint,
+                &peer_name,
+                tray,
+                log_path,
+                error,
+            )
+            .await?;
+        } else {
+            let message =
+                format!("Linux input capture unavailable ({error}); keeping the session connected");
+            tracing::warn!(%message);
+            append_portable_log(log_path, &message);
+            if let Some(tray) = tray {
+                tray.role_failure(message).await;
+            }
+        }
+    }
     send_linux_audio_route(
         &mut writer,
         peer_supports_audio_route,
@@ -1058,6 +1091,13 @@ async fn run_linux_controller_session(
             tokio::select! {
                 biased;
                 _ = watchdog.tick() => {
+                    if local_is_controller
+                        && input_forwarding_enabled
+                        && !session_paused
+                        && let Some(capture) = capture.as_ref()
+                    {
+                        capture.keep_alive();
+                    }
                     if transition_deadline.is_some_and(|deadline| {
                         tokio::time::Instant::now() >= deadline
                     }) && coordinator.is_transitioning() {
@@ -1243,11 +1283,49 @@ async fn run_linux_controller_session(
                             // transport reconnect; doing so creates an endless arm-fail
                             // loop and can leave the compositor pointer captured.
                             *capture = None;
-                            anyhow::bail!("Linux capture backend failed: {error}");
+                            input_active = false;
+                            if local_is_controller
+                                && role_switch_available
+                                && !session_paused
+                                && !coordinator.is_transitioning()
+                            {
+                                request_connector_control_after_capture_failure(
+                                    &mut writer,
+                                    &peer_fingerprint,
+                                    &peer_name,
+                                    tray,
+                                    log_path,
+                                    error,
+                                )
+                                .await?;
+                            } else if let Some(tray) = tray {
+                                tray.role_failure(format!(
+                                    "Linux capture backend failed: {error}"
+                                ))
+                                .await;
+                            }
                         }
                         None if capture.is_some() => {
                             *capture = None;
-                            anyhow::bail!("Linux capture backend stopped unexpectedly");
+                            input_active = false;
+                            let error = "capture backend stopped unexpectedly";
+                            if local_is_controller
+                                && role_switch_available
+                                && !session_paused
+                                && !coordinator.is_transitioning()
+                            {
+                                request_connector_control_after_capture_failure(
+                                    &mut writer,
+                                    &peer_fingerprint,
+                                    &peer_name,
+                                    tray,
+                                    log_path,
+                                    error,
+                                )
+                                .await?;
+                            } else if let Some(tray) = tray {
+                                tray.role_failure(format!("Linux {error}")).await;
+                            }
                         }
                         None => {}
                     }
@@ -1303,11 +1381,20 @@ async fn run_linux_controller_session(
                                         )
                                         .await?;
                                     } else {
-                                        disarm_connector_capture(
+                                        if let Err(error) = disarm_connector_capture(
                                             capture,
                                             "failed to disarm capture after disabling input forwarding",
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            tracing::warn!(%error, "capture disable failed; keeping the peer session connected");
+                                            append_portable_log(log_path, format!(
+                                                "capture disable failed without disconnecting the peer session: {error:#}"
+                                            ));
+                                            if let Some(tray) = tray {
+                                                tray.role_failure(error.to_string()).await;
+                                            }
+                                        }
                                     }
                                 } else if !input_forwarding_enabled {
                                     injector.all_keys_up().await.ok();
@@ -1619,11 +1706,20 @@ async fn run_linux_controller_session(
                                                 .await?;
                                             }
                                         } else {
-                                            disarm_connector_capture(
+                                            if let Err(error) = disarm_connector_capture(
                                                 capture,
                                                 "failed to disarm capture after peer disabled input forwarding",
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                tracing::warn!(%error, "peer-requested capture disable failed; keeping the session connected");
+                                                append_portable_log(log_path, format!(
+                                                    "peer-requested capture disable failed without disconnecting: {error:#}"
+                                                ));
+                                                if let Some(tray) = tray {
+                                                    tray.role_failure(error.to_string()).await;
+                                                }
+                                            }
                                         }
                                     } else if !enabled {
                                         input_epoch.suspend();
@@ -3087,6 +3183,13 @@ async fn handle_controller(
         tokio::select! {
             biased;
             _ = connection_watchdog.tick() => {
+                if local_is_controller
+                    && input_forwarding_enabled
+                    && !session_paused
+                    && let Some(capture) = capture.as_ref()
+                {
+                    capture.keep_alive();
+                }
                 if role_request_deadline.is_some_and(|deadline| {
                     tokio::time::Instant::now() >= deadline
                 }) {

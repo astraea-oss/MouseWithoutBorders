@@ -5,9 +5,9 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ashpd::{
@@ -35,6 +35,9 @@ use crate::{LinuxInputError, Result};
 
 const PORTAL_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 const PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPTURE_OWNER_LEASE: Duration = Duration::from_secs(3);
+const CAPTURE_LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const FAILSAFE_PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureEvent {
@@ -69,6 +72,7 @@ pub struct PortalCaptureBackend {
     command_tx: mpsc::Sender<CaptureCommand>,
     event_rx: mpsc::UnboundedReceiver<CaptureEvent>,
     zone_set: Arc<AtomicU32>,
+    owner_lease: Arc<CaptureOwnerLease>,
 }
 
 impl PortalCaptureBackend {
@@ -79,6 +83,8 @@ impl PortalCaptureBackend {
         let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
         let zone_set = Arc::new(AtomicU32::new(0));
         let task_zone_set = zone_set.clone();
+        let owner_lease = Arc::new(CaptureOwnerLease::new());
+        let task_owner_lease = owner_lease.clone();
         std::thread::Builder::new()
             .name("edge-portal-capture".to_string())
             .spawn(move || {
@@ -100,6 +106,7 @@ impl PortalCaptureBackend {
                     event_tx.clone(),
                     ready_tx.clone(),
                     task_zone_set,
+                    task_owner_lease,
                 );
                 let startup_cancel = async move {
                     if startup_cancel_rx.await.is_err() {
@@ -146,6 +153,7 @@ impl PortalCaptureBackend {
             command_tx,
             event_rx,
             zone_set,
+            owner_lease,
         })
     }
 
@@ -154,12 +162,30 @@ impl PortalCaptureBackend {
     }
 
     pub async fn arm(&self) -> Result<()> {
+        self.owner_lease.renew();
         let (response, receiver) = oneshot::channel();
-        self.command_tx
+        if let Err(error) = self
+            .command_tx
             .send(CaptureCommand::Arm(response))
             .await
-            .map_err(|_| capture_task_closed())?;
-        receiver.await.map_err(|_| capture_task_closed())?
+            .map_err(|_| capture_task_closed())
+        {
+            self.owner_lease.clear();
+            return Err(error);
+        }
+        let result = receiver.await.map_err(|_| capture_task_closed())?;
+        if result.is_err() {
+            self.owner_lease.clear();
+        }
+        result
+    }
+
+    /// Confirms that the session task which owns this capture is still able to
+    /// make progress. An armed capture is released by its dedicated portal
+    /// worker if these confirmations stop, so a wedged network/session task
+    /// cannot retain all local keyboard and pointer input indefinitely.
+    pub fn keep_alive(&self) {
+        self.owner_lease.renew();
     }
 
     pub async fn release(&self, cursor_position: Option<(f64, f64)>) -> Result<()> {
@@ -175,6 +201,7 @@ impl PortalCaptureBackend {
     }
 
     pub async fn disarm(&self) -> Result<()> {
+        self.owner_lease.clear();
         let (response, receiver) = oneshot::channel();
         self.command_tx
             .send(CaptureCommand::Disarm(response))
@@ -195,8 +222,44 @@ impl PortalCaptureBackend {
     }
 }
 
+#[derive(Debug)]
+struct CaptureOwnerLease {
+    epoch: Instant,
+    deadline_millis: AtomicU64,
+}
+
+impl CaptureOwnerLease {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            deadline_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn renew(&self) {
+        let deadline = self
+            .epoch
+            .elapsed()
+            .saturating_add(CAPTURE_OWNER_LEASE)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.deadline_millis
+            .store(deadline.max(1), Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.deadline_millis.store(0, Ordering::Release);
+    }
+
+    fn expired(&self) -> bool {
+        let deadline = self.deadline_millis.load(Ordering::Acquire);
+        deadline != 0 && self.epoch.elapsed().as_millis() >= u128::from(deadline)
+    }
+}
+
 impl Drop for PortalCaptureBackend {
     fn drop(&mut self) {
+        self.owner_lease.clear();
         let _ = self.command_tx.try_send(CaptureCommand::Shutdown);
     }
 }
@@ -220,6 +283,7 @@ async fn run_portal_capture(
     event_tx: mpsc::UnboundedSender<CaptureEvent>,
     ready_tx: mpsc::UnboundedSender<Result<()>>,
     zone_set_state: Arc<AtomicU32>,
+    owner_lease: Arc<CaptureOwnerLease>,
 ) -> Result<()> {
     let input_capture = InputCapture::new().await.map_err(portal_error)?;
     let capabilities = Capabilities::Keyboard | Capabilities::Pointer;
@@ -270,6 +334,9 @@ async fn run_portal_capture(
     let mut closed_events = session.receive_closed().await.map_err(portal_error)?;
     let mut activation_id = None;
     let mut input_state = CaptureInputState::default();
+    let mut armed = false;
+    let mut lease_watchdog = time::interval(CAPTURE_LEASE_CHECK_INTERVAL);
+    lease_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let _ = ready_tx.send(Ok(()));
 
@@ -280,11 +347,15 @@ async fn run_portal_capture(
                 match command {
                     Some(CaptureCommand::Arm(response)) => {
                         let result = portal_command("Enable", input_capture.enable(&session, Default::default())).await;
+                        armed = result.is_ok();
+                        if !armed {
+                            owner_lease.clear();
+                        }
                         let _ = response.send(result);
                     }
                     Some(CaptureCommand::Release { cursor_position, response }) => {
-                        let result = if let Some(id) = activation_id.take() {
-                            portal_command(
+                        let result = if let Some(id) = activation_id {
+                            let result = portal_command(
                                 "Release",
                                 input_capture.release(
                                     &session,
@@ -293,18 +364,66 @@ async fn run_portal_capture(
                                         .set_cursor_position(cursor_position),
                                 ),
                             )
-                            .await
+                            .await;
+                            if result.is_ok() {
+                                activation_id = None;
+                            }
+                            result
                         } else {
                             Ok(())
                         };
                         let _ = response.send(result);
                     }
                     Some(CaptureCommand::Disarm(response)) => {
-                        activation_id = None;
+                        armed = false;
+                        owner_lease.clear();
                         let result = portal_command("Disable", input_capture.disable(&session, Default::default())).await;
-                        let _ = response.send(result);
+                        match result {
+                            Ok(()) => {
+                                activation_id = None;
+                                let _ = response.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let detail = error.to_string();
+                                let _ = response.send(Err(error));
+                                input_state.clear();
+                                let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
+                                force_close_portal_capture(
+                                    &input_capture,
+                                    &session,
+                                    &mut activation_id,
+                                )
+                                .await;
+                                let _ = event_tx.send(CaptureEvent::EmergencyReleased);
+                                break Err(LinuxInputError::LibeiInit(format!(
+                                    "failed to disable capture; portal session was closed to restore local input: {detail}"
+                                )));
+                            }
+                        }
                     }
-                    Some(CaptureCommand::Shutdown) | None => break Ok(()),
+                    Some(CaptureCommand::Shutdown) | None => {
+                        armed = false;
+                        owner_lease.clear();
+                        break Ok(())
+                    },
+                }
+            }
+            _ = lease_watchdog.tick(), if armed => {
+                if owner_lease.expired() {
+                    tracing::error!(
+                        timeout_seconds = CAPTURE_OWNER_LEASE.as_secs(),
+                        "Linux capture owner stopped responding; forcing local input release"
+                    );
+                    armed = false;
+                    owner_lease.clear();
+                    input_state.clear();
+                    let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
+                    force_close_portal_capture(&input_capture, &session, &mut activation_id).await;
+                    let _ = event_tx.send(CaptureEvent::EmergencyReleased);
+                    break Err(LinuxInputError::LibeiInit(
+                        "capture owner stopped responding; portal session was closed to restore local input"
+                            .to_string(),
+                    ));
                 }
             }
             Some(activated) = activated_events.next() => {
@@ -343,7 +462,13 @@ async fn run_portal_capture(
             }
             Some(changed) = zones_changed_events.next() => {
                 let invalidated = changed.zone_set().unwrap_or(zone_set);
-                input_capture.disable(&session, Default::default()).await.map_err(portal_error)?;
+                armed = false;
+                owner_lease.clear();
+                portal_command(
+                    "Disable for layout change",
+                    input_capture.disable(&session, Default::default()),
+                )
+                .await?;
                 activation_id = None;
                 input_state.clear();
                 let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
@@ -378,14 +503,19 @@ async fn run_portal_capture(
                     }
                     EisAction::EmergencyRelease => {
                         let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
-                        if let Some(id) = activation_id.take() {
-                            input_capture
-                                .release(
+                        if let Some(id) = activation_id {
+                            let result = portal_command(
+                                "emergency Release",
+                                input_capture.release(
                                     &session,
                                     ReleaseOptions::default().set_activation_id(id),
-                                )
-                                .await
-                                .map_err(portal_error)?;
+                                ),
+                            )
+                            .await;
+                            if result.is_ok() {
+                                activation_id = None;
+                            }
+                            result?;
                         }
                         let _ = event_tx.send(CaptureEvent::EmergencyReleased);
                     }
@@ -430,6 +560,35 @@ async fn portal_command<T>(
         .map_err(portal_error)
 }
 
+async fn failsafe_portal_command<T>(
+    command: impl Future<Output = std::result::Result<T, PortalError>>,
+) -> Result<T> {
+    time::timeout(FAILSAFE_PORTAL_COMMAND_TIMEOUT, command)
+        .await
+        .map_err(|_| {
+            LinuxInputError::LibeiInit(
+                "InputCapture portal fail-safe command timed out after 500 milliseconds"
+                    .to_string(),
+            )
+        })?
+        .map_err(portal_error)
+}
+
+async fn force_close_portal_capture(
+    input_capture: &InputCapture,
+    session: &Session<InputCapture>,
+    activation_id: &mut Option<u32>,
+) {
+    if let Some(id) = activation_id.take() {
+        let _ = failsafe_portal_command(
+            input_capture.release(session, ReleaseOptions::default().set_activation_id(id)),
+        )
+        .await;
+    }
+    let _ = failsafe_portal_command(input_capture.disable(session, Default::default())).await;
+    let _ = time::timeout(FAILSAFE_PORTAL_COMMAND_TIMEOUT, session.close()).await;
+}
+
 async fn create_and_start_session(
     input_capture: &InputCapture,
     capabilities: reis::enumflags2::BitFlags<Capabilities>,
@@ -467,10 +626,8 @@ async fn configure_barriers(
     session: &Session<InputCapture>,
     edge: Edge,
 ) -> Result<(u32, HashMap<u32, BarrierMetadata>)> {
-    let zones = input_capture
-        .zones(session, Default::default())
-        .await
-        .map_err(portal_error)?
+    let zones = portal_command("GetZones", input_capture.zones(session, Default::default()))
+        .await?
         .response()
         .map_err(portal_error)?;
     if zones.regions().is_empty() {
@@ -514,17 +671,18 @@ async fn configure_barriers(
         .iter()
         .map(|(id, position, _)| Barrier::new(*id, *position))
         .collect::<Vec<_>>();
-    let response = input_capture
-        .set_pointer_barriers(
+    let response = portal_command(
+        "SetPointerBarriers",
+        input_capture.set_pointer_barriers(
             session,
             &portal_barriers,
             zones.zone_set(),
             Default::default(),
-        )
-        .await
-        .map_err(portal_error)?
-        .response()
-        .map_err(portal_error)?;
+        ),
+    )
+    .await?
+    .response()
+    .map_err(portal_error)?;
     let failed = response.failed_barriers();
     let accepted = requested
         .into_iter()
@@ -582,7 +740,7 @@ impl CaptureInputState {
         } else {
             self.pressed_keys.remove(&evdev_code);
         }
-        down && evdev_code == KEY_PAUSE
+        down && (evdev_code == KEY_PAUSE || evdev_code == KEY_ESC)
             && self
                 .pressed_keys
                 .iter()
@@ -594,6 +752,7 @@ impl CaptureInputState {
 const CONTROL_KEYS: &[u16] = &[29, 97];
 const ALT_KEYS: &[u16] = &[56, 100];
 const KEY_PAUSE: u16 = 119;
+const KEY_ESC: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 enum EisAction {
@@ -708,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_chord_requires_control_alt_and_pause() {
+    fn emergency_chord_requires_control_alt_and_release_key() {
         let mut state = CaptureInputState::default();
         assert!(!state.update_key(29, true));
         assert!(!state.update_key(56, true));
@@ -717,6 +876,21 @@ mod tests {
         state.clear();
         assert!(!state.update_key(29, true));
         assert!(!state.update_key(KEY_PAUSE, true));
+
+        state.clear();
+        assert!(!state.update_key(97, true));
+        assert!(!state.update_key(100, true));
+        assert!(state.update_key(KEY_ESC, true));
+    }
+
+    #[test]
+    fn capture_owner_lease_can_be_renewed_and_cleared() {
+        let lease = CaptureOwnerLease::new();
+        assert!(!lease.expired());
+        lease.renew();
+        assert!(!lease.expired());
+        lease.clear();
+        assert!(!lease.expired());
     }
 
     #[tokio::test]
@@ -727,6 +901,7 @@ mod tests {
             command_tx,
             event_rx,
             zone_set: Arc::new(AtomicU32::new(0)),
+            owner_lease: Arc::new(CaptureOwnerLease::new()),
         };
 
         let cleanup =
