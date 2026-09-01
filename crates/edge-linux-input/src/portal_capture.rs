@@ -4,7 +4,7 @@ use std::{
     num::NonZeroU32,
     os::unix::net::UnixStream,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -18,6 +18,11 @@ use ashpd::{
             ActivatedBarrier, Barrier, Capabilities, CreateSessionOptions, InputCapture,
             ReleaseOptions, StartOptions,
         },
+    },
+    zbus::{
+        Connection,
+        fdo::DBusProxy,
+        names::{BusName, OwnedUniqueName, WellKnownName},
     },
 };
 use edge_protocol::{Edge, InputEvent, MouseButton};
@@ -33,8 +38,12 @@ use tokio::{
 
 use crate::{LinuxInputError, Result};
 
-const PORTAL_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
+const PORTAL_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 const PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const PORTAL_DESKTOP_NAME: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const PORTAL_OWNER_STABLE_FOR: Duration = Duration::from_secs(1);
+const PORTAL_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CAPTURE_OWNER_LEASE: Duration = Duration::from_secs(3);
 const CAPTURE_LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const FAILSAFE_PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
@@ -85,6 +94,8 @@ impl PortalCaptureBackend {
         let task_zone_set = zone_set.clone();
         let owner_lease = Arc::new(CaptureOwnerLease::new());
         let task_owner_lease = owner_lease.clone();
+        let portal_generation = Arc::new(Mutex::new(None));
+        let task_portal_generation = portal_generation.clone();
         std::thread::Builder::new()
             .name("edge-portal-capture".to_string())
             .spawn(move || {
@@ -107,6 +118,7 @@ impl PortalCaptureBackend {
                     ready_tx.clone(),
                     task_zone_set,
                     task_owner_lease,
+                    task_portal_generation,
                 );
                 let startup_cancel = async move {
                     if startup_cancel_rx.await.is_err() {
@@ -143,8 +155,11 @@ impl PortalCaptureBackend {
                 // versions) the compositor-side capture session. Repeated role attempts
                 // would eventually wedge the portal for every application.
                 let _ = startup_cancel_tx.send(());
+                if let Some(generation) = portal_generation_value(&portal_generation) {
+                    portal_generation_gate().poison(&generation);
+                }
                 return Err(LinuxInputError::LibeiInit(
-                    "InputCapture portal stopped responding during preflight; restart xdg-desktop-portal-hyprland before retrying"
+                    "InputCapture portal stopped responding during preflight; retries are blocked for this portal process until xdg-desktop-portal is restarted"
                         .to_string(),
                 ));
             }
@@ -257,6 +272,74 @@ impl CaptureOwnerLease {
     }
 }
 
+#[derive(Debug, Default)]
+struct PortalGenerationGate {
+    poisoned: Mutex<Option<String>>,
+}
+
+impl PortalGenerationGate {
+    fn ensure_available(&self, generation: &OwnedUniqueName) -> Result<()> {
+        let mut poisoned = self
+            .poisoned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match poisoned.as_deref() {
+            Some(owner) if owner == generation.as_str() => Err(LinuxInputError::LibeiInit(
+                "InputCapture portal process previously stopped responding; restart xdg-desktop-portal before retrying capture"
+                    .to_string(),
+            )),
+            Some(_) => {
+                *poisoned = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&self, generation: &str) {
+        *self
+            .poisoned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(generation.to_string());
+    }
+}
+
+fn portal_generation_gate() -> &'static PortalGenerationGate {
+    static GATE: OnceLock<PortalGenerationGate> = OnceLock::new();
+    GATE.get_or_init(PortalGenerationGate::default)
+}
+
+fn portal_generation_value(generation: &Mutex<Option<String>>) -> Option<String> {
+    generation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+#[derive(Debug, Default)]
+struct StablePortalOwner {
+    candidate: Option<(OwnedUniqueName, Instant)>,
+}
+
+impl StablePortalOwner {
+    fn observe(&mut self, owner: OwnedUniqueName, now: Instant) -> Option<OwnedUniqueName> {
+        match &mut self.candidate {
+            Some((candidate, since)) if *candidate == owner => {
+                (now.saturating_duration_since(*since) >= PORTAL_OWNER_STABLE_FOR)
+                    .then(|| owner.clone())
+            }
+            _ => {
+                self.candidate = Some((owner, now));
+                None
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.candidate = None;
+    }
+}
+
 impl Drop for PortalCaptureBackend {
     fn drop(&mut self) {
         self.owner_lease.clear();
@@ -277,6 +360,59 @@ struct BarrierMetadata {
     height: u32,
 }
 
+async fn wait_for_stable_portal_owner(proxy: &DBusProxy<'_>) -> Result<OwnedUniqueName> {
+    let portal_name = WellKnownName::try_from(PORTAL_DESKTOP_NAME)
+        .expect("the desktop portal D-Bus name is valid");
+    proxy
+        .start_service_by_name(portal_name.clone(), 0)
+        .await
+        .map_err(|error| portal_owner_error("start xdg-desktop-portal", error))?;
+
+    let deadline = Instant::now() + PORTAL_OWNER_WAIT_TIMEOUT;
+    let mut stable = StablePortalOwner::default();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(LinuxInputError::LibeiInit(format!(
+                "xdg-desktop-portal did not retain one D-Bus owner for {} milliseconds",
+                PORTAL_OWNER_STABLE_FOR.as_millis()
+            )));
+        }
+
+        match proxy
+            .get_name_owner(BusName::from(portal_name.clone()))
+            .await
+        {
+            Ok(owner) => {
+                if let Some(owner) = stable.observe(owner, now) {
+                    return Ok(owner);
+                }
+            }
+            Err(ashpd::zbus::fdo::Error::NameHasNoOwner(_)) => stable.clear(),
+            Err(error) => {
+                return Err(portal_owner_error(
+                    "query the xdg-desktop-portal owner",
+                    error,
+                ));
+            }
+        }
+        time::sleep(PORTAL_OWNER_POLL_INTERVAL).await;
+    }
+}
+
+async fn current_portal_owner(proxy: &DBusProxy<'_>) -> Result<OwnedUniqueName> {
+    let portal_name = WellKnownName::try_from(PORTAL_DESKTOP_NAME)
+        .expect("the desktop portal D-Bus name is valid");
+    proxy
+        .get_name_owner(BusName::from(portal_name))
+        .await
+        .map_err(|error| portal_owner_error("verify the xdg-desktop-portal owner", error))
+}
+
+fn portal_owner_error(context: &'static str, error: impl std::fmt::Display) -> LinuxInputError {
+    LinuxInputError::LibeiInit(format!("failed to {context}: {error}"))
+}
+
 async fn run_portal_capture(
     edge: Edge,
     mut command_rx: mpsc::Receiver<CaptureCommand>,
@@ -284,8 +420,32 @@ async fn run_portal_capture(
     ready_tx: mpsc::UnboundedSender<Result<()>>,
     zone_set_state: Arc<AtomicU32>,
     owner_lease: Arc<CaptureOwnerLease>,
+    portal_generation_state: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
-    let input_capture = InputCapture::new().await.map_err(portal_error)?;
+    let portal_connection = Connection::session()
+        .await
+        .map_err(|error| portal_owner_error("connect to the session bus", error))?;
+    let portal_dbus = DBusProxy::new(&portal_connection)
+        .await
+        .map_err(|error| portal_owner_error("create the D-Bus owner proxy", error))?;
+    let mut portal_owner_changes = portal_dbus
+        .receive_name_owner_changed_with_args(&[(0, PORTAL_DESKTOP_NAME)])
+        .await
+        .map_err(|error| portal_owner_error("subscribe to portal owner changes", error))?;
+    let portal_generation = wait_for_stable_portal_owner(&portal_dbus).await?;
+    portal_generation_gate().ensure_available(&portal_generation)?;
+    *portal_generation_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(portal_generation.to_string());
+    tracing::info!(
+        owner = %portal_generation,
+        stable_milliseconds = PORTAL_OWNER_STABLE_FOR.as_millis(),
+        "InputCapture portal owner is stable"
+    );
+
+    let input_capture = InputCapture::with_connection(portal_connection.clone())
+        .await
+        .map_err(portal_error)?;
     let capabilities = Capabilities::Keyboard | Capabilities::Pointer;
     let (session, available_capabilities) =
         create_and_start_session(&input_capture, capabilities).await?;
@@ -338,11 +498,51 @@ async fn run_portal_capture(
     let mut lease_watchdog = time::interval(CAPTURE_LEASE_CHECK_INTERVAL);
     lease_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
+    let owner_after_setup = current_portal_owner(&portal_dbus).await?;
+    if owner_after_setup != portal_generation {
+        return Err(LinuxInputError::LibeiInit(format!(
+            "xdg-desktop-portal restarted during InputCapture setup ({portal_generation} -> {owner_after_setup}); discarded the stale session"
+        )));
+    }
+
     let _ = ready_tx.send(Ok(()));
+    let mut portal_owner_valid = true;
 
     let outcome = async {
         loop {
         tokio::select! {
+            owner_change = portal_owner_changes.next() => {
+                let (observed_owner, detail) = match owner_change {
+                    Some(change) => match change.args() {
+                        Ok(args) => {
+                            let owner = args
+                                .new_owner()
+                                .as_ref()
+                                .map(|owner| owner.to_owned());
+                            let detail = owner.as_ref().map_or_else(
+                                || format!("{portal_generation} -> no owner"),
+                                |owner| format!("{portal_generation} -> {owner}"),
+                            );
+                            (owner, detail)
+                        }
+                        Err(error) => (
+                            None,
+                            format!("could not decode portal owner change: {error}"),
+                        ),
+                    },
+                    None => (None, "portal owner-change monitor ended".to_string()),
+                };
+                if observed_owner.as_ref() != Some(&portal_generation) {
+                    tracing::error!(%detail, "InputCapture portal owner changed; poisoning the active capture session");
+                    portal_owner_valid = false;
+                    owner_lease.clear();
+                    input_state.clear();
+                    let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
+                    break Err(LinuxInputError::LibeiInit(format!(
+                        "xdg-desktop-portal owner changed while capture was active ({detail}); discarded the stale session"
+                    )));
+                }
+            }
             command = command_rx.recv() => {
                 match command {
                     Some(CaptureCommand::Arm(response)) => {
@@ -526,23 +726,30 @@ async fn run_portal_capture(
     }
     .await;
 
-    // Always tear down the compositor capture, including when the EIS stream
-    // closes or event processing fails. Previously those early error returns
-    // skipped this cleanup and could leave Hyprland hiding/capturing the local
-    // pointer until the portal or compositor was restarted.
-    if let Some(id) = activation_id.take() {
+    if portal_owner_valid {
+        // Always tear down the compositor capture while the portal process that
+        // created it still owns the well-known name. Sending an old session path
+        // to a replacement portal reproduces the invalid-session corruption this
+        // guard exists to prevent.
+        if let Some(id) = activation_id.take() {
+            let _ = portal_command(
+                "Release during shutdown",
+                input_capture.release(&session, ReleaseOptions::default().set_activation_id(id)),
+            )
+            .await;
+        }
         let _ = portal_command(
-            "Release during shutdown",
-            input_capture.release(&session, ReleaseOptions::default().set_activation_id(id)),
+            "Disable during shutdown",
+            input_capture.disable(&session, Default::default()),
         )
         .await;
+        let _ = time::timeout(PORTAL_COMMAND_TIMEOUT, session.close()).await;
+    } else {
+        tracing::warn!(
+            owner = %portal_generation,
+            "skipped stale InputCapture cleanup after portal replacement"
+        );
     }
-    let _ = portal_command(
-        "Disable during shutdown",
-        input_capture.disable(&session, Default::default()),
-    )
-    .await;
-    let _ = time::timeout(PORTAL_COMMAND_TIMEOUT, session.close()).await;
     outcome
 }
 
@@ -891,6 +1098,41 @@ mod tests {
         assert!(!lease.expired());
         lease.clear();
         assert!(!lease.expired());
+    }
+
+    #[test]
+    fn portal_owner_must_remain_stable_before_capture_setup() {
+        let first = OwnedUniqueName::try_from(":1.40").expect("first owner");
+        let replacement = OwnedUniqueName::try_from(":1.41").expect("replacement owner");
+        let started = Instant::now();
+        let mut stable = StablePortalOwner::default();
+
+        assert_eq!(stable.observe(first.clone(), started), None);
+        assert_eq!(
+            stable.observe(first.clone(), started + PORTAL_OWNER_STABLE_FOR / 2),
+            None
+        );
+        assert_eq!(
+            stable.observe(replacement.clone(), started + PORTAL_OWNER_STABLE_FOR),
+            None
+        );
+        assert_eq!(
+            stable.observe(replacement.clone(), started + PORTAL_OWNER_STABLE_FOR * 2),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn timed_out_portal_generation_is_blocked_until_owner_changes() {
+        let first = OwnedUniqueName::try_from(":1.50").expect("first owner");
+        let replacement = OwnedUniqueName::try_from(":1.51").expect("replacement owner");
+        let gate = PortalGenerationGate::default();
+
+        assert!(gate.ensure_available(&first).is_ok());
+        gate.poison(first.as_str());
+        assert!(gate.ensure_available(&first).is_err());
+        assert!(gate.ensure_available(&replacement).is_ok());
+        assert!(gate.ensure_available(&first).is_ok());
     }
 
     #[tokio::test]
