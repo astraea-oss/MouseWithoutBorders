@@ -183,6 +183,13 @@ impl PortalCaptureBackend {
         receiver.await.map_err(|_| capture_task_closed())?
     }
 
+    pub async fn release_and_disarm(&self, cursor_position: Option<(f64, f64)>) -> Result<()> {
+        let release_result = self.release(cursor_position).await;
+        let disarm_result = self.disarm().await;
+        release_result?;
+        disarm_result
+    }
+
     pub async fn next_event(&mut self) -> Option<CaptureEvent> {
         self.event_rx.recv().await
     }
@@ -710,5 +717,41 @@ mod tests {
         state.clear();
         assert!(!state.update_key(29, true));
         assert!(!state.update_key(KEY_PAUSE, true));
+    }
+
+    #[tokio::test]
+    async fn releases_active_capture_before_disarming_it() {
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let backend = PortalCaptureBackend {
+            command_tx,
+            event_rx,
+            zone_set: Arc::new(AtomicU32::new(0)),
+        };
+
+        let cleanup =
+            tokio::spawn(async move { backend.release_and_disarm(Some((12.0, 34.0))).await });
+
+        match command_rx.recv().await.expect("release command") {
+            CaptureCommand::Release {
+                cursor_position,
+                response,
+            } => {
+                assert_eq!(cursor_position, Some((12.0, 34.0)));
+                response.send(Ok(())).expect("release response");
+            }
+            command => panic!("expected release before disarm, got {command:?}"),
+        }
+        match command_rx.recv().await.expect("disarm command") {
+            CaptureCommand::Disarm(response) => {
+                response.send(Ok(())).expect("disarm response");
+            }
+            command => panic!("expected disarm after release, got {command:?}"),
+        }
+
+        cleanup
+            .await
+            .expect("cleanup task")
+            .expect("cleanup result");
     }
 }

@@ -3468,7 +3468,7 @@ async fn handle_controller(
                                 &ControlEvent::SetInputForwarding { enabled: false },
                             );
                             if let Some(capture) = &capture {
-                                capture.disarm().await.ok();
+                                capture.release_and_disarm(None).await.ok();
                             }
                         } else if local_is_controller && let Some(capture) = &capture {
                             capture.arm().await?;
@@ -3660,7 +3660,7 @@ async fn handle_controller(
                                     input_epoch.suspend();
                                     backend.all_keys_up().await.ok();
                                     if let Some(capture) = &capture {
-                                        capture.disarm().await.ok();
+                                        capture.release_and_disarm(None).await.ok();
                                     }
                                 } else if local_is_controller
                                     && let Some(capture) = &capture
@@ -4269,7 +4269,7 @@ async fn handle_controller(
                             input_epoch.suspend();
                             backend.all_keys_up().await.ok();
                             if let Some(capture) = &capture {
-                                capture.disarm().await.ok();
+                                capture.release_and_disarm(None).await.ok();
                             }
                         } else if local_is_controller && let Some(capture) = &capture {
                             capture.arm().await?;
