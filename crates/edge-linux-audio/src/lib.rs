@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
+    AudioPacket, FLAG_PROBE, FRAME_MS, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
     PcmConcealer, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ use tokio::{
 };
 
 const VIRTUAL_SINK: &str = "edge_kvm_remote";
+const PLAYBACK_QUEUE_TARGET_MS: usize = 40;
+const PLAYBACK_QUEUE_FRAMES: usize = PLAYBACK_QUEUE_TARGET_MS / FRAME_MS as usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoutingJournal {
@@ -280,7 +282,9 @@ impl LinuxAudioReceiver {
             // that backpressure off the UDP receive loop so short scheduler or
             // sender bursts are absorbed here instead of overflowing the kernel
             // socket queue and turning into audible packet loss.
-            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(64);
+            // The jitter buffer already absorbs network variation. Keep this
+            // queue small so pacat backpressure cannot turn into audible lag.
+            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(PLAYBACK_QUEUE_FRAMES);
             let mut playback_writer = tokio::spawn(async move {
                 while let Some(encoded) = playback_rx.recv().await {
                     stdin
