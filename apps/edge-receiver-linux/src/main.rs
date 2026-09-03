@@ -2890,6 +2890,9 @@ async fn run_receiver(
 }
 
 fn configure_controller_socket(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY")?;
     #[cfg(target_os = "linux")]
     SockRef::from(stream)
         .set_tcp_user_timeout(Some(CONTROLLER_STALL_TIMEOUT))
@@ -5202,7 +5205,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn controller_socket_uses_bounded_tcp_user_timeout() {
+    async fn controller_socket_is_low_latency_and_uses_bounded_user_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let connect = TcpStream::connect(address);
@@ -5213,6 +5216,7 @@ mod tests {
 
         configure_controller_socket(&server).unwrap();
 
+        assert!(server.nodelay().unwrap());
         assert_eq!(
             SockRef::from(&server).tcp_user_timeout().unwrap(),
             Some(CONTROLLER_STALL_TIMEOUT)
