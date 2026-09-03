@@ -7,12 +7,13 @@ runtime handover, and Windows `SendInput` receiver path are implemented on the
 feature branch. Automated workspace tests cover negotiation, liveness, role
 epochs, migration, four-edge geometry, and input cleanup on both build targets.
 
-Live InputCapture and repeated Linux-to-Linux/Windows-to-Linux handover still
-need the Phase 0 probe and end-to-end run on the target Hyprland computers; no
-Wayland compositor is available in the Windows/WSL development environment.
-Phase 6 keeps the old executable names as compatibility entry points because
-their deprecation window has not happened yet; UI, help, and examples are now
-role-neutral.
+The Phase 0 probe passes on the current Hyprland target with the standard
+InputCapture portal and libei 1.6.0. Development testing has exercised live
+Linux-to-Linux capture, handover, emergency release, reconnect, and audio. The
+complete acceptance matrix still needs a recorded run, especially both
+Windows/Linux control directions. Phase 6 keeps the old executable names as
+compatibility entry points because their deprecation window has not happened
+yet; UI, help, and examples are now role-neutral.
 
 ## Goal
 

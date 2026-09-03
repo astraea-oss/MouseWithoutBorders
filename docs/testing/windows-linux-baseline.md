@@ -7,16 +7,26 @@ interoperate.
 
 ## Automated checks
 
-From the repository root:
+From the repository root on Linux:
 
 ```text
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo test --workspace --exclude edge-controller-win
+cargo clippy --workspace --all-targets --exclude edge-controller-win -- -D warnings
+cargo build -p edge-receiver-linux --release
 ```
 
-If the host cannot build a platform-specific package, run the workspace checks
-on both Windows and Linux and record the two results in the pull request.
+On Windows:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace --exclude edge-receiver-linux
+cargo clippy --workspace --all-targets --exclude edge-receiver-linux -- -D warnings
+cargo build -p edge-controller-win --release
+```
+
+Run the platform checks on both operating systems and record both results in
+the pull request.
 
 ## Live setup
 

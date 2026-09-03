@@ -217,10 +217,10 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         let result = tokio::task::spawn_blocking(move || run_settings_window(settings_input))
             .await
             .context("settings window task failed")??;
-        if matches!(result, SettingsUiResult::Saved(_)) {
-            if let Some(parent_pid) = args.settings_parent_pid {
-                restart_after_settings(parent_pid, &restart_config_path, &receiver_log).await?;
-            }
+        if matches!(result, SettingsUiResult::Saved(_))
+            && let Some(parent_pid) = args.settings_parent_pid
+        {
+            restart_after_settings(parent_pid, &restart_config_path, &receiver_log).await?;
         }
         return Ok(());
     }
@@ -885,6 +885,7 @@ async fn read_initial_peer_screen(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn run_linux_controller_session(
     connection: LinuxPeerConnection,
     config: &AppConfig,

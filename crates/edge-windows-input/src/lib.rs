@@ -6,7 +6,9 @@ use edge_clipboard::{CanonicalImage, ClipboardItem};
 use edge_common::{ClipboardConfig, GameCompatibilityMode};
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
-use edge_protocol::{ControlEvent, Edge, InputEvent, OutputInfo, ReleaseReason, ScreenInfo};
+use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
+#[cfg(windows)]
+use edge_protocol::{OutputInfo, ScreenInfo};
 
 mod injection;
 pub use injection::WindowsInputInjector;

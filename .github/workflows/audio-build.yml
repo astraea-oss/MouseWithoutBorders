@@ -15,6 +15,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test Windows workspace
         run: cargo test --workspace --exclude edge-receiver-linux
+      - name: Lint Windows workspace
+        run: cargo clippy --workspace --all-targets --exclude edge-receiver-linux -- -D warnings
       - name: Build Windows controller
         run: cargo build -p edge-controller-win --release
       - uses: actions/upload-artifact@v4
@@ -31,6 +33,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
       - name: Test Linux workspace
         run: cargo test --workspace --exclude edge-controller-win
+      - name: Lint Linux workspace
+        run: cargo clippy --workspace --all-targets --exclude edge-controller-win -- -D warnings
       - name: Build Linux receiver
         run: cargo build -p edge-receiver-linux --release
       - uses: actions/upload-artifact@v4
