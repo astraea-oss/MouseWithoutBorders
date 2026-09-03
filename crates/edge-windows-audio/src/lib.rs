@@ -341,11 +341,8 @@ mod implementation {
             if input.is_empty() || self.output_channels == 0 || self.output_rate == 0 {
                 return Vec::new();
             }
-            self.input_frames.extend(
-                input
-                    .chunks_exact(CHANNELS)
-                    .map(|frame| [frame[0], frame[1]]),
-            );
+            self.input_frames
+                .extend(input.as_chunks::<CHANNELS>().0.iter().copied());
             let step = SAMPLE_RATE as f64 / (self.output_rate as f64 * rate_scale);
             let estimated_frames =
                 ((self.input_frames.len() as f64 - self.source_position).max(0.0) / step).ceil()
@@ -777,7 +774,7 @@ mod implementation {
             let input = vec![0.25; 480 * 2];
             let mut converter = OutputConverter::new(44_100, 2);
             let mut output = Vec::new();
-            for frame in input.chunks_exact(SAMPLES_PER_CHANNEL * CHANNELS) {
+            for frame in input.as_chunks::<{ SAMPLES_PER_CHANNEL * CHANNELS }>().0 {
                 output.extend(converter.convert(frame, 1.0));
             }
             assert_eq!(output.len(), 441 * 2);
