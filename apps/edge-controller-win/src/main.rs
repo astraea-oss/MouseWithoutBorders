@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
+use std::process::Command;
+#[cfg(windows)]
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::time::Duration;
 use std::time::Instant;
@@ -75,12 +77,17 @@ const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 const UPGRADE_PEER_STATUS: &str = "Upgrade the other computer";
 static CONNECTOR_SESSION_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static SETTINGS_PROCESS_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Windows node for edge-kvm")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    settings: bool,
     #[arg(long, help = "Load config and connect without installing hooks")]
     dry_run: bool,
     #[arg(long, help = "Run the Windows tray shell after connecting")]
@@ -132,6 +139,27 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     let run_tray = should_run_tray(&args);
     let config_path = args.config.unwrap_or_else(default_config_path);
     let mut config = load_or_create_config(&config_path).await?;
+
+    if args.settings {
+        #[cfg(windows)]
+        {
+            let settings_input = SettingsUiInput {
+                role: Role::Controller,
+                can_choose_transport: false,
+                restart_on_save: false,
+                config_path,
+                local_ip: detect_primary_local_ip(),
+                pairing: controller_pairing_state(&config),
+                config,
+            };
+            tokio::task::spawn_blocking(move || edge_ui::run_settings_window(settings_input))
+                .await
+                .context("settings window task failed")??;
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        anyhow::bail!("the Windows settings window is only available on Windows");
+    }
 
     if config.transport != TransportMode::Connect {
         anyhow::bail!(
@@ -233,7 +261,6 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                 match handle_pending_windows_tray_commands(
                     &mut tray_command_rx,
                     &config_path,
-                    &config,
                     &controller_log,
                     input_forwarding_enabled,
                 )? {
@@ -443,7 +470,11 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
 
 #[cfg(windows)]
 fn should_run_tray(args: &Args) -> bool {
-    args.tray || (!args.dry_run && args.test_input.is_none() && args.test_clipboard_text.is_none())
+    args.tray
+        || (!args.settings
+            && !args.dry_run
+            && args.test_input.is_none()
+            && args.test_clipboard_text.is_none())
 }
 
 #[cfg(windows)]
@@ -576,27 +607,13 @@ enum TrayCommandOutcome {
 fn handle_pending_windows_tray_commands(
     commands: &mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>,
     config_path: &Path,
-    config: &AppConfig,
     log_path: &Path,
     input_forwarding_enabled: bool,
 ) -> Result<TrayCommandOutcome> {
     while let Ok(command) = commands.try_recv() {
         match command {
             edge_windows_input::WindowsTrayCommand::OpenSettings => {
-                let config = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
-                    tracing::warn!(%err, "failed to reload config for settings UI");
-                    config.clone()
-                });
-                append_portable_log(log_path, "opening settings window");
-                edge_ui::spawn_settings_window(SettingsUiInput {
-                    role: Role::Controller,
-                    can_choose_transport: false,
-                    restart_on_save: false,
-                    config_path: config_path.to_path_buf(),
-                    local_ip: detect_primary_local_ip(),
-                    pairing: controller_pairing_state(&config),
-                    config,
-                });
+                open_controller_settings(config_path, log_path);
             }
             edge_windows_input::WindowsTrayCommand::Pair => {
                 append_portable_log(log_path, "pairing requested from tray");
@@ -646,6 +663,48 @@ fn controller_pairing_state(config: &AppConfig) -> PairingUiState {
     }
 
     PairingUiState::Idle
+}
+
+#[cfg(windows)]
+fn open_controller_settings(config_path: &Path, log_path: &Path) {
+    use std::sync::atomic::Ordering;
+
+    if SETTINGS_PROCESS_OPEN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    append_portable_log(log_path, "opening settings window");
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(err) => {
+            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to locate controller executable for settings window");
+            append_portable_log(
+                log_path,
+                format!("failed to locate controller executable for settings window: {err}"),
+            );
+            return;
+        }
+    };
+
+    match Command::new(executable)
+        .arg("--settings")
+        .arg("--config")
+        .arg(config_path)
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            });
+        }
+        Err(err) => {
+            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to start settings process");
+            append_portable_log(log_path, format!("failed to start settings process: {err}"));
+        }
+    }
 }
 
 fn install_controller_panic_log(log_path: PathBuf) {
@@ -890,6 +949,13 @@ async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<
     }
 }
 
+fn configure_controller_socket(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY")?;
+    Ok(())
+}
+
 async fn connect_session(
     config: &AppConfig,
     identity: &IdentityKey,
@@ -901,6 +967,7 @@ async fn connect_session(
         .await
         .with_context(|| format!("connection to {addr} timed out"))?
         .with_context(|| format!("failed to connect to {addr}"))?;
+    configure_controller_socket(&stream)?;
     let peer_addr = stream
         .peer_addr()
         .context("failed to query receiver address")?;
@@ -1516,7 +1583,6 @@ async fn run_connected_inner(
                     match handle_pending_windows_tray_commands(
                         commands,
                         config_path,
-                        config,
                         log_path,
                         *input_forwarding_enabled,
                     )? {
@@ -3388,6 +3454,28 @@ fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn controller_socket_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(address);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        let _server = accepted.unwrap();
+
+        configure_controller_socket(&client).unwrap();
+
+        assert!(client.nodelay().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn settings_helper_does_not_start_another_tray() {
+        let args = Args::try_parse_from(["edge-controller-win", "--settings"]).unwrap();
+        assert!(!should_run_tray(&args));
+    }
 
     #[test]
     fn receiver_hello_must_match_noise_identity() {
