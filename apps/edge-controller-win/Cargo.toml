@@ -15,6 +15,7 @@ edge-crypto = { path = "../../crates/edge-crypto" }
 edge-geometry = { path = "../../crates/edge-geometry" }
 edge-keymap = { path = "../../crates/edge-keymap" }
 edge-protocol = { path = "../../crates/edge-protocol" }
+edge-runtime = { path = "../../crates/edge-runtime" }
 edge-ui = { path = "../../crates/edge-ui" }
 edge-windows-input = { path = "../../crates/edge-windows-input" }
 edge-windows-audio = { path = "../../crates/edge-windows-audio" }

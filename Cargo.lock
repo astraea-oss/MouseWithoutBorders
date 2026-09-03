@@ -210,6 +210,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_repr",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -882,6 +897,7 @@ dependencies = [
  "edge-geometry",
  "edge-keymap",
  "edge-protocol",
+ "edge-runtime",
  "edge-ui",
  "edge-windows-audio",
  "edge-windows-input",
@@ -935,11 +951,14 @@ dependencies = [
 name = "edge-linux-input"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "edge-clipboard",
  "edge-common",
  "edge-protocol",
  "evdev",
+ "futures-util",
  "libc",
+ "reis",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -973,15 +992,34 @@ dependencies = [
  "edge-clipboard",
  "edge-common",
  "edge-crypto",
+ "edge-geometry",
  "edge-linux-audio",
  "edge-linux-input",
  "edge-protocol",
+ "edge-runtime",
  "edge-ui",
  "ksni",
+ "libc",
  "socket2",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "edge-runtime"
+version = "0.1.0"
+dependencies = [
+ "edge-clipboard",
+ "edge-common",
+ "edge-crypto",
+ "edge-protocol",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1004,6 +1042,7 @@ dependencies = [
  "edge-audio",
  "tokio",
  "tracing",
+ "wasapi",
 ]
 
 [[package]]
@@ -2194,6 +2233,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-integer"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2914,6 +2962,19 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reis"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b967ec6489a42067a20724f11987bb96178ea796873cbe1afd25fb93ee6f85f"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "log",
+ "rustix 1.1.4",
+ "tokio",
+]
 
 [[package]]
 name = "renderdoc-sys"
@@ -3707,6 +3768,19 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasapi"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee144c215d8d31e94c1a599fbaf540ca82a7017e4f1786816b179f334fac751d"
+dependencies = [
+ "log",
+ "num-integer",
+ "thiserror 2.0.18",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

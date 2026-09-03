@@ -4,11 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snow::{Builder, params::NoiseParams};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     sync::Mutex,
 };
 
@@ -224,11 +220,9 @@ where
     pub fn into_inner(self) -> S {
         self.io
     }
-}
 
-impl NoiseSession<TcpStream> {
-    pub fn split(self) -> (NoiseReader, NoiseWriter) {
-        let (reader, writer) = self.io.into_split();
+    pub fn split(self) -> (NoiseReader<ReadHalf<S>>, NoiseWriter<WriteHalf<S>>) {
+        let (reader, writer) = tokio::io::split(self.io);
         let transport = Arc::new(Mutex::new(self.transport));
         (
             NoiseReader {
@@ -243,12 +237,15 @@ impl NoiseSession<TcpStream> {
     }
 }
 
-pub struct NoiseReader {
-    io: OwnedReadHalf,
+pub struct NoiseReader<R> {
+    io: R,
     transport: Arc<Mutex<snow::TransportState>>,
 }
 
-impl NoiseReader {
+impl<R> NoiseReader<R>
+where
+    R: AsyncRead + Unpin,
+{
     pub async fn read_packet(&mut self) -> Result<Vec<u8>> {
         let encrypted = read_packet(&mut self.io).await?;
         let mut plaintext = vec![0; encrypted.len()];
@@ -261,12 +258,15 @@ impl NoiseReader {
     }
 }
 
-pub struct NoiseWriter {
-    io: OwnedWriteHalf,
+pub struct NoiseWriter<W> {
+    io: W,
     transport: Arc<Mutex<snow::TransportState>>,
 }
 
-impl NoiseWriter {
+impl<W> NoiseWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
     pub async fn write_packet(&mut self, plaintext: &[u8]) -> Result<()> {
         let mut encrypted = vec![0; plaintext.len() + 16];
         let len = {
@@ -467,5 +467,36 @@ mod tests {
         assert_eq!(responder_peer, expected_initiator);
         assert_eq!(message, b"hello");
         assert_eq!(reply, b"world");
+    }
+
+    #[tokio::test]
+    async fn split_noise_session_uses_the_same_duplex_transport_path_as_tcp() {
+        let initiator_identity = IdentityKey::generate().unwrap();
+        let responder_identity = IdentityKey::generate().unwrap();
+        let expected_responder = responder_identity.fingerprint();
+        let (client, server) = tokio::io::duplex(4096);
+
+        let initiator = tokio::spawn(async move {
+            let (session, _) =
+                initiate_noise_session(client, &initiator_identity, Some(&expected_responder))
+                    .await
+                    .unwrap();
+            let (mut reader, mut writer) = session.split();
+            writer.write_packet(b"split hello").await.unwrap();
+            reader.read_packet().await.unwrap()
+        });
+
+        let responder = tokio::spawn(async move {
+            let (session, _) = accept_noise_session(server, &responder_identity)
+                .await
+                .unwrap();
+            let (mut reader, mut writer) = session.split();
+            let message = reader.read_packet().await.unwrap();
+            writer.write_packet(b"split world").await.unwrap();
+            message
+        });
+
+        assert_eq!(initiator.await.unwrap(), b"split world");
+        assert_eq!(responder.await.unwrap(), b"split hello");
     }
 }

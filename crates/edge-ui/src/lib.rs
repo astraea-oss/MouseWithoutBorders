@@ -9,8 +9,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, AudioLocalPlayback, GameCompatibilityMode, PeerConfig, PeerPosition, Role,
-    parse_listen_port, update_listen_port, validate_device_name, validate_host, validate_port,
+    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
+    TransportMode, parse_listen_port, update_listen_port, validate_device_name, validate_host,
+    validate_port,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -18,6 +19,12 @@ static SETTINGS_CONTEXT: OnceLock<Mutex<Option<eframe::egui::Context>>> = OnceLo
 
 pub struct SettingsUiInput {
     pub role: Role,
+    /// The Linux node supports both connection directions. The Windows entry
+    /// point is currently connector-only, so it displays the mode read-only.
+    pub can_choose_transport: bool,
+    /// Close the settings window after a successful save so the caller can
+    /// restart the node with the new connection configuration.
+    pub restart_on_save: bool,
     pub config_path: PathBuf,
     pub config: AppConfig,
     pub local_ip: Option<IpAddr>,
@@ -267,10 +274,13 @@ struct SettingsApp {
     device_name: String,
     peer_host: String,
     port: String,
+    transport: TransportMode,
+    can_choose_transport: bool,
+    restart_on_save: bool,
     position: PeerPosition,
     game_compatibility: GameCompatibilityMode,
     clipboard_images_enabled: bool,
-    audio_enabled: bool,
+    audio_route: AudioRoutePreference,
     audio_play_local: bool,
     save_message: Option<String>,
     error_message: Option<String>,
@@ -279,10 +289,10 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new(input: SettingsUiInput, result: Arc<Mutex<SettingsUiResult>>) -> Self {
-        let peer = input.config.peer.laptop.clone();
-        let port = match input.role {
-            Role::Controller => peer.as_ref().map(|peer| peer.port).unwrap_or(42_420),
-            Role::Receiver => input
+        let peer = input.config.peer.clone();
+        let port = match input.config.transport {
+            TransportMode::Connect => peer.port,
+            TransportMode::Listen => input
                 .config
                 .listen
                 .as_deref()
@@ -298,18 +308,23 @@ impl SettingsApp {
                 .unwrap_or_else(|| "Unknown".to_string()),
             pairing: input.pairing,
             device_name: input.config.device_name.clone(),
-            peer_host: peer
-                .as_ref()
-                .map(|peer| peer.host.clone())
-                .unwrap_or_default(),
+            peer_host: peer.host,
             port: port.to_string(),
-            position: peer
-                .as_ref()
-                .map(|peer| peer.position)
-                .unwrap_or(PeerPosition::Left),
-            game_compatibility: input.config.input.game_compatibility,
+            transport: input.config.transport,
+            can_choose_transport: input.can_choose_transport,
+            restart_on_save: input.restart_on_save,
+            position: input.config.layout.listener_position,
+            game_compatibility: input.config.input.capture.game_compatibility,
             clipboard_images_enabled: input.config.clipboard.images_enabled,
-            audio_enabled: input.config.audio.enabled,
+            audio_route: input
+                .config
+                .audio
+                .route
+                .unwrap_or(if input.config.audio.enabled {
+                    AudioRoutePreference::PeerToLocal
+                } else {
+                    AudioRoutePreference::Disabled
+                }),
             audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
             original: input.config,
             save_message: None,
@@ -318,7 +333,7 @@ impl SettingsApp {
         }
     }
 
-    fn save(&mut self) {
+    fn save(&mut self) -> bool {
         self.error_message = None;
         self.save_message = None;
 
@@ -326,17 +341,25 @@ impl SettingsApp {
             Ok(config) => match config.save_blocking(&self.config_path) {
                 Ok(()) => {
                     self.original = config.clone();
-                    self.save_message = Some(
-                        "Saved. Audio changes apply immediately; connection changes apply on reconnect."
-                            .to_string(),
-                    );
+                    self.save_message = Some(if self.restart_on_save {
+                        "Saved. Restarting edge-kvm...".to_string()
+                    } else {
+                        "Saved. Connection changes apply on reconnect.".to_string()
+                    });
                     if let Ok(mut result) = self.result.lock() {
                         *result = SettingsUiResult::Saved(Box::new(config));
                     }
+                    true
                 }
-                Err(err) => self.error_message = Some(err.to_string()),
+                Err(err) => {
+                    self.error_message = Some(err.to_string());
+                    false
+                }
             },
-            Err(err) => self.error_message = Some(err.to_string()),
+            Err(err) => {
+                self.error_message = Some(err.to_string());
+                false
+            }
         }
     }
 
@@ -351,29 +374,25 @@ impl SettingsApp {
 
         let mut config = self.original.clone();
         config.device_name = self.device_name.trim().to_string();
-        config.input.game_compatibility = self.game_compatibility;
+        config.transport = self.transport;
+        config.input.capture.game_compatibility = self.game_compatibility;
         config.clipboard.images_enabled = self.clipboard_images_enabled;
-        config.audio.enabled = self.audio_enabled;
+        config.audio.route = Some(self.audio_route);
+        config.audio.enabled = self.audio_route != AudioRoutePreference::Disabled;
         config.audio.local_playback = if self.audio_play_local {
             AudioLocalPlayback::Mirror
         } else {
             AudioLocalPlayback::Redirect
         };
 
-        match self.role {
-            Role::Controller => {
+        match self.transport {
+            TransportMode::Connect => {
                 validate_host(&self.peer_host)?;
-                let peer = config.peer.laptop.get_or_insert_with(|| PeerConfig {
-                    host: String::new(),
-                    port,
-                    position: self.position,
-                    pinned_fingerprint: String::new(),
-                });
-                peer.host = self.peer_host.trim().to_string();
-                peer.port = port;
-                peer.position = self.position;
+                config.peer.host = self.peer_host.trim().to_string();
+                config.peer.port = port;
+                config.layout.listener_position = self.position;
             }
-            Role::Receiver => {
+            TransportMode::Listen => {
                 config.listen = Some(update_listen_port(config.listen.as_deref(), port));
             }
         }
@@ -438,11 +457,41 @@ impl eframe::App for SettingsApp {
                 ui.add_enabled(false, egui::TextEdit::singleline(&mut self.local_ip));
                 ui.end_row();
 
+                ui.label("Connection mode");
+                ui.add_enabled_ui(self.can_choose_transport, |ui| {
+                    egui::ComboBox::from_id_salt("connection_mode")
+                        .selected_text(transport_label(self.transport))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.transport,
+                                TransportMode::Connect,
+                                "Connect to the other computer",
+                            );
+                            ui.selectable_value(
+                                &mut self.transport,
+                                TransportMode::Listen,
+                                "Wait for the other computer",
+                            );
+                        });
+                });
+                ui.end_row();
+
+                ui.label("");
+                ui.small(match self.transport {
+                    TransportMode::Connect => {
+                        "This computer starts the connection. Enter the other computer's IP below."
+                    }
+                    TransportMode::Listen => {
+                        "This computer waits. Set the other computer to Connect."
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Peer IP");
-                if self.role == Role::Controller {
+                if self.transport == TransportMode::Connect {
                     ui.text_edit_singleline(&mut self.peer_host);
                 } else {
-                    let mut receiver_peer = "Not used by receiver".to_string();
+                    let mut receiver_peer = "Not needed while waiting".to_string();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut receiver_peer));
                 }
                 ui.end_row();
@@ -452,7 +501,7 @@ impl eframe::App for SettingsApp {
                 ui.end_row();
 
                 ui.label("Screen location");
-                if self.role == Role::Controller {
+                if self.transport == TransportMode::Connect {
                     egui::ComboBox::from_id_salt("screen_location")
                         .selected_text(position_label(self.position))
                         .show_ui(ui, |ui| {
@@ -462,7 +511,7 @@ impl eframe::App for SettingsApp {
                             ui.selectable_value(&mut self.position, PeerPosition::Bottom, "Bottom");
                         });
                 } else {
-                    let mut text = "Set on controller".to_string();
+                    let mut text = "Set on connecting computer".to_string();
                     ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
                 }
                 ui.end_row();
@@ -478,15 +527,37 @@ impl eframe::App for SettingsApp {
                 );
                 ui.end_row();
 
-                ui.label("Stream Linux audio");
-                ui.checkbox(&mut self.audio_enabled, "Enabled on connection");
+                ui.label("Audio streaming");
+                egui::ComboBox::from_id_salt("audio_route")
+                    .selected_text(audio_route_label(
+                        self.audio_route,
+                        &self.device_name,
+                        &self.original.peer.name,
+                    ))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::LocalToPeer,
+                            format!("{} → {}", self.device_name, self.original.peer.name),
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::PeerToLocal,
+                            format!("{} → {}", self.original.peer.name, self.device_name),
+                        );
+                        ui.selectable_value(
+                            &mut self.audio_route,
+                            AudioRoutePreference::Disabled,
+                            "Audio off",
+                        );
+                    });
                 ui.end_row();
 
-                ui.label("Laptop playback");
+                ui.label("Local playback");
                 ui.checkbox(&mut self.audio_play_local, "Keep playing locally");
                 ui.end_row();
 
-                ui.label("Windows output");
+                ui.label("Playback output");
                 let mut output = "Follow system default".to_string();
                 ui.add_enabled(false, egui::TextEdit::singleline(&mut output));
                 ui.end_row();
@@ -501,8 +572,13 @@ impl eframe::App for SettingsApp {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Save").clicked() {
-                self.save();
+            let save_label = if self.restart_on_save {
+                "Save and restart"
+            } else {
+                "Save"
+            };
+            if ui.button(save_label).clicked() && self.save() && self.restart_on_save {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
     }
@@ -514,6 +590,21 @@ fn position_label(position: PeerPosition) -> &'static str {
         PeerPosition::Right => "Right",
         PeerPosition::Top => "Top",
         PeerPosition::Bottom => "Bottom",
+    }
+}
+
+fn transport_label(transport: TransportMode) -> &'static str {
+    match transport {
+        TransportMode::Connect => "Connect to the other computer",
+        TransportMode::Listen => "Wait for the other computer",
+    }
+}
+
+fn audio_route_label(route: AudioRoutePreference, local_name: &str, peer_name: &str) -> String {
+    match route {
+        AudioRoutePreference::LocalToPeer => format!("{local_name} → {peer_name}"),
+        AudioRoutePreference::PeerToLocal => format!("{peer_name} → {local_name}"),
+        AudioRoutePreference::Disabled => "Audio off".to_string(),
     }
 }
 

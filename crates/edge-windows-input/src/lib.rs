@@ -7,6 +7,11 @@ use edge_common::{ClipboardConfig, GameCompatibilityMode};
 use edge_geometry::Size;
 use edge_keymap::{WindowsScanCode, windows_scancode_to_evdev};
 use edge_protocol::{ControlEvent, Edge, InputEvent, ReleaseReason};
+#[cfg(windows)]
+use edge_protocol::{OutputInfo, ScreenInfo};
+
+mod injection;
+pub use injection::WindowsInputInjector;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WindowsInputError {
@@ -14,6 +19,10 @@ pub enum WindowsInputError {
     UnsupportedPlatform,
     #[error("unmapped Windows scan code {scan_code:#x}, extended={extended}")]
     UnmappedKey { scan_code: u16, extended: bool },
+    #[error("unmapped evdev key code {evdev_code}")]
+    UnmappedEvdevKey { evdev_code: u16 },
+    #[error("Windows input injection error: {0}")]
+    Injection(String),
     #[error("Windows tray error: {0}")]
     Tray(String),
     #[error("Windows input capture is already running")]
@@ -53,8 +62,30 @@ pub enum WindowsTrayCommand {
     Disconnect,
     Reconnect,
     ToggleInputForwarding,
-    ToggleAudio,
+    SetAudio(WindowsAudioChoice),
+    SetController(WindowsControllerChoice),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsAudioChoice {
+    Off,
+    Local,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsControllerChoice {
+    Local,
+    Peer,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowsTrayContext {
+    pub transport: String,
+    pub input_backend: String,
+    pub local_device_name: String,
+    pub peer_device_name: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -111,6 +142,21 @@ pub fn start_capture(_config: CaptureConfig) -> Result<mpsc::Receiver<CapturedIn
 }
 
 #[cfg(windows)]
+pub fn screen_info() -> ScreenInfo {
+    capture::screen_info()
+}
+
+#[cfg(windows)]
+pub fn cursor_position() -> Result<(i32, i32)> {
+    capture::cursor_position()
+}
+
+#[cfg(not(windows))]
+pub fn cursor_position() -> Result<(i32, i32)> {
+    Err(WindowsInputError::UnsupportedPlatform)
+}
+
+#[cfg(windows)]
 pub fn install_hooks() -> Result<()> {
     tracing::info!("Windows hook installation placeholder");
     Ok(())
@@ -122,14 +168,38 @@ pub fn install_hooks() -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn run_tray(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
-    tray::run(status, commands)
+pub fn run_tray(
+    status: &str,
+    commands: mpsc::Sender<WindowsTrayCommand>,
+    context: WindowsTrayContext,
+) -> Result<()> {
+    tray::run(status, commands, context)
 }
 
 #[cfg(not(windows))]
-pub fn run_tray(_status: &str, _commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
+pub fn run_tray(
+    _status: &str,
+    _commands: mpsc::Sender<WindowsTrayCommand>,
+    _context: WindowsTrayContext,
+) -> Result<()> {
     Err(WindowsInputError::UnsupportedPlatform)
 }
+
+#[cfg(windows)]
+pub fn record_tray_injected_input() {
+    tray::record_injected_input();
+}
+
+#[cfg(not(windows))]
+pub fn record_tray_injected_input() {}
+
+#[cfg(windows)]
+pub fn record_tray_clipboard_event() {
+    tray::record_clipboard_event();
+}
+
+#[cfg(not(windows))]
+pub fn record_tray_clipboard_event() {}
 
 #[cfg(windows)]
 pub fn update_tray_status(status: &str) -> Result<()> {
@@ -152,12 +222,60 @@ pub fn update_tray_audio(_enabled: bool, _status: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+pub fn update_tray_audio_route(
+    choice: WindowsAudioChoice,
+    local_available: bool,
+    peer_available: bool,
+    status: &str,
+) -> Result<()> {
+    tray::update_audio_route(choice, local_available, peer_available, status)
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_audio_route(
+    _choice: WindowsAudioChoice,
+    _local_available: bool,
+    _peer_available: bool,
+    _status: &str,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
 pub fn update_tray_input_forwarding(enabled: bool) -> Result<()> {
     tray::update_input_forwarding(enabled)
 }
 
 #[cfg(not(windows))]
 pub fn update_tray_input_forwarding(_enabled: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn update_tray_role(
+    local_name: &str,
+    peer_name: &str,
+    local_is_controller: bool,
+    available: bool,
+    switching: bool,
+) -> Result<()> {
+    tray::update_role(
+        local_name,
+        peer_name,
+        local_is_controller,
+        available,
+        switching,
+    )
+}
+
+#[cfg(not(windows))]
+pub fn update_tray_role(
+    _local_name: &str,
+    _peer_name: &str,
+    _local_is_controller: bool,
+    _available: bool,
+    _switching: bool,
+) -> Result<()> {
     Ok(())
 }
 
@@ -611,12 +729,12 @@ mod capture {
             },
             WindowsAndMessaging::{
                 CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyCursor,
-                DispatchMessageW, GetClipCursor, GetForegroundWindow, GetMessageW,
-                GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLMHF_INJECTED,
-                MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM,
-                OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE,
-                OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, RegisterClassW, SPI_SETCURSORS,
-                SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
+                DispatchMessageW, GetClipCursor, GetCursorPos, GetForegroundWindow, GetMessageW,
+                GetSystemMetrics, GetWindowRect, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND,
+                OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS,
+                OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PostThreadMessageW, RegisterClassW,
+                SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, ShowCursor,
                 SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
                 WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
                 WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
@@ -626,11 +744,15 @@ mod capture {
         },
     };
 
+    use crate::injection::is_edge_kvm_injected;
     use crate::{
         CaptureConfig, CaptureStatsSnapshot, CapturedInput, ControlEvent, InputEvent, Result,
         WindowsInputError, map_key,
     };
-    use edge_geometry::{Point, Size, apply_remote_motion, clamp};
+    use edge_geometry::{
+        Point, Rect, Size, apply_remote_motion, clamp, edge_anchor, local_restore_point,
+        normalized_perpendicular, point_is_at_edge, remote_entry_point, remote_return_edge_reached,
+    };
     use edge_protocol::{MouseButton, ReleaseReason};
 
     const SM_XVIRTUALSCREEN: i32 = 76;
@@ -655,6 +777,32 @@ mod capture {
     const GAME_GUARD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
     const RELEASE_REENTRY_COOLDOWN: Duration = Duration::from_millis(750);
     const INPUT_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+
+    pub(super) fn screen_info() -> crate::ScreenInfo {
+        let bounds = LocalBounds::query();
+        crate::ScreenInfo {
+            outputs: vec![crate::OutputInfo {
+                name: "Windows Virtual Desktop".to_string(),
+                width: bounds.width.max(1) as u32,
+                height: bounds.height.max(1) as u32,
+                scale: 1.0,
+                x: bounds.left,
+                y: bounds.top,
+            }],
+            primary_output: "Windows Virtual Desktop".to_string(),
+        }
+    }
+
+    pub(super) fn cursor_position() -> Result<(i32, i32)> {
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return Err(WindowsInputError::Capture(format!(
+                "GetCursorPos failed with Win32 error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        Ok((point.x, point.y))
+    }
     const INPUT_STALL_CONFIRMATIONS: u8 = 2;
     const INPUT_RESTART_COOLDOWN: Duration = Duration::from_secs(8);
     const FULLSCREEN_TOLERANCE_PX: i32 = 2;
@@ -1284,6 +1432,16 @@ mod capture {
         CAPTURE_STATS
             .mouse_hook_events
             .fetch_add(1, Ordering::Relaxed);
+        if is_edge_kvm_injected(mouse.dwExtraInfo) {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -1464,6 +1622,16 @@ mod capture {
         CAPTURE_STATS
             .keyboard_hook_events
             .fetch_add(1, Ordering::Relaxed);
+        if is_edge_kvm_injected(keyboard.dwExtraInfo) {
+            return unsafe {
+                CallNextHookEx(
+                    null_mut::<std::ffi::c_void>() as HHOOK,
+                    code,
+                    wparam,
+                    lparam,
+                )
+            };
+        }
         let Some(state) = STATE.get() else {
             return unsafe {
                 CallNextHookEx(
@@ -1493,6 +1661,10 @@ mod capture {
         let message = wparam as u32;
         let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let up = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+        if keyboard.flags & LLKHF_INJECTED != 0 && state.active {
+            return 1;
+        }
 
         if !state.enabled {
             return unsafe {
@@ -1575,12 +1747,14 @@ mod capture {
 
     impl CaptureState {
         fn at_activation_edge(&self, point: POINT) -> bool {
-            match self.config.edge {
-                Edge::Left => point.x <= self.local_bounds.left,
-                Edge::Right => point.x >= self.local_bounds.right(),
-                Edge::Top => point.y <= self.local_bounds.top,
-                Edge::Bottom => point.y >= self.local_bounds.bottom(),
-            }
+            point_is_at_edge(
+                self.config.edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                },
+                self.local_bounds.rect(),
+            )
         }
 
         fn game_guard_blocks_capture(&mut self) -> bool {
@@ -1658,7 +1832,7 @@ mod capture {
             self.raw_absolute_position = None;
             self.send_control(ControlEvent::EnterRemote {
                 edge: self.config.edge,
-                normalized_y: self.normalized_perpendicular(point),
+                normalized_position: self.normalized_perpendicular(point),
             });
             unsafe {
                 SetCursorPos(self.anchor.x, self.anchor.y);
@@ -1832,28 +2006,12 @@ mod capture {
         }
 
         fn remote_start(&self, point: POINT) -> Point {
-            let normalized = f64::from(self.normalized_perpendicular(point));
-            let remote = self.config.remote_size;
-            let x_padding = remote_entry_padding(remote.width);
-            let y_padding = remote_entry_padding(remote.height);
-            match self.config.edge {
-                Edge::Left => Point {
-                    x: f64::from(remote.width.saturating_sub(1)) - x_padding,
-                    y: normalized * f64::from(remote.height.saturating_sub(1)),
-                },
-                Edge::Right => Point {
-                    x: x_padding,
-                    y: normalized * f64::from(remote.height.saturating_sub(1)),
-                },
-                Edge::Top => Point {
-                    x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: f64::from(remote.height.saturating_sub(1)) - y_padding,
-                },
-                Edge::Bottom => Point {
-                    x: normalized * f64::from(remote.width.saturating_sub(1)),
-                    y: y_padding,
-                },
-            }
+            remote_entry_point(
+                self.config.edge,
+                self.normalized_perpendicular(point),
+                self.config.remote_size,
+                REMOTE_ENTRY_PADDING,
+            )
         }
 
         fn local_restore(&self) -> POINT {
@@ -1862,18 +2020,28 @@ mod capture {
         }
 
         fn normalized_perpendicular(&self, point: POINT) -> f32 {
-            match self.config.edge {
-                Edge::Left | Edge::Right => self.local_bounds.normalized_y(f64::from(point.y)),
-                Edge::Top | Edge::Bottom => self.local_bounds.normalized_x(f64::from(point.x)),
-            }
+            normalized_perpendicular(
+                self.config.edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
+                },
+                self.local_bounds.rect(),
+            )
         }
 
         fn remote_normalized_perpendicular(&self) -> f32 {
             let remote = self.config.remote_size;
-            match self.config.edge {
-                Edge::Left | Edge::Right => normalized_axis(self.remote_cursor.y, remote.height),
-                Edge::Top | Edge::Bottom => normalized_axis(self.remote_cursor.x, remote.width),
-            }
+            normalized_perpendicular(
+                self.config.edge,
+                self.remote_cursor,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: remote.width,
+                    height: remote.height,
+                },
+            )
         }
 
         fn send_input(&self, event: InputEvent) {
@@ -1894,16 +2062,7 @@ mod capture {
     }
 
     fn remote_cursor_at_return_edge(edge: Edge, cursor: Point, remote: Size) -> bool {
-        match edge {
-            Edge::Left => {
-                cursor.x >= f64::from(remote.width.saturating_sub(1)) - REMOTE_RETURN_MARGIN
-            }
-            Edge::Right => cursor.x <= REMOTE_RETURN_MARGIN,
-            Edge::Top => {
-                cursor.y >= f64::from(remote.height.saturating_sub(1)) - REMOTE_RETURN_MARGIN
-            }
-            Edge::Bottom => cursor.y <= REMOTE_RETURN_MARGIN,
-        }
+        remote_return_edge_reached(edge, cursor, remote, REMOTE_RETURN_MARGIN)
     }
 
     struct CaptureStats {
@@ -2190,80 +2349,38 @@ mod capture {
             }
         }
 
+        fn rect(&self) -> Rect {
+            Rect {
+                x: f64::from(self.left),
+                y: f64::from(self.top),
+                width: self.width.max(1) as u32,
+                height: self.height.max(1) as u32,
+            }
+        }
+
         fn anchor_for(&self, edge: Edge, point: POINT) -> POINT {
-            match edge {
-                Edge::Left => POINT {
-                    x: self.left + 2,
-                    y: point.y.clamp(self.top, self.bottom()),
+            let anchor = edge_anchor(
+                edge,
+                Point {
+                    x: f64::from(point.x),
+                    y: f64::from(point.y),
                 },
-                Edge::Right => POINT {
-                    x: self.right() - 2,
-                    y: point.y.clamp(self.top, self.bottom()),
-                },
-                Edge::Top => POINT {
-                    x: point.x.clamp(self.left, self.right()),
-                    y: self.top + 2,
-                },
-                Edge::Bottom => POINT {
-                    x: point.x.clamp(self.left, self.right()),
-                    y: self.bottom() - 2,
-                },
+                self.rect(),
+                2.0,
+            );
+            POINT {
+                x: anchor.x.round() as i32,
+                y: anchor.y.round() as i32,
             }
         }
 
         fn restore_for(&self, edge: Edge, normalized: f32) -> POINT {
-            match edge {
-                Edge::Left => POINT {
-                    x: self.left + 3,
-                    y: self.y_at(normalized),
-                },
-                Edge::Right => POINT {
-                    x: self.right() - 3,
-                    y: self.y_at(normalized),
-                },
-                Edge::Top => POINT {
-                    x: self.x_at(normalized),
-                    y: self.top + 3,
-                },
-                Edge::Bottom => POINT {
-                    x: self.x_at(normalized),
-                    y: self.bottom() - 3,
-                },
+            let restore = local_restore_point(edge, normalized, self.rect(), 3.0);
+            POINT {
+                x: restore.x.round() as i32,
+                y: restore.y.round() as i32,
             }
         }
-
-        fn normalized_x(&self, x: f64) -> f32 {
-            normalized_axis(x - f64::from(self.left), self.width.max(1) as u32)
-        }
-
-        fn normalized_y(&self, y: f64) -> f32 {
-            normalized_axis(y - f64::from(self.top), self.height.max(1) as u32)
-        }
-
-        fn x_at(&self, normalized: f32) -> i32 {
-            let x = f64::from(self.left)
-                + f64::from(self.width.saturating_sub(1)) * f64::from(normalized);
-            clamp(x, f64::from(self.left), f64::from(self.right())).round() as i32
-        }
-
-        fn y_at(&self, normalized: f32) -> i32 {
-            let y = f64::from(self.top)
-                + f64::from(self.height.saturating_sub(1)) * f64::from(normalized);
-            clamp(y, f64::from(self.top), f64::from(self.bottom())).round() as i32
-        }
-    }
-
-    fn normalized_axis(pos: f64, extent: u32) -> f32 {
-        if extent <= 1 {
-            return 0.0;
-        }
-        let max = f64::from(extent - 1);
-        (clamp(pos, 0.0, max) / max) as f32
-    }
-
-    fn remote_entry_padding(extent: u32) -> f64 {
-        let max = f64::from(extent.saturating_sub(1));
-        clamp(REMOTE_ENTRY_PADDING, 1.0, max)
     }
 
     fn foreground_is_fullscreen() -> bool {
@@ -2408,7 +2525,7 @@ mod tray {
         ptr::null_mut,
         sync::{
             Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             mpsc,
         },
     };
@@ -2434,17 +2551,24 @@ mod tray {
         },
     };
 
-    use crate::{Result, WindowsInputError, WindowsTrayCommand};
+    use crate::{
+        Result, WindowsAudioChoice, WindowsControllerChoice, WindowsInputError, WindowsTrayCommand,
+        WindowsTrayContext,
+    };
 
     const TRAY_ID: u32 = 1;
     const WM_TRAY_ICON: u32 = WM_APP + 1;
     const ID_SETTINGS: usize = 1001;
     const ID_RELEASE: usize = 1002;
     const ID_QUIT: usize = 1003;
-    const ID_AUDIO: usize = 1004;
+    const ID_AUDIO_OFF: usize = 1004;
     const ID_CONNECTION: usize = 1005;
     const ID_INPUT_FORWARDING: usize = 1006;
     const ID_PAIR: usize = 1007;
+    const ID_LOCAL_CONTROLLER: usize = 1008;
+    const ID_PEER_CONTROLLER: usize = 1009;
+    const ID_AUDIO_LOCAL: usize = 1010;
+    const ID_AUDIO_PEER: usize = 1011;
 
     static TRAY_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     static TRAY_AUDIO_STATUS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
@@ -2452,11 +2576,65 @@ mod tray {
     static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
     static TRAY_CONNECTED: AtomicBool = AtomicBool::new(false);
-    static TRAY_AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
+    static TRAY_AUDIO_CHOICE: AtomicUsize = AtomicUsize::new(0);
+    static TRAY_AUDIO_LOCAL_AVAILABLE: AtomicBool = AtomicBool::new(false);
+    static TRAY_AUDIO_PEER_AVAILABLE: AtomicBool = AtomicBool::new(false);
     static TRAY_INPUT_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(true);
+    static TRAY_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_INJECTED_INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_CLIPBOARD_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_ROLE: Mutex<TrayRole> = Mutex::new(TrayRole::new());
+    static TRAY_CONTEXT: Mutex<TrayContext> = Mutex::new(TrayContext::new());
 
-    pub fn run(status: &str, commands: mpsc::Sender<WindowsTrayCommand>) -> Result<()> {
+    #[derive(Clone)]
+    struct TrayContext {
+        transport: String,
+        input_backend: String,
+        local_device_name: String,
+        peer_device_name: String,
+        last_error: String,
+    }
+
+    impl TrayContext {
+        const fn new() -> Self {
+            Self {
+                transport: String::new(),
+                input_backend: String::new(),
+                local_device_name: String::new(),
+                peer_device_name: String::new(),
+                last_error: String::new(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TrayRole {
+        local_name: String,
+        peer_name: String,
+        local_is_controller: bool,
+        available: bool,
+        switching: bool,
+    }
+
+    impl TrayRole {
+        const fn new() -> Self {
+            Self {
+                local_name: String::new(),
+                peer_name: String::new(),
+                local_is_controller: true,
+                available: false,
+                switching: false,
+            }
+        }
+    }
+
+    pub fn run(
+        status: &str,
+        commands: mpsc::Sender<WindowsTrayCommand>,
+        context: WindowsTrayContext,
+    ) -> Result<()> {
         unsafe {
+            set_tray_context(context);
             set_tray_status(status);
             set_tray_commands(commands);
 
@@ -2523,7 +2701,28 @@ mod tray {
     }
 
     pub fn update_audio(enabled: bool, status: &str) -> Result<()> {
-        TRAY_AUDIO_ENABLED.store(enabled, Ordering::Relaxed);
+        let _ = enabled;
+        let mut audio_status = TRAY_AUDIO_STATUS
+            .lock()
+            .expect("tray audio status poisoned");
+        *audio_status = to_wide(status);
+        Ok(())
+    }
+
+    pub fn update_audio_route(
+        choice: WindowsAudioChoice,
+        local_available: bool,
+        peer_available: bool,
+        status: &str,
+    ) -> Result<()> {
+        let choice = match choice {
+            WindowsAudioChoice::Off => 0,
+            WindowsAudioChoice::Local => 1,
+            WindowsAudioChoice::Peer => 2,
+        };
+        TRAY_AUDIO_CHOICE.store(choice, Ordering::Relaxed);
+        TRAY_AUDIO_LOCAL_AVAILABLE.store(local_available, Ordering::Relaxed);
+        TRAY_AUDIO_PEER_AVAILABLE.store(peer_available, Ordering::Relaxed);
         let mut audio_status = TRAY_AUDIO_STATUS
             .lock()
             .expect("tray audio status poisoned");
@@ -2533,6 +2732,30 @@ mod tray {
 
     pub fn update_input_forwarding(enabled: bool) -> Result<()> {
         TRAY_INPUT_FORWARDING_ENABLED.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn record_injected_input() {
+        TRAY_INJECTED_INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_clipboard_event() {
+        TRAY_CLIPBOARD_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn update_role(
+        local_name: &str,
+        peer_name: &str,
+        local_is_controller: bool,
+        available: bool,
+        switching: bool,
+    ) -> Result<()> {
+        let mut role = TRAY_ROLE.lock().expect("tray role poisoned");
+        role.local_name = local_name.to_string();
+        role.peer_name = peer_name.to_string();
+        role.local_is_controller = local_is_controller;
+        role.available = available;
+        role.switching = switching;
         Ok(())
     }
 
@@ -2587,7 +2810,21 @@ mod tray {
                 }
             }
             ID_INPUT_FORWARDING => send_tray_command(WindowsTrayCommand::ToggleInputForwarding),
-            ID_AUDIO => send_tray_command(WindowsTrayCommand::ToggleAudio),
+            ID_AUDIO_OFF => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Off))
+            }
+            ID_AUDIO_LOCAL => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Local))
+            }
+            ID_AUDIO_PEER => {
+                send_tray_command(WindowsTrayCommand::SetAudio(WindowsAudioChoice::Peer))
+            }
+            ID_LOCAL_CONTROLLER => send_tray_command(WindowsTrayCommand::SetController(
+                WindowsControllerChoice::Local,
+            )),
+            ID_PEER_CONTROLLER => send_tray_command(WindowsTrayCommand::SetController(
+                WindowsControllerChoice::Peer,
+            )),
             ID_QUIT => {
                 send_tray_command(WindowsTrayCommand::Quit);
                 remove_tray_icon(hwnd);
@@ -2678,23 +2915,165 @@ mod tray {
         }
 
         let status = current_tray_status();
+        let status_text = wide_to_string(&status);
+        let status_label = to_wide(&format!("Status: {}", status_summary(&status_text)));
         let audio_status = current_audio_status();
+        let context = TRAY_CONTEXT.lock().expect("tray context poisoned").clone();
+        let transport = to_wide(&format!("Transport: {}", context.transport));
+        let input_backend = to_wide(&format!("Input backend: {}", context.input_backend));
+        let pairing = to_wide(&format!(
+            "Pairing: {}",
+            if status_text.starts_with("Pairing") {
+                "waiting for confirmation"
+            } else {
+                "not armed"
+            }
+        ));
         let settings = to_wide("Settings...");
-        let pair = to_wide("Pair or replace laptop...");
+        let pair = to_wide("Pair or replace peer...");
         let release = to_wide("Release control");
         let connection = to_wide(if TRAY_CONNECTED.load(Ordering::Relaxed) {
             "Disconnect"
         } else {
             "Reconnect"
         });
-        let audio = to_wide("Stream Linux audio");
+        let local_audio = to_wide(&format!(
+            "{} → {}",
+            if context.local_device_name.is_empty() {
+                "This computer"
+            } else {
+                &context.local_device_name
+            },
+            if context.peer_device_name.is_empty() {
+                "Peer"
+            } else {
+                &context.peer_device_name
+            },
+        ));
+        let peer_audio = to_wide(&format!(
+            "{} → {}",
+            if context.peer_device_name.is_empty() {
+                "Peer"
+            } else {
+                &context.peer_device_name
+            },
+            if context.local_device_name.is_empty() {
+                "this computer"
+            } else {
+                &context.local_device_name
+            },
+        ));
+        let audio_heading = to_wide("Audio routing");
+        let audio_off = to_wide("Audio off");
         let input_forwarding = to_wide("Forward mouse and keyboard");
-        let quit = to_wide("Quit");
-        let audio_flags = if TRAY_AUDIO_ENABLED.load(Ordering::Relaxed) {
-            MF_STRING | MF_CHECKED
+        let quit = to_wide("Quit edge-kvm");
+        let role = TRAY_ROLE.lock().expect("tray role poisoned").clone();
+        let peer_name = if role.peer_name.is_empty() {
+            &context.peer_device_name
         } else {
-            MF_STRING
+            &role.peer_name
         };
+        let peer = to_wide(&format!(
+            "Peer: {}",
+            if peer_name.is_empty() {
+                "none"
+            } else {
+                peer_name
+            }
+        ));
+        let connections = to_wide(&format!(
+            "Connections: {}",
+            TRAY_CONNECTIONS.load(Ordering::Relaxed)
+        ));
+        let input_events = to_wide(&format!(
+            "Input events: {}",
+            crate::capture_stats()
+                .input_events
+                .saturating_add(TRAY_INJECTED_INPUT_EVENTS.load(Ordering::Relaxed))
+        ));
+        let clipboard_events = to_wide(&format!(
+            "Clipboard events: {}",
+            TRAY_CLIPBOARD_EVENTS.load(Ordering::Relaxed)
+        ));
+        let last_error = to_wide(&format!(
+            "Last error: {}",
+            if context.last_error.is_empty() {
+                "None"
+            } else {
+                &context.last_error
+            }
+        ));
+        let local_controller = to_wide(&format!(
+            "{} controls {}",
+            if role.local_name.is_empty() {
+                if context.local_device_name.is_empty() {
+                    "This computer"
+                } else {
+                    &context.local_device_name
+                }
+            } else {
+                &role.local_name
+            },
+            if peer_name.is_empty() {
+                "Peer"
+            } else {
+                peer_name
+            }
+        ));
+        let peer_controller = to_wide(&format!(
+            "{} controls {}",
+            if peer_name.is_empty() {
+                "Peer"
+            } else {
+                peer_name
+            },
+            if role.local_name.is_empty() {
+                if context.local_device_name.is_empty() {
+                    "this computer"
+                } else {
+                    &context.local_device_name
+                }
+            } else {
+                &role.local_name
+            }
+        ));
+        let role_enabled =
+            role.available && !role.switching && TRAY_CONNECTED.load(Ordering::Relaxed);
+        let role_disabled_flag = if role_enabled { 0 } else { MF_DISABLED };
+        let local_role_flags = MF_STRING
+            | role_disabled_flag
+            | if role.local_is_controller {
+                MF_CHECKED
+            } else {
+                0
+            };
+        let peer_role_flags = MF_STRING
+            | role_disabled_flag
+            | if role.local_is_controller {
+                0
+            } else {
+                MF_CHECKED
+            };
+        let audio_choice = TRAY_AUDIO_CHOICE.load(Ordering::Relaxed);
+        let audio_off_flags = MF_STRING | if audio_choice == 0 { MF_CHECKED } else { 0 };
+        let audio_local_flags = MF_STRING
+            | if audio_choice == 1 { MF_CHECKED } else { 0 }
+            | if TRAY_AUDIO_LOCAL_AVAILABLE.load(Ordering::Relaxed)
+                && TRAY_CONNECTED.load(Ordering::Relaxed)
+            {
+                0
+            } else {
+                MF_DISABLED
+            };
+        let audio_peer_flags = MF_STRING
+            | if audio_choice == 2 { MF_CHECKED } else { 0 }
+            | if TRAY_AUDIO_PEER_AVAILABLE.load(Ordering::Relaxed)
+                && TRAY_CONNECTED.load(Ordering::Relaxed)
+            {
+                0
+            } else {
+                MF_DISABLED
+            };
         let input_forwarding_flags = if TRAY_INPUT_FORWARDING_ENABLED.load(Ordering::Relaxed) {
             MF_STRING | MF_CHECKED
         } else {
@@ -2707,20 +3086,49 @@ mod tray {
         };
 
         unsafe {
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status_label.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, transport.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_backend.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, pairing.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, peer.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, connections.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_events.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, clipboard_events.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, last_error.as_ptr());
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
+            AppendMenuW(
+                menu,
+                local_role_flags,
+                ID_LOCAL_CONTROLLER,
+                local_controller.as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                peer_role_flags,
+                ID_PEER_CONTROLLER,
+                peer_controller.as_ptr(),
+            );
             AppendMenuW(
                 menu,
                 input_forwarding_flags,
                 ID_INPUT_FORWARDING,
                 input_forwarding.as_ptr(),
             );
-            AppendMenuW(menu, audio_flags, ID_AUDIO, audio.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_heading.as_ptr());
+            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
+            AppendMenuW(
+                menu,
+                audio_local_flags,
+                ID_AUDIO_LOCAL,
+                local_audio.as_ptr(),
+            );
+            AppendMenuW(menu, audio_peer_flags, ID_AUDIO_PEER, peer_audio.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
             let mut point = POINT::default();
@@ -2745,9 +3153,43 @@ mod tray {
     }
 
     fn set_tray_status(status: &str) {
-        TRAY_CONNECTED.store(status.starts_with("Connected"), Ordering::Relaxed);
+        let connected = status.starts_with("Connected");
+        let was_connected = TRAY_CONNECTED.swap(connected, Ordering::Relaxed);
+        if connected && !was_connected {
+            TRAY_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut context = TRAY_CONTEXT.lock().expect("tray context poisoned");
+        if connected
+            || status == "Connecting"
+            || status.starts_with("Pairing")
+            || status == "Disconnected by user"
+        {
+            context.last_error.clear();
+        } else if status == "Disconnected" {
+            context.last_error = "Connection lost".to_string();
+        } else if !matches!(status, "Starting" | "Listening") {
+            context.last_error = status.to_string();
+        }
+        drop(context);
         let mut tray_status = TRAY_STATUS.lock().expect("tray status poisoned");
         *tray_status = to_wide(status);
+    }
+
+    fn set_tray_context(context: WindowsTrayContext) {
+        let mut tray_context = TRAY_CONTEXT.lock().expect("tray context poisoned");
+        tray_context.transport = context.transport;
+        tray_context.input_backend = context.input_backend;
+        tray_context.local_device_name = context.local_device_name.clone();
+        tray_context.peer_device_name = context.peer_device_name.clone();
+        drop(tray_context);
+
+        let mut role = TRAY_ROLE.lock().expect("tray role poisoned");
+        if role.local_name.is_empty() {
+            role.local_name = context.local_device_name;
+        }
+        if role.peer_name.is_empty() {
+            role.peer_name = context.peer_device_name;
+        }
     }
 
     fn set_tray_commands(commands: mpsc::Sender<WindowsTrayCommand>) {
@@ -2779,6 +3221,28 @@ mod tray {
             to_wide("Audio: Off")
         } else {
             audio_status.clone()
+        }
+    }
+
+    fn wide_to_string(value: &[u16]) -> String {
+        let length = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        String::from_utf16_lossy(&value[..length])
+    }
+
+    fn status_summary(status: &str) -> &str {
+        if status.starts_with("Connected") {
+            "Connected"
+        } else if status.starts_with("Pairing") {
+            "Pairing"
+        } else if status.starts_with("Connecting") {
+            "Connecting"
+        } else if status.starts_with("Disconnected") {
+            "Disconnected"
+        } else {
+            status
         }
     }
 

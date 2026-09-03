@@ -1,15 +1,16 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ksni::TrayMethods;
-use tokio::sync::{Mutex, mpsc};
+use tokio::{sync::mpsc, time};
 
-const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+const COUNTER_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const TRAY_UPDATE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum TrayCommand {
@@ -18,27 +19,42 @@ pub enum TrayCommand {
     Disconnect,
     Reconnect,
     ToggleInputForwarding,
-    ToggleAudio,
+    SetAudio(AudioChoice),
+    SetController(ControllerChoice),
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerChoice {
+    Local,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioChoice {
+    Off,
+    Local,
+    Peer,
 }
 
 #[derive(Clone)]
 pub struct ReceiverTrayHandle {
     handle: ksni::Handle<ReceiverTray>,
     input_events: Arc<AtomicU64>,
-    last_input_update: Arc<Mutex<Instant>>,
+    clipboard_events: Arc<AtomicU64>,
+    counters_dirty: Arc<AtomicBool>,
 }
 
 impl ReceiverTrayHandle {
     pub async fn spawn(
-        listen: String,
+        transport: String,
         backend: String,
         pairing_armed: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<TrayCommand>), ksni::Error> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let tray = ReceiverTray {
             state: TrayState::Starting,
-            listen,
+            transport,
             backend,
             pairing_armed,
             connected_peer: None,
@@ -46,15 +62,33 @@ impl ReceiverTrayHandle {
             input_events: 0,
             clipboard_events: 0,
             input_forwarding_enabled: true,
+            audio_choice: AudioChoice::Off,
+            local_audio_available: false,
+            peer_audio_available: false,
+            local_device_name: None,
+            peer_device_name: None,
+            local_is_controller: true,
+            role_switch_available: false,
+            role_switching: false,
             last_error: None,
             command_tx,
         };
         let handle = tray.assume_sni_available(true).spawn().await?;
+        let input_events = Arc::new(AtomicU64::new(0));
+        let clipboard_events = Arc::new(AtomicU64::new(0));
+        let counters_dirty = Arc::new(AtomicBool::new(false));
+        spawn_counter_updates(
+            handle.clone(),
+            input_events.clone(),
+            clipboard_events.clone(),
+            counters_dirty.clone(),
+        );
         Ok((
             Self {
                 handle,
-                input_events: Arc::new(AtomicU64::new(0)),
-                last_input_update: Arc::new(Mutex::new(Instant::now() - COUNTER_UPDATE_INTERVAL)),
+                input_events,
+                clipboard_events,
+                counters_dirty,
             },
             command_rx,
         ))
@@ -69,17 +103,29 @@ impl ReceiverTrayHandle {
         .await;
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn connecting(&self) {
+        self.update(|tray| {
+            tray.state = TrayState::Starting;
+            tray.connected_peer = None;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
     pub async fn pairing_armed(&self, armed: bool) {
         self.update(move |tray| tray.pairing_armed = armed).await;
     }
 
     pub async fn connected(&self, peer: String) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = TrayState::Connected;
             tray.connected_peer = Some(peer);
             tray.connections = tray.connections.saturating_add(1);
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = None;
         })
         .await;
@@ -87,6 +133,7 @@ impl ReceiverTrayHandle {
 
     pub async fn disconnected(&self, error: Option<String>) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = if error.is_some() {
                 TrayState::Error
@@ -95,6 +142,7 @@ impl ReceiverTrayHandle {
             };
             tray.connected_peer = None;
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = error;
         })
         .await;
@@ -102,39 +150,88 @@ impl ReceiverTrayHandle {
 
     pub async fn disconnected_by_user(&self) {
         let input_events = self.input_events.load(Ordering::Relaxed);
+        let clipboard_events = self.clipboard_events.load(Ordering::Relaxed);
         self.update(|tray| {
             tray.state = TrayState::Paused;
             tray.connected_peer = None;
             tray.input_events = input_events;
+            tray.clipboard_events = clipboard_events;
             tray.last_error = None;
         })
         .await;
     }
 
-    pub async fn input_event(&self) {
-        let total = self.input_events.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut last_update = self.last_input_update.lock().await;
-        if last_update.elapsed() < COUNTER_UPDATE_INTERVAL {
-            return;
-        }
-        *last_update = Instant::now();
-        drop(last_update);
-
-        self.update(move |tray| tray.input_events = total).await;
+    pub fn input_event(&self) {
+        self.input_events.fetch_add(1, Ordering::Relaxed);
+        self.counters_dirty.store(true, Ordering::Release);
     }
 
-    pub async fn clipboard_event(&self) {
-        let input_events = self.input_events.load(Ordering::Relaxed);
-        self.update(|tray| {
-            tray.input_events = input_events;
-            tray.clipboard_events = tray.clipboard_events.saturating_add(1);
-        })
-        .await;
+    pub fn clipboard_event(&self) {
+        self.clipboard_events.fetch_add(1, Ordering::Relaxed);
+        self.counters_dirty.store(true, Ordering::Release);
     }
 
     pub async fn input_forwarding(&self, enabled: bool) {
         self.update(move |tray| tray.input_forwarding_enabled = enabled)
             .await;
+    }
+
+    pub async fn session_paused(&self, paused: bool) {
+        self.update(move |tray| {
+            tray.state = if paused {
+                TrayState::Paused
+            } else {
+                TrayState::Connected
+            };
+            tray.role_switching = false;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
+    pub async fn audio_route(
+        &self,
+        choice: AudioChoice,
+        local_available: bool,
+        peer_available: bool,
+    ) {
+        self.update(move |tray| {
+            tray.audio_choice = choice;
+            tray.local_audio_available = local_available;
+            tray.peer_audio_available = peer_available;
+        })
+        .await;
+    }
+
+    pub async fn role_assignment(
+        &self,
+        local_device_name: String,
+        peer_device_name: String,
+        local_is_controller: bool,
+        available: bool,
+    ) {
+        self.update(|tray| {
+            tray.local_device_name = Some(local_device_name);
+            tray.peer_device_name = Some(peer_device_name);
+            tray.local_is_controller = local_is_controller;
+            tray.role_switch_available = available;
+            tray.role_switching = false;
+            tray.last_error = None;
+        })
+        .await;
+    }
+
+    pub async fn role_switching(&self, switching: bool) {
+        self.update(move |tray| tray.role_switching = switching)
+            .await;
+    }
+
+    pub async fn role_failure(&self, error: String) {
+        self.update(|tray| {
+            tray.role_switching = false;
+            tray.last_error = Some(error);
+        })
+        .await;
     }
 
     pub async fn error(&self, error: String) {
@@ -151,8 +248,35 @@ impl ReceiverTrayHandle {
     }
 
     async fn update(&self, update: impl FnOnce(&mut ReceiverTray)) {
-        let _ = self.handle.update(update).await;
+        let _ = time::timeout(TRAY_UPDATE_TIMEOUT, self.handle.update(update)).await;
     }
+}
+
+fn spawn_counter_updates(
+    handle: ksni::Handle<ReceiverTray>,
+    input_events: Arc<AtomicU64>,
+    clipboard_events: Arc<AtomicU64>,
+    counters_dirty: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = time::interval(COUNTER_UPDATE_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if !counters_dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            let input_events = input_events.load(Ordering::Relaxed);
+            let clipboard_events = clipboard_events.load(Ordering::Relaxed);
+            let update = handle.update(move |tray| {
+                tray.input_events = input_events;
+                tray.clipboard_events = clipboard_events;
+            });
+            if time::timeout(TRAY_UPDATE_TIMEOUT, update).await.is_err() {
+                counters_dirty.store(true, Ordering::Release);
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +303,7 @@ impl TrayState {
 #[derive(Debug)]
 pub struct ReceiverTray {
     state: TrayState,
-    listen: String,
+    transport: String,
     backend: String,
     pairing_armed: bool,
     connected_peer: Option<String>,
@@ -187,13 +311,21 @@ pub struct ReceiverTray {
     input_events: u64,
     clipboard_events: u64,
     input_forwarding_enabled: bool,
+    audio_choice: AudioChoice,
+    local_audio_available: bool,
+    peer_audio_available: bool,
+    local_device_name: Option<String>,
+    peer_device_name: Option<String>,
+    local_is_controller: bool,
+    role_switch_available: bool,
+    role_switching: bool,
     last_error: Option<String>,
     command_tx: mpsc::UnboundedSender<TrayCommand>,
 }
 
 impl ksni::Tray for ReceiverTray {
     fn id(&self) -> String {
-        "edge-kvm-receiver".to_string()
+        "edge-kvm-node".to_string()
     }
 
     fn category(&self) -> ksni::Category {
@@ -201,7 +333,7 @@ impl ksni::Tray for ReceiverTray {
     }
 
     fn title(&self) -> String {
-        format!("edge-kvm receiver: {}", self.state.label())
+        format!("edge-kvm: {}", self.state.label())
     }
 
     fn status(&self) -> ksni::Status {
@@ -226,7 +358,7 @@ impl ksni::Tray for ReceiverTray {
         ksni::ToolTip {
             icon_name: self.icon_name(),
             icon_pixmap: self.icon_pixmap(),
-            title: "edge-kvm receiver".to_string(),
+            title: "edge-kvm".to_string(),
             description: self.description(),
         }
     }
@@ -240,7 +372,7 @@ impl ksni::Tray for ReceiverTray {
 
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             disabled_item(format!("Status: {}", self.state.label())),
-            disabled_item(format!("Listen: {}", self.listen)),
+            disabled_item(format!("Transport: {}", self.transport)),
             disabled_item(format!("Input backend: {}", self.backend)),
             disabled_item(format!(
                 "Pairing: {}",
@@ -269,7 +401,7 @@ impl ksni::Tray for ReceiverTray {
                 label: if self.pairing_armed {
                     "Pairing enabled for next connection".to_string()
                 } else {
-                    "Pair or replace controller...".to_string()
+                    "Pair or replace peer...".to_string()
                 },
                 icon_name: "network-connect".to_string(),
                 enabled: !self.pairing_armed && self.state != TrayState::Connected,
@@ -281,6 +413,7 @@ impl ksni::Tray for ReceiverTray {
             .into(),
         );
         items.push(self.connection_item());
+        items.push(self.controller_items());
         items.push(
             CheckmarkItem {
                 label: "Forward mouse and keyboard".to_string(),
@@ -294,18 +427,9 @@ impl ksni::Tray for ReceiverTray {
             }
             .into(),
         );
-        items.push(
-            StandardItem {
-                label: "Toggle audio streaming".to_string(),
-                icon_name: "audio-volume-high".to_string(),
-                enabled: self.state == TrayState::Connected,
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.command_tx.send(TrayCommand::ToggleAudio);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
+        items.push(MenuItem::Separator);
+        items.push(disabled_item("Audio routing".to_string()));
+        items.push(self.audio_items());
         items.push(
             StandardItem {
                 label: "Settings...".to_string(),
@@ -319,7 +443,7 @@ impl ksni::Tray for ReceiverTray {
         );
         items.push(
             StandardItem {
-                label: "Quit receiver".to_string(),
+                label: "Quit edge-kvm".to_string(),
                 icon_name: "application-exit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Quit);
@@ -334,6 +458,81 @@ impl ksni::Tray for ReceiverTray {
 }
 
 impl ReceiverTray {
+    fn audio_items(&self) -> ksni::MenuItem<Self> {
+        use ksni::menu::{RadioGroup, RadioItem};
+
+        let local = self.local_device_name.as_deref().unwrap_or("This computer");
+        let peer = self.peer_device_name.as_deref().unwrap_or("Peer");
+        let connected = self.state == TrayState::Connected;
+        RadioGroup {
+            selected: match self.audio_choice {
+                AudioChoice::Off => 0,
+                AudioChoice::Local => 1,
+                AudioChoice::Peer => 2,
+            },
+            select: Box::new(|tray: &mut Self, selected| {
+                let choice = match selected {
+                    0 => AudioChoice::Off,
+                    1 => AudioChoice::Local,
+                    _ => AudioChoice::Peer,
+                };
+                let _ = tray.command_tx.send(TrayCommand::SetAudio(choice));
+            }),
+            options: vec![
+                RadioItem {
+                    label: "Audio off".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: format!("{local} → {peer}"),
+                    enabled: connected && self.local_audio_available,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: format!("{peer} → {local}"),
+                    enabled: connected && self.peer_audio_available,
+                    ..Default::default()
+                },
+            ],
+        }
+        .into()
+    }
+
+    fn controller_items(&self) -> ksni::MenuItem<Self> {
+        use ksni::menu::{RadioGroup, RadioItem};
+
+        let local = self.local_device_name.as_deref().unwrap_or("This computer");
+        let peer = self.peer_device_name.as_deref().unwrap_or("Peer");
+        let enabled = self.state == TrayState::Connected
+            && self.role_switch_available
+            && !self.role_switching;
+        RadioGroup {
+            selected: usize::from(!self.local_is_controller),
+            select: Box::new(|tray: &mut Self, selected| {
+                let choice = if selected == 0 {
+                    ControllerChoice::Local
+                } else {
+                    ControllerChoice::Peer
+                };
+                let _ = tray.command_tx.send(TrayCommand::SetController(choice));
+            }),
+            options: vec![
+                RadioItem {
+                    label: format!("{local} controls {peer}"),
+                    enabled,
+                    ..Default::default()
+                },
+                RadioItem {
+                    label: format!("{peer} controls {local}"),
+                    enabled,
+                    ..Default::default()
+                },
+            ],
+        }
+        .into()
+    }
+
     fn connection_item(&self) -> ksni::MenuItem<Self> {
         use ksni::menu::StandardItem;
 
@@ -357,7 +556,7 @@ impl ReceiverTray {
             }
             .into(),
             TrayState::Starting | TrayState::Listening | TrayState::Error => StandardItem {
-                label: "Stop listening".to_string(),
+                label: "Disconnect".to_string(),
                 icon_name: "network-offline".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Disconnect);
@@ -379,7 +578,7 @@ impl ReceiverTray {
     fn description(&self) -> String {
         let mut lines = vec![
             format!("Status: {}", self.state.label()),
-            format!("Listen: {}", self.listen),
+            format!("Transport: {}", self.transport),
             format!("Input backend: {}", self.backend),
         ];
         if let Some(peer) = &self.connected_peer {
@@ -485,7 +684,7 @@ mod tests {
         let (command_tx, _) = mpsc::unbounded_channel();
         ReceiverTray {
             state,
-            listen: "0.0.0.0:42420".to_string(),
+            transport: "Listen: 0.0.0.0:42420".to_string(),
             backend: "hyprland".to_string(),
             pairing_armed: true,
             connected_peer: (state == TrayState::Connected).then(|| "controller".to_string()),
@@ -493,6 +692,14 @@ mod tests {
             input_events: 2,
             clipboard_events: 3,
             input_forwarding_enabled: true,
+            audio_choice: AudioChoice::Off,
+            local_audio_available: true,
+            peer_audio_available: true,
+            local_device_name: Some("Desk".to_string()),
+            peer_device_name: Some("Studio".to_string()),
+            local_is_controller: true,
+            role_switch_available: true,
+            role_switching: false,
             last_error: last_error.map(str::to_string),
             command_tx,
         }
@@ -526,7 +733,7 @@ mod tests {
         let error = test_tray(TrayState::Error, Some("connection lost"));
 
         let expected = menu_shape(&connected);
-        assert_eq!(expected.len(), 16);
+        assert_eq!(expected.len(), 19);
         assert_eq!(menu_shape(&listening), expected);
         assert_eq!(menu_shape(&paused), expected);
         assert_eq!(menu_shape(&error), expected);
@@ -546,11 +753,11 @@ mod tests {
         );
         assert_eq!(
             menu_label(&test_tray(TrayState::Listening, None), 11),
-            "Stop listening"
+            "Disconnect"
         );
         assert_eq!(
             menu_label(&test_tray(TrayState::Error, Some("failed")), 11),
-            "Stop listening"
+            "Disconnect"
         );
     }
 
@@ -570,7 +777,7 @@ mod tests {
         let ksni::MenuItem::Standard(pairing) = &menu[10] else {
             panic!("pairing action is not a standard item");
         };
-        assert_eq!(pairing.label, "Pair or replace controller...");
+        assert_eq!(pairing.label, "Pair or replace peer...");
         assert!(pairing.enabled);
 
         let mut connected = test_tray(TrayState::Connected, None);
@@ -587,7 +794,7 @@ mod tests {
         let mut connected = test_tray(TrayState::Connected, None);
         connected.input_forwarding_enabled = false;
         let menu = connected.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[13] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert_eq!(toggle.label, "Forward mouse and keyboard");
@@ -596,9 +803,54 @@ mod tests {
 
         let listening = test_tray(TrayState::Listening, None);
         let menu = listening.menu();
-        let ksni::MenuItem::Checkmark(toggle) = &menu[12] else {
+        let ksni::MenuItem::Checkmark(toggle) = &menu[13] else {
             panic!("input forwarding action is not a checkmark");
         };
         assert!(!toggle.enabled);
+    }
+
+    #[test]
+    fn role_actions_use_device_names_and_committed_selection() {
+        let tray = test_tray(TrayState::Connected, None);
+        let menu = tray.menu();
+        let ksni::MenuItem::RadioGroup(roles) = &menu[12] else {
+            panic!("role actions are not a radio group");
+        };
+        assert_eq!(roles.selected, 0);
+        assert_eq!(roles.options[0].label, "Desk controls Studio");
+        assert_eq!(roles.options[1].label, "Studio controls Desk");
+        assert!(roles.options.iter().all(|option| option.enabled));
+
+        let mut switching = test_tray(TrayState::Connected, None);
+        switching.local_is_controller = false;
+        switching.role_switching = true;
+        let ksni::MenuItem::RadioGroup(roles) = &switching.menu()[12] else {
+            panic!("role actions are not a radio group");
+        };
+        assert_eq!(roles.selected, 1);
+        assert!(roles.options.iter().all(|option| !option.enabled));
+    }
+
+    #[test]
+    fn audio_actions_are_directional_named_and_capability_gated() {
+        let mut tray = test_tray(TrayState::Connected, None);
+        tray.audio_choice = AudioChoice::Peer;
+        tray.local_audio_available = false;
+        let menu = tray.menu();
+        let ksni::MenuItem::Standard(heading) = &menu[15] else {
+            panic!("audio heading is not a standard item");
+        };
+        assert_eq!(heading.label, "Audio routing");
+        assert!(!heading.enabled);
+        let ksni::MenuItem::RadioGroup(audio) = &menu[16] else {
+            panic!("audio actions are not a radio group");
+        };
+        assert_eq!(audio.selected, 2);
+        assert_eq!(audio.options[0].label, "Audio off");
+        assert_eq!(audio.options[1].label, "Desk → Studio");
+        assert_eq!(audio.options[2].label, "Studio → Desk");
+        assert!(audio.options[0].enabled);
+        assert!(!audio.options[1].enabled);
+        assert!(audio.options[2].enabled);
     }
 }

@@ -19,6 +19,8 @@ use tokio::{
 };
 
 #[cfg(target_os = "linux")]
+mod portal_capture;
+#[cfg(target_os = "linux")]
 mod uinput;
 #[cfg(target_os = "linux")]
 mod wayland_virtual_input;
@@ -65,6 +67,8 @@ pub enum LinuxInputError {
 pub type Result<T> = std::result::Result<T, LinuxInputError>;
 
 #[cfg(target_os = "linux")]
+pub use portal_capture::{CaptureEvent, PortalCaptureBackend};
+#[cfg(target_os = "linux")]
 pub use uinput::UinputBackend;
 #[cfg(target_os = "linux")]
 pub use wayland_virtual_input::HyprlandVirtualInputBackend;
@@ -91,6 +95,35 @@ impl HyprlandVirtualInputBackend {
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone)]
 pub struct UinputBackend;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureEvent {
+    Activated {
+        activation_id: u32,
+        edge: edge_protocol::Edge,
+        normalized_position: f32,
+    },
+    Input(InputEvent),
+    Deactivated,
+    EmergencyReleased,
+    LayoutChanged {
+        previous_zone_set: u32,
+        current_zone_set: u32,
+    },
+    BackendFailed(String),
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct PortalCaptureBackend;
+
+#[cfg(not(target_os = "linux"))]
+impl PortalCaptureBackend {
+    pub async fn preflight(_edge: edge_protocol::Edge) -> Result<Self> {
+        Err(LinuxInputError::LibeiUnsupportedPlatform)
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl UinputBackend {

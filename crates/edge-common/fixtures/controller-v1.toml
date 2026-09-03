@@ -1,0 +1,24 @@
+device_name = "Main PC"
+role = "controller"
+release_hotkey = "Ctrl+Alt+Pause"
+
+[peer.laptop]
+host = "192.168.0.11"
+port = 42420
+position = "left"
+pinned_fingerprint = ""
+
+[input]
+backend = "auto"
+game_compatibility = "always-enabled"
+
+[clipboard]
+enabled = true
+images_enabled = true
+max_bytes = 1048576
+max_image_bytes = 4194304
+
+[audio]
+enabled = true
+local_playback = "redirect"
+jitter_target_ms = 60

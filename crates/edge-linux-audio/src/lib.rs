@@ -8,19 +8,21 @@ use std::{
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, FLAG_PROBE, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec, SAMPLES_PER_CHANNEL,
-    SAMPLES_PER_FRAME, SessionSecrets,
+    AudioPacket, FLAG_PROBE, FRAME_MS, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
+    PcmConcealer, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     process::{Child, Command},
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
 const VIRTUAL_SINK: &str = "edge_kvm_remote";
+const PLAYBACK_QUEUE_TARGET_MS: usize = 40;
+const PLAYBACK_QUEUE_FRAMES: usize = PLAYBACK_QUEUE_TARGET_MS / FRAME_MS as usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoutingJournal {
@@ -239,6 +241,172 @@ pub struct LinuxAudioSender {
     routing: AudioRoutingGuard,
 }
 
+pub struct LinuxAudioReceiver {
+    task: Option<JoinHandle<String>>,
+}
+
+impl Drop for LinuxAudioReceiver {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl LinuxAudioReceiver {
+    pub async fn start(
+        socket: Arc<UdpSocket>,
+        source_endpoint: SocketAddr,
+        secrets: SessionSecrets,
+        jitter_target_ms: u32,
+    ) -> Result<Self> {
+        let mut playback = spawn_playback()?;
+        let mut stdin = playback.stdin.take().context("pacat stdin was not piped")?;
+        let cipher = PacketCipher::new(&secrets);
+        let probe = cipher.seal(&AudioPacket {
+            sequence: 0,
+            sample_timestamp: 0,
+            flags: FLAG_PROBE,
+            payload: Vec::new(),
+        })?;
+        socket
+            .send_to(&probe, source_endpoint)
+            .await
+            .context("failed to send Linux playback UDP probe")?;
+
+        let task = tokio::spawn(async move {
+            let mut jitter = JitterBuffer::new(jitter_target_ms);
+            let mut concealer = PcmConcealer::default();
+            let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
+            // pacat deliberately paces writes to the physical audio device. Keep
+            // that backpressure off the UDP receive loop so short scheduler or
+            // sender bursts are absorbed here instead of overflowing the kernel
+            // socket queue and turning into audible packet loss.
+            // The jitter buffer already absorbs network variation. Keep this
+            // queue small so pacat backpressure cannot turn into audible lag.
+            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(PLAYBACK_QUEUE_FRAMES);
+            let mut playback_writer = tokio::spawn(async move {
+                while let Some(encoded) = playback_rx.recv().await {
+                    stdin
+                        .write_all(&encoded)
+                        .await
+                        .map_err(|error| format!("Linux audio playback failed: {error}"))?;
+                }
+                Ok::<(), String>(())
+            });
+            let mut probe_retry = tokio::time::interval(Duration::from_millis(250));
+            let mut watchdog = tokio::time::interval(Duration::from_millis(500));
+            let started = tokio::time::Instant::now();
+            let mut last_media = started;
+            let mut received_media = false;
+            let mut media_stalled = false;
+            let mut playback_queue_drops = 0_u64;
+            let mut last_queue_warning = started;
+            let reason = 'receive: loop {
+                tokio::select! {
+                    received = socket.recv_from(&mut buffer) => {
+                        match received {
+                            Ok((length, source)) if source.ip() == source_endpoint.ip() => match cipher.open(&buffer[..length]) {
+                                Ok(packet) if packet.flags & FLAG_PROBE == 0 => {
+                                    received_media = true;
+                                    last_media = tokio::time::Instant::now();
+                                    if media_stalled {
+                                        tracing::info!("Linux audio media recovered after a UDP gap");
+                                        media_stalled = false;
+                                    }
+                                    if jitter.push(packet) {
+                                        for _ in 0..8 {
+                                            let Some(packet) = jitter.pop_ready() else { break; };
+                                            let pcm = match concealer.decode(packet.as_ref().map(|packet| packet.payload.as_slice())) {
+                                                Ok(pcm) => pcm,
+                                                Err(error) => {
+                                                    tracing::debug!(%error, "rejected PCM audio frame");
+                                                    continue;
+                                                }
+                                            };
+                                            let encoded = match PcmCodec::encode(&pcm) {
+                                                Ok(encoded) => encoded,
+                                                Err(error) => break 'receive format!("Linux PCM playback encoding failed: {error}"),
+                                            };
+                                            match playback_tx.try_send(encoded) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    playback_queue_drops = playback_queue_drops.saturating_add(1);
+                                                    if last_queue_warning.elapsed() >= Duration::from_secs(1) {
+                                                        tracing::warn!(
+                                                            dropped_frames = playback_queue_drops,
+                                                            "Linux audio playback queue saturated; dropping newest frame"
+                                                        );
+                                                        playback_queue_drops = 0;
+                                                        last_queue_warning = tokio::time::Instant::now();
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    break 'receive "Linux audio playback queue closed".to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => tracing::debug!(%error, "rejected Linux audio datagram"),
+                            },
+                            Ok(_) => {}
+                            Err(error) => break format!("Linux audio UDP receive failed: {error}"),
+                        }
+                    }
+                    _ = probe_retry.tick(), if !received_media => {
+                        if let Err(error) = socket.send_to(&probe, source_endpoint).await {
+                            break format!("Linux audio UDP probe retry failed: {error}");
+                        }
+                    }
+                    _ = watchdog.tick() => {
+                        if received_media
+                            && !media_stalled
+                            && last_media.elapsed() > Duration::from_secs(2)
+                        {
+                            // UDP can disappear briefly on Wi-Fi while the encrypted
+                            // control session remains healthy. Keep pacat and the
+                            // negotiated keys alive so playback resumes naturally when
+                            // media returns instead of permanently killing the route.
+                            media_stalled = true;
+                            tracing::warn!("Linux audio media paused after a UDP gap; waiting for recovery");
+                        }
+                        if !received_media && started.elapsed() > Duration::from_secs(8) {
+                            break "audio source did not start within 8 seconds".to_string();
+                        }
+                    }
+                    result = &mut playback_writer => {
+                        break match result {
+                            Ok(Ok(())) => "Linux audio playback stopped unexpectedly".to_string(),
+                            Ok(Err(error)) => error,
+                            Err(error) => format!("Linux audio playback task failed: {error}"),
+                        };
+                    }
+                }
+            };
+            playback_writer.abort();
+            let _ = playback.kill().await;
+            reason
+        });
+        Ok(Self { task: Some(task) })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+
+    pub async fn failure_reason(mut self) -> String {
+        let Some(task) = self.task.take() else {
+            return "Linux audio receiver stopped without a result".to_string();
+        };
+        match task.await {
+            Ok(reason) => reason,
+            Err(error) => format!("Linux audio receiver task failed: {error}"),
+        }
+    }
+}
+
 impl Drop for LinuxAudioSender {
     fn drop(&mut self) {
         self.task.abort();
@@ -341,6 +509,26 @@ fn spawn_capture(source: &str) -> Result<Child> {
     command
         .spawn()
         .context("failed to start parec; install PipeWire PulseAudio tools")
+}
+
+fn spawn_playback() -> Result<Child> {
+    let mut command = Command::new("pacat");
+    command
+        .args([
+            "--playback",
+            "--format=s16le",
+            "--rate=48000",
+            "--channels=2",
+            "--latency-msec=20",
+            "--raw",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+        .spawn()
+        .context("failed to start pacat; install PipeWire PulseAudio tools")
 }
 
 #[cfg(test)]

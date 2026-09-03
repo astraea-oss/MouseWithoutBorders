@@ -15,36 +15,42 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
-use edge_clipboard::ImageTransferSchedule;
 #[cfg(windows)]
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
     IncomingImageTransfer, OutgoingImageTransfer,
 };
-#[cfg(windows)]
 use edge_common::PeerPosition;
 use edge_common::{
-    AppConfig, Role, default_state_dir, detect_primary_local_ip, init_tracing, portable_config_path,
+    AppConfig, AudioRoutePreference, Role, TransportMode, default_state_dir,
+    detect_primary_local_ip, init_tracing, portable_config_path,
 };
-use edge_crypto::{
-    IdentityKey, NoiseReader, NoiseSession, NoiseWriter, initiate_noise_session, pairing_code,
-};
+use edge_crypto::{IdentityKey, NoiseSession, initiate_noise_session, pairing_code};
 #[cfg(windows)]
-use edge_geometry::Size;
-#[cfg(windows)]
+use edge_geometry::{Point, Rect, Size, normalized_perpendicular};
 use edge_protocol::Edge;
 use edge_protocol::{
-    AudioCodec, AudioControl, AudioStopReason, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    Capability, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame, Hello,
-    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, PAIRING_CONFIRMATION_EXTENSION,
-    PROTOCOL_VERSION, PairingEvent, ScreenInfo, decode_frame, encode_frame,
+    AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStopReason, AudioStreamState,
+    CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame,
+    Heartbeat, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton,
+    NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent,
+    RoleEvent, RoleState, RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
+};
+use edge_runtime::{
+    AudioRouteStore, CommittedAudioRoute, CommittedRole, InputDirectionCapabilities,
+    InputEpochGate, LivenessConfig, LivenessEvent, LivenessTracker, RoleCoordinator, RoleDecision,
+    RoleStore, SecureFrameReader, SecureFrameSession, SecureFrameWriter, select_initial_controller,
 };
 use edge_ui::{PairingConfirmationInput, PairingUiState, SettingsUiInput};
 use tokio::{
+    io::{ReadHalf, WriteHalf},
     net::{TcpStream, UdpSocket},
     sync::mpsc,
     time,
 };
+
+type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
+type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
 
 #[cfg(windows)]
 const LIVE_INPUT_QUEUE_CAPACITY: usize = 32;
@@ -58,10 +64,20 @@ const FALLBACK_REMOTE_SIZE: Size = Size {
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIPBOARD_PASTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
-const RECEIVER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
+#[cfg(windows)]
+const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
+#[cfg(windows)]
+const RETURN_EDGE_MARGIN: i32 = 12;
+#[cfg(windows)]
+const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
+const UPGRADE_PEER_STATUS: &str = "Upgrade the other computer";
+static CONNECTOR_SESSION_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Windows controller for edge-kvm")]
+#[command(version, about = "Windows node for edge-kvm")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -69,7 +85,7 @@ struct Args {
     dry_run: bool,
     #[arg(long, help = "Run the Windows tray shell after connecting")]
     tray: bool,
-    #[arg(long, help = "Confirm and replace an unknown or changed laptop key")]
+    #[arg(long, help = "Confirm and replace an unknown or changed peer key")]
     pair: bool,
     #[arg(long, help = "Send one test input event over the encrypted session")]
     test_input: Option<TestInput>,
@@ -117,10 +133,16 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let mut config = load_or_create_config(&config_path).await?;
 
-    if config.role != Role::Controller {
+    if config.transport != TransportMode::Connect {
         anyhow::bail!(
-            "controller requires role = \"controller\" in {}",
+            "controller requires transport = \"connect\" in {}",
             config_path.display()
+        );
+    }
+    if !config.input.capture.output.trim().is_empty() {
+        tracing::warn!(
+            output = %config.input.capture.output,
+            "input.capture.output is Linux-only; Windows keeps using the full virtual desktop"
         );
     }
 
@@ -143,7 +165,10 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
     #[cfg(windows)]
     {
         if run_tray {
-            let mut pairing_armed = args.pair;
+            // A brand-new peer has no identity to replace, so begin the
+            // confirmation flow automatically. Replacing an existing identity
+            // still requires the explicit tray action or --pair.
+            let mut pairing_armed = args.pair || config.peer.pinned_fingerprint.is_empty();
             let (mut connection, pairing_consumed, connect_status) = connect_for_tray(
                 &config,
                 &identity,
@@ -155,7 +180,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             if connection.is_some() || pairing_consumed {
                 pairing_armed = false;
             }
-            let mut connection_enabled = true;
+            let mut connection_enabled = connect_status != UPGRADE_PEER_STATUS;
             let mut input_forwarding_enabled = true;
             let mut next_connect_attempt = if connection.is_some() {
                 Instant::now()
@@ -178,8 +203,14 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
             tracing::info!(%status, "starting tray loop");
             append_portable_log(&controller_log, format!("starting tray loop: {status}"));
             let tray_log = controller_log.clone();
+            let tray_context = edge_windows_input::WindowsTrayContext {
+                transport: format!("Connect: {}:{}", config.peer.host, config.peer.port),
+                input_backend: "Windows hooks / SendInput".to_string(),
+                local_device_name: config.device_name.clone(),
+                peer_device_name: config.peer.name.clone(),
+            };
             std::thread::spawn(move || {
-                if let Err(err) = edge_windows_input::run_tray(&status, win_tray_tx) {
+                if let Err(err) = edge_windows_input::run_tray(&status, win_tray_tx, tray_context) {
                     tracing::warn!(%err, "Windows tray exited with error");
                     append_portable_log(
                         &tray_log,
@@ -233,7 +264,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         connection = None;
                         next_connect_attempt = Instant::now();
                         update_windows_tray_status(
-                            "Pairing: enable pairing on the laptop",
+                            "Pairing: enable pairing on the peer",
                             &controller_log,
                         );
                     }
@@ -241,13 +272,14 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                         input_forwarding_enabled = enabled;
                         update_windows_tray_input_forwarding(enabled, &controller_log);
                     }
-                    TrayCommandOutcome::AudioChanged(enabled) => {
-                        config.audio.enabled = enabled;
+                    TrayCommandOutcome::AudioChanged(choice) => {
+                        config.audio.enabled =
+                            choice != edge_windows_input::WindowsAudioChoice::Off;
                         update_windows_tray_audio(
-                            enabled,
-                            if enabled && connection_enabled {
+                            config.audio.enabled,
+                            if config.audio.enabled && connection_enabled {
                                 "Audio: Starting"
-                            } else if enabled {
+                            } else if config.audio.enabled {
                                 "Audio: Paused"
                             } else {
                                 "Audio: Off"
@@ -255,24 +287,18 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                             &controller_log,
                         );
                     }
+                    TrayCommandOutcome::ControllerRequested(_) => {
+                        tracing::debug!("role selection ignored while no peer session is active");
+                    }
                     TrayCommandOutcome::Continue => {}
                 }
 
-                if let Some((active_connection, screen_info)) = connection.take() {
+                if let Some((active_connection, initial_receiver)) = connection.take() {
                     update_windows_tray_status(&active_connection.status(), &controller_log);
                     match run_connected(
                         active_connection,
                         &config,
-                        screen_info.screen_info,
-                        screen_info.capabilities.contains(&Capability::AudioV1),
-                        screen_info
-                            .extensions
-                            .iter()
-                            .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
-                        screen_info
-                            .extensions
-                            .iter()
-                            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+                        initial_receiver,
                         &mut input_forwarding_enabled,
                         &controller_log,
                         &config_path,
@@ -299,7 +325,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                             connection_enabled = true;
                             next_connect_attempt = Instant::now();
                             update_windows_tray_status(
-                                "Pairing: enable pairing on the laptop",
+                                "Pairing: enable pairing on the peer",
                                 &controller_log,
                             );
                         }
@@ -346,7 +372,11 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
                     pairing_armed = false;
                 }
                 if connection.is_none() {
-                    next_connect_attempt = Instant::now() + Duration::from_secs(2);
+                    if connect_status == UPGRADE_PEER_STATUS {
+                        connection_enabled = false;
+                    } else {
+                        next_connect_attempt = Instant::now() + Duration::from_secs(2);
+                    }
                 }
                 let status = connection
                     .as_ref()
@@ -363,7 +393,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         &identity,
         &config_path,
         &controller_log,
-        args.pair,
+        args.pair || config.peer.pinned_fingerprint.is_empty(),
         &mut pairing_consumed,
     )
     .await?;
@@ -395,16 +425,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         run_connected(
             connection,
             &config,
-            initial_receiver.screen_info,
-            initial_receiver.capabilities.contains(&Capability::AudioV1),
-            initial_receiver
-                .extensions
-                .iter()
-                .any(|extension| extension == INPUT_TOGGLE_EXTENSION),
-            initial_receiver
-                .extensions
-                .iter()
-                .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+            initial_receiver,
             &mut input_forwarding_enabled,
             &controller_log,
             &config_path,
@@ -460,12 +481,21 @@ async fn connect_for_tray(
                 "Identity changed — pair again".to_string()
             } else if message.contains("pairing") || message.contains("not paired") {
                 "Pairing required on both computers".to_string()
+            } else if is_protocol_mismatch_message(&message) {
+                UPGRADE_PEER_STATUS.to_string()
             } else {
                 "Disconnected".to_string()
             };
             (None, pairing_consumed, status)
         }
     }
+}
+
+fn is_protocol_mismatch_message(message: &str) -> bool {
+    message.contains(UPGRADE_PEER_STATUS)
+        || (message.contains("invalid_hello")
+            && message.contains("protocol version")
+            && message.contains("incompatible"))
 }
 
 fn append_portable_log(path: &Path, message: impl AsRef<str>) {
@@ -501,6 +531,25 @@ fn update_windows_tray_audio(enabled: bool, status: &str, log_path: &Path) {
 }
 
 #[cfg(windows)]
+fn update_windows_tray_audio_route(
+    choice: edge_windows_input::WindowsAudioChoice,
+    local_available: bool,
+    peer_available: bool,
+    status: &str,
+    log_path: &Path,
+) {
+    if let Err(err) =
+        edge_windows_input::update_tray_audio_route(choice, local_available, peer_available, status)
+    {
+        tracing::warn!(%err, ?choice, status, "failed to update Windows tray audio route");
+        append_portable_log(
+            log_path,
+            format!("failed to update Windows tray audio route to {status}: {err}"),
+        );
+    }
+}
+
+#[cfg(windows)]
 fn update_windows_tray_input_forwarding(enabled: bool, log_path: &Path) {
     if let Err(err) = edge_windows_input::update_tray_input_forwarding(enabled) {
         tracing::warn!(%err, enabled, "failed to update Windows tray input forwarding state");
@@ -519,7 +568,8 @@ enum TrayCommandOutcome {
     Reconnect,
     Pair,
     InputForwardingChanged(bool),
-    AudioChanged(bool),
+    AudioChanged(edge_windows_input::WindowsAudioChoice),
+    ControllerRequested(edge_windows_input::WindowsControllerChoice),
 }
 
 #[cfg(windows)]
@@ -540,6 +590,8 @@ fn handle_pending_windows_tray_commands(
                 append_portable_log(log_path, "opening settings window");
                 edge_ui::spawn_settings_window(SettingsUiInput {
                     role: Role::Controller,
+                    can_choose_transport: false,
+                    restart_on_save: false,
                     config_path: config_path.to_path_buf(),
                     local_ip: detect_primary_local_ip(),
                     pairing: controller_pairing_state(&config),
@@ -566,18 +618,13 @@ fn handle_pending_windows_tray_commands(
                 append_portable_log(log_path, format!("input forwarding toggled to {enabled}"));
                 return Ok(TrayCommandOutcome::InputForwardingChanged(enabled));
             }
-            edge_windows_input::WindowsTrayCommand::ToggleAudio => {
-                let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|err| {
-                    tracing::warn!(%err, "failed to reload config for audio toggle");
-                    config.clone()
-                });
-                updated.audio.enabled = !updated.audio.enabled;
-                updated.save_blocking(config_path)?;
-                append_portable_log(
-                    log_path,
-                    format!("audio streaming toggled to {}", updated.audio.enabled),
-                );
-                return Ok(TrayCommandOutcome::AudioChanged(updated.audio.enabled));
+            edge_windows_input::WindowsTrayCommand::SetAudio(choice) => {
+                append_portable_log(log_path, format!("audio route requested: {choice:?}"));
+                return Ok(TrayCommandOutcome::AudioChanged(choice));
+            }
+            edge_windows_input::WindowsTrayCommand::SetController(choice) => {
+                append_portable_log(log_path, format!("controller role requested: {choice:?}"));
+                return Ok(TrayCommandOutcome::ControllerRequested(choice));
             }
             edge_windows_input::WindowsTrayCommand::Quit => {
                 append_portable_log(log_path, "quit requested from tray");
@@ -591,12 +638,10 @@ fn handle_pending_windows_tray_commands(
 
 #[cfg(windows)]
 fn controller_pairing_state(config: &AppConfig) -> PairingUiState {
-    if let Some(peer) = &config.peer.laptop
-        && !peer.pinned_fingerprint.trim().is_empty()
-    {
+    if !config.peer.pinned_fingerprint.trim().is_empty() {
         return PairingUiState::Paired {
-            peer_name: "laptop".to_string(),
-            peer_fingerprint: peer.pinned_fingerprint.clone(),
+            peer_name: config.peer.name.clone(),
+            peer_fingerprint: config.peer.pinned_fingerprint.clone(),
         };
     }
 
@@ -613,6 +658,8 @@ fn install_controller_panic_log(log_path: PathBuf) {
 
 struct ControllerConnection {
     session: NoiseSession<TcpStream>,
+    local_name: String,
+    local_fingerprint: String,
     addr: String,
     peer_addr: std::net::SocketAddr,
     peer_fingerprint: String,
@@ -640,7 +687,7 @@ async fn connect_and_initialize(
             match read_secure_frame(&mut connection.session).await? {
                 Frame::Hello(hello) => break Ok(hello),
                 Frame::Error(error) => {
-                    anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+                    anyhow::bail!("peer error: {}: {}", error.code, error.message)
                 }
                 frame => tracing::debug!(?frame, "waiting for receiver hello"),
             }
@@ -651,9 +698,11 @@ async fn connect_and_initialize(
     validate_receiver_hello(&hello, &connection.peer_fingerprint)?;
 
     let mut initial = InitialReceiverState {
+        peer_name: hello.device_name.clone(),
         screen_info: None,
-        capabilities: hello.capabilities.clone(),
+        node_capabilities: hello.node_capabilities.clone(),
         extensions: hello.extensions.clone(),
+        role_state: None,
     };
     let supports_confirmation = hello
         .extensions
@@ -685,11 +734,7 @@ async fn connect_and_initialize(
 
             #[cfg(windows)]
             update_windows_tray_status("Pairing: compare the code on both computers", log_path);
-            let peer = config
-                .peer
-                .laptop
-                .as_ref()
-                .context("missing [peer.laptop] config")?;
+            let peer = &config.peer;
             let previous_peer_fingerprint = (!peer.pinned_fingerprint.is_empty()
                 && peer.pinned_fingerprint != connection.peer_fingerprint)
                 .then(|| peer.pinned_fingerprint.clone());
@@ -719,34 +764,89 @@ async fn connect_and_initialize(
                 anyhow::bail!("pairing was cancelled on this computer");
             }
             if !read_pairing_decision(&mut connection.session).await? {
-                anyhow::bail!("pairing was declined on the laptop");
+                anyhow::bail!("pairing was declined on the peer");
             }
 
             let mut updated = AppConfig::load(config_path).await.unwrap_or_else(|error| {
                 tracing::warn!(%error, "failed to reload controller config before saving pin");
                 config.clone()
             });
-            let peer = updated
-                .peer
-                .laptop
-                .as_mut()
-                .context("missing [peer.laptop] config")?;
-            peer.pinned_fingerprint = connection.peer_fingerprint.clone();
+            updated.peer.pinned_fingerprint = connection.peer_fingerprint.clone();
             updated.save(config_path).await?;
             connection.peer_trusted = true;
             append_portable_log(
                 log_path,
                 format!(
-                    "paired laptop {} ({}) after confirmation on both computers",
+                    "paired peer {} ({}) after confirmation on both computers",
                     hello.device_name, connection.peer_fingerprint
                 ),
             );
         }
     } else if !connection.peer_trusted {
         anyhow::bail!(
-            "the laptop does not support two-sided pairing confirmation; update it before replacing its key"
+            "the peer does not support two-sided pairing confirmation; update it before replacing its key"
         );
     }
+
+    let local_fingerprint = identity.fingerprint();
+    let peer_can_capture = hello
+        .node_capabilities
+        .contains(&NodeCapability::InputCaptureV1);
+    let peer_can_inject = hello
+        .node_capabilities
+        .contains(&NodeCapability::InputInjectV1);
+    let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let persisted = role_store.load().await.unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to read committed role state; using fresh-pair selection");
+        None
+    });
+    let selected_controller = persisted
+        .filter(|role| role.belongs_to(&local_fingerprint, &connection.peer_fingerprint))
+        .map(|role| role.controller_fingerprint)
+        .or_else(|| {
+            select_initial_controller(
+                &local_fingerprint,
+                &connection.peer_fingerprint,
+                config.preferred_role == Role::Controller,
+                InputDirectionCapabilities {
+                    controller_can_capture: true,
+                    receiver_can_inject: peer_can_inject,
+                },
+                InputDirectionCapabilities {
+                    controller_can_capture: peer_can_capture,
+                    receiver_can_inject: true,
+                },
+            )
+            .map(str::to_string)
+        });
+    if let Some(controller) = &selected_controller {
+        role_store
+            .save(&CommittedRole::new(controller))
+            .await
+            .context("failed to persist initial controller assignment")?;
+    } else {
+        role_store.clear().await.ok();
+    }
+    let role_state = RoleState {
+        controller_fingerprint: selected_controller,
+        role_epoch: INITIAL_ROLE_EPOCH,
+        transition: RoleTransitionState::Stable,
+        listener_position: peer_position_to_edge(config.layout.listener_position),
+        paused: CONNECTOR_SESSION_PAUSED.load(std::sync::atomic::Ordering::Acquire),
+        failure_detail: None,
+    };
+    write_secure_frame(
+        &mut connection.session,
+        &Frame::Role(RoleEvent::SessionState(role_state.clone())),
+    )
+    .await?;
+    initial.role_state = Some(role_state);
+    #[cfg(windows)]
+    write_secure_frame(
+        &mut connection.session,
+        &Frame::ScreenInfo(edge_windows_input::screen_info()),
+    )
+    .await?;
 
     read_initial_frames(&mut connection.session, &mut initial).await?;
     Ok((connection, initial))
@@ -755,13 +855,10 @@ async fn connect_and_initialize(
 fn validate_receiver_hello(hello: &Hello, noise_fingerprint: &str) -> Result<()> {
     if hello.protocol_version != PROTOCOL_VERSION {
         anyhow::bail!(
-            "receiver protocol version {} is incompatible with {}",
+            "Upgrade the other computer: receiver protocol version {} is incompatible with {}",
             hello.protocol_version,
             PROTOCOL_VERSION
         );
-    }
-    if hello.role != Role::Receiver {
-        anyhow::bail!("connected peer did not identify itself as a receiver");
     }
     if hello.public_key_fingerprint != noise_fingerprint {
         anyhow::bail!("receiver hello fingerprint does not match its encrypted identity");
@@ -773,7 +870,7 @@ async fn read_pairing_status(session: &mut NoiseSession<TcpStream>) -> Result<(b
     match time::timeout(Duration::from_secs(15), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Status { trusted, armed }))) => Ok((trusted, armed)),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
         Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing status, got {frame:?}"),
         Ok(Err(error)) => Err(error).context("failed to read receiver pairing status"),
@@ -785,11 +882,11 @@ async fn read_pairing_decision(session: &mut NoiseSession<TcpStream>) -> Result<
     match time::timeout(Duration::from_secs(120), read_secure_frame(session)).await {
         Ok(Ok(Frame::Pairing(PairingEvent::Decision { accepted }))) => Ok(accepted),
         Ok(Ok(Frame::Error(error))) => {
-            anyhow::bail!("receiver error: {}: {}", error.code, error.message)
+            anyhow::bail!("peer error: {}: {}", error.code, error.message)
         }
         Ok(Ok(frame)) => anyhow::bail!("expected receiver pairing decision, got {frame:?}"),
         Ok(Err(error)) => Err(error).context("failed to read receiver pairing decision"),
-        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the laptop"),
+        Err(_) => anyhow::bail!("timed out waiting for pairing confirmation on the peer"),
     }
 }
 
@@ -798,11 +895,7 @@ async fn connect_session(
     identity: &IdentityKey,
     pairing_armed: bool,
 ) -> Result<ControllerConnection> {
-    let peer = config
-        .peer
-        .laptop
-        .as_ref()
-        .context("missing [peer.laptop] config")?;
+    let peer = &config.peer;
     let addr = format!("{}:{}", peer.host, peer.port);
     let stream = time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
@@ -820,14 +913,14 @@ async fn connect_session(
     .context("encrypted handshake timed out")?
             .with_context(|| {
                 format!(
-                    "failed encrypted handshake with {addr}; if this laptop was reset, choose 'Pair or replace laptop...' from the tray on both computers"
+                    "failed encrypted handshake with {addr}; if this peer was reset, choose 'Pair or replace peer...' from the tray on both computers"
                 )
             })?;
     let peer_trusted =
         !peer.pinned_fingerprint.is_empty() && peer.pinned_fingerprint == peer_fingerprint;
     if !peer_trusted && !pairing_armed {
         anyhow::bail!(
-            "the laptop at {addr} is not paired; choose 'Pair or replace laptop...' from both tray menus"
+            "the peer at {addr} is not paired; choose 'Pair or replace peer...' from both tray menus"
         );
     }
 
@@ -836,13 +929,22 @@ async fn connect_session(
         &Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             device_name: config.device_name.clone(),
-            role: Role::Controller,
+            role: config.preferred_role,
             public_key_fingerprint: identity.fingerprint(),
-            capabilities: vec![Capability::AudioV1],
+            capabilities: Vec::new(),
             extensions: vec![
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                AUDIO_ROUTE_EXTENSION.to_string(),
+            ],
+            node_capabilities: vec![
+                NodeCapability::InputCaptureV1,
+                NodeCapability::InputInjectV1,
+                NodeCapability::RoleSwitchV1,
+                NodeCapability::ScreenInfoBothSidesV1,
+                NodeCapability::AudioCaptureV1,
+                NodeCapability::AudioPlaybackV1,
             ],
         }),
     )
@@ -851,6 +953,8 @@ async fn connect_session(
     tracing::info!(%addr, %peer_fingerprint, "sent encrypted controller hello");
     Ok(ControllerConnection {
         session,
+        local_name: config.device_name.clone(),
+        local_fingerprint: identity.fingerprint(),
         addr,
         peer_addr,
         peer_fingerprint,
@@ -861,9 +965,11 @@ async fn connect_session(
 
 #[derive(Debug, Default)]
 struct InitialReceiverState {
+    peer_name: String,
     screen_info: Option<ScreenInfo>,
-    capabilities: Vec<Capability>,
+    node_capabilities: Vec<NodeCapability>,
     extensions: Vec<String>,
+    role_state: Option<RoleState>,
 }
 
 async fn read_initial_frames(
@@ -878,7 +984,8 @@ async fn read_initial_frames(
                     fingerprint = %hello.public_key_fingerprint,
                     "receiver hello"
                 );
-                initial.capabilities = hello.capabilities;
+                initial.peer_name = hello.device_name;
+                initial.node_capabilities = hello.node_capabilities;
                 initial.extensions = hello.extensions;
             }
             Ok(Frame::ScreenInfo(info)) => {
@@ -892,7 +999,7 @@ async fn read_initial_frames(
             }
             Ok(Frame::Heartbeat(_)) => return Ok(()),
             Ok(Frame::Error(err)) => {
-                anyhow::bail!("receiver error: {}: {}", err.code, err.message)
+                anyhow::bail!("peer error: {}: {}", err.code, err.message)
             }
             Ok(frame) => tracing::debug!(?frame, "initial receiver frame"),
             Err(err) => return Err(err).context("failed to read receiver frame"),
@@ -901,60 +1008,93 @@ async fn read_initial_frames(
 }
 
 async fn send_test_input(session: &mut NoiseSession<TcpStream>, test: TestInput) -> Result<()> {
+    write_secure_frame(
+        session,
+        &Frame::control(
+            INITIAL_ROLE_EPOCH,
+            ControlEvent::EnterRemote {
+                edge: Edge::Left,
+                normalized_position: 0.5,
+            },
+        ),
+    )
+    .await?;
     match test {
         TestInput::Pointer => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerMotion { dx: 80.0, dy: 0.0 }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerMotion { dx: 80.0, dy: 0.0 },
+                ),
             )
             .await?;
         }
         TestInput::Click => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerButton {
-                    button: MouseButton::Left,
-                    down: true,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerButton {
+                        button: MouseButton::Left,
+                        down: true,
+                    },
+                ),
             )
             .await?;
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerButton {
-                    button: MouseButton::Left,
-                    down: false,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerButton {
+                        button: MouseButton::Left,
+                        down: false,
+                    },
+                ),
             )
             .await?;
         }
         TestInput::Wheel => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::PointerWheel { x: 0.0, y: -1.0 }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::PointerWheel { x: 0.0, y: -1.0 },
+                ),
             )
             .await?;
         }
         TestInput::Key => {
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::Key {
-                    evdev_code: 30,
-                    down: true,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: true,
+                    },
+                ),
             )
             .await?;
             write_secure_frame(
                 session,
-                &Frame::Input(InputEvent::Key {
-                    evdev_code: 30,
-                    down: false,
-                }),
+                &Frame::input(
+                    INITIAL_ROLE_EPOCH,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: false,
+                    },
+                ),
             )
             .await?;
         }
     }
 
-    write_secure_frame(session, &Frame::Input(InputEvent::AllKeysUp)).await?;
+    write_secure_frame(
+        session,
+        &Frame::input(INITIAL_ROLE_EPOCH, InputEvent::AllKeysUp),
+    )
+    .await?;
     tracing::info!(?test, "sent test input");
     Ok(())
 }
@@ -972,10 +1112,7 @@ enum ConnectedSessionExit {
 async fn run_connected(
     connection: ControllerConnection,
     config: &AppConfig,
-    screen_info: Option<ScreenInfo>,
-    peer_supports_audio: bool,
-    peer_supports_input_toggle: bool,
-    peer_supports_images: bool,
+    initial_receiver: InitialReceiverState,
     input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
@@ -984,10 +1121,7 @@ async fn run_connected(
     let result = run_connected_inner(
         connection,
         config,
-        screen_info,
-        peer_supports_audio,
-        peer_supports_input_toggle,
-        peer_supports_images,
+        initial_receiver,
         input_forwarding_enabled,
         log_path,
         config_path,
@@ -1003,23 +1137,92 @@ async fn run_connected(
 async fn run_connected_inner(
     connection: ControllerConnection,
     config: &AppConfig,
-    screen_info: Option<ScreenInfo>,
-    peer_supports_audio: bool,
-    peer_supports_input_toggle: bool,
-    peer_supports_images: bool,
+    initial_receiver: InitialReceiverState,
     input_forwarding_enabled: &mut bool,
     log_path: &Path,
     config_path: &Path,
     mut tray_commands: Option<&mut mpsc::UnboundedReceiver<edge_windows_input::WindowsTrayCommand>>,
 ) -> Result<ConnectedSessionExit> {
+    let connection_status = connection.status();
+    let peer_supports_audio_capture = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::AudioCaptureV1);
+    let peer_supports_audio_playback = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::AudioPlaybackV1);
+    let peer_supports_audio_route = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == AUDIO_ROUTE_EXTENSION);
+    let peer_supports_input_toggle = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == INPUT_TOGGLE_EXTENSION);
+    let peer_supports_images = initial_receiver
+        .extensions
+        .iter()
+        .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+    let screen_info = initial_receiver.screen_info.clone();
+    let initial_role_state = initial_receiver
+        .role_state
+        .clone()
+        .context("connector did not initialize role state")?;
+    let peer_supports_role_switch = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::RoleSwitchV1);
+    let peer_supports_input_capture = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::InputCaptureV1);
+    let peer_supports_input_injection = initial_receiver
+        .node_capabilities
+        .contains(&NodeCapability::InputInjectV1);
+    let role_switch_available =
+        peer_supports_role_switch && peer_supports_input_capture && peer_supports_input_injection;
+    let local_name = connection.local_name.clone();
+    let local_fingerprint = connection.local_fingerprint.clone();
+    let peer_name = initial_receiver.peer_name.clone();
+    let peer_fingerprint = connection.peer_fingerprint.clone();
+    let mut coordinator = RoleCoordinator::new(
+        local_fingerprint.clone(),
+        peer_fingerprint.clone(),
+        initial_role_state.controller_fingerprint.clone(),
+        initial_role_state.role_epoch,
+        initial_role_state.listener_position,
+        initial_role_state.paused,
+    )?;
+    let mut role_epoch = initial_role_state.role_epoch;
+    let mut local_is_controller =
+        initial_role_state.controller_fingerprint.as_deref() == Some(local_fingerprint.as_str());
+    let mut session_paused = initial_role_state.paused;
+    let mut input_epoch = InputEpochGate::default();
+    let mut injector = edge_windows_input::WindowsInputInjector::new()
+        .context("failed to initialize Windows input injection")?;
+    let mut return_watcher = WindowsRemoteReturnWatcher::new(edge_windows_input::screen_info());
+    let mut pending_role_readiness: Option<(bool, bool, Option<String>)> = None;
+    let mut transition_deadline: Option<tokio::time::Instant> = None;
+    let role_store = RoleStore::new(default_state_dir().join("role.toml"));
+    let mut pending_role_persistence: Option<(u64, String)> = None;
+    let audio_route_store = AudioRouteStore::new(default_state_dir().join("audio.toml"));
     tracing::info!(status = %connection.status(), "connected; press Ctrl+C to quit");
     append_portable_log(
         log_path,
         format!("connected session started: {}", connection.status()),
     );
     let mut input_rx = start_live_input(config, screen_info)?;
-    edge_windows_input::set_forwarding_enabled(*input_forwarding_enabled);
+    edge_windows_input::set_forwarding_enabled(
+        local_is_controller && *input_forwarding_enabled && !session_paused,
+    );
     update_windows_tray_input_forwarding(*input_forwarding_enabled, log_path);
+    edge_windows_input::update_tray_role(
+        &local_name,
+        &peer_name,
+        local_is_controller,
+        role_switch_available && !session_paused,
+        false,
+    )?;
+    if session_paused {
+        update_windows_tray_status("Disconnected by user", log_path);
+    }
     let mut runtime_config = config.clone();
     let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images).await?;
     let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
@@ -1031,53 +1234,100 @@ async fn run_connected_inner(
     let mut config_refresh = time::interval(Duration::from_millis(500));
     let mut audio_watch = time::interval(Duration::from_millis(500));
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
-    let (reader, writer) = connection.session.split();
-    let mut writer = ScheduledNoiseWriter::new(writer);
+    let (reader, mut writer) = SecureFrameSession::new(connection.session).split();
     let mut receiver_rx = spawn_receiver_reader(reader);
     let mut tray_command_poll = time::interval(Duration::from_millis(200));
-    let mut connection_watchdog = time::interval(Duration::from_secs(1));
-    let mut last_receiver_activity = Instant::now();
+    let liveness_config = LivenessConfig::default();
+    let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
+    tokio::pin!(heartbeat);
+    let mut heartbeat_sequence = 0_u64;
+    let mut connection_watchdog = time::interval(Duration::from_millis(250));
+    connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut receiver_liveness = LivenessTracker::new(liveness_config, tokio::time::Instant::now());
     let peer_ip = connection.peer_addr.ip();
     let mut _audio_receiver: Option<edge_windows_audio::WindowsAudioReceiver> = None;
+    let mut _audio_sender: Option<edge_windows_audio::WindowsAudioSender> = None;
+    let mut pending_audio_socket: Option<std::sync::Arc<UdpSocket>> = None;
     let mut audio_restart_attempted = false;
-    let mut audio_enabled = runtime_config.audio.enabled;
-    if peer_supports_audio {
+    let stored_audio_route = audio_route_store
+        .load()
+        .await
+        .context("failed to load committed audio route")?
+        .filter(|route| route.belongs_to(&local_fingerprint, &peer_fingerprint));
+    let mut audio_source = match stored_audio_route.as_ref() {
+        Some(route) => route.source_fingerprint.clone(),
+        None => match runtime_config.audio.route {
+            Some(AudioRoutePreference::Disabled) => None,
+            Some(AudioRoutePreference::LocalToPeer) => Some(local_fingerprint.clone()),
+            Some(AudioRoutePreference::PeerToLocal) => Some(peer_fingerprint.clone()),
+            None if runtime_config.audio.enabled => Some(peer_fingerprint.clone()),
+            None => None,
+        },
+    };
+    if audio_source.as_deref() == Some(local_fingerprint.as_str())
+        && (!peer_supports_audio_playback || !peer_supports_audio_route)
+        || audio_source.as_deref() == Some(peer_fingerprint.as_str())
+            && !peer_supports_audio_capture
+    {
+        audio_source = None;
+    }
+    if stored_audio_route.is_none() {
+        let committed = audio_source.clone().map_or_else(
+            CommittedAudioRoute::disabled,
+            CommittedAudioRoute::from_source,
+        );
+        audio_route_store
+            .save(&committed)
+            .await
+            .context("failed to persist initial audio route")?;
+    }
+    let mut audio_enabled = audio_source.is_some();
+    let audio_choice = windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint);
+    update_windows_tray_audio_route(
+        audio_choice,
+        peer_supports_audio_playback && peer_supports_audio_route,
+        peer_supports_audio_capture,
+        if audio_enabled {
+            "Audio: Starting"
+        } else {
+            "Audio: Off"
+        },
+        log_path,
+    );
+    if !session_paused {
         append_portable_log(
             log_path,
-            format!("requesting Linux audio enabled={audio_enabled}"),
+            format!("committing audio source {audio_source:?}"),
         );
-        update_windows_tray_audio(
-            audio_enabled,
-            if audio_enabled {
-                "Audio: Starting"
-            } else {
-                "Audio: Off"
-            },
-            log_path,
-        );
-        write_secure_frame_writer(
+        send_windows_audio_route(
             &mut writer,
-            &Frame::Audio(AudioControl::SetEnabled {
-                enabled: audio_enabled,
-            }),
+            peer_supports_audio_route,
+            &audio_source,
+            &peer_fingerprint,
         )
         .await?;
-    } else {
-        append_portable_log(log_path, "receiver does not advertise AudioV1");
-        update_windows_tray_audio(audio_enabled, "Audio: Unsupported by receiver", log_path);
+        if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+            pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+        }
+    } else if session_paused {
+        update_windows_tray_audio(audio_enabled, "Audio: Paused", log_path);
     }
     if peer_supports_input_toggle {
         write_secure_frame_writer(
             &mut writer,
-            &Frame::Control(ControlEvent::SetInputForwarding {
-                enabled: *input_forwarding_enabled,
-            }),
+            &Frame::control(
+                role_epoch,
+                ControlEvent::SetInputForwarding {
+                    enabled: *input_forwarding_enabled,
+                },
+            ),
         )
         .await?;
     }
 
     loop {
-        if writer.bulk_is_due()
+        if !session_paused
+            && writer.bulk_is_due()
             && let Some((frame, completed)) = live_clipboard.next_image_frame()
         {
             write_secure_frame_writer(&mut writer, &frame).await?;
@@ -1096,8 +1346,13 @@ async fn run_connected_inner(
         tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => {
-                write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
-                if peer_supports_audio {
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::input(role_epoch, InputEvent::AllKeysUp),
+                )
+                .await
+                .ok();
+                if audio_enabled {
                     write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                 }
                 tracing::info!("shutdown requested");
@@ -1130,43 +1385,62 @@ async fn run_connected_inner(
                         .expect("finished Windows audio receiver disappeared")
                         .failure_reason()
                         .await;
-                    if audio_enabled && peer_supports_audio && !audio_restart_attempted {
+                    if audio_source.as_deref() == Some(peer_fingerprint.as_str()) && !audio_restart_attempted {
                         audio_restart_attempted = true;
                         update_windows_tray_audio(true, "Audio: Restarting", log_path);
                         append_portable_log(log_path, format!("Windows audio media stopped ({failure}); requesting one restart"));
-                        write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
+                        send_windows_audio_route(&mut writer, peer_supports_audio_route, &audio_source, &peer_fingerprint).await?;
                     } else {
                         update_windows_tray_audio(audio_enabled, &format!("Audio error: {failure}"), log_path);
                         append_portable_log(log_path, format!("Windows audio transport stopped: {failure}"));
                         write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::TransportFailure })).await.ok();
                     }
                 }
+                if _audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
+                    let failure = _audio_sender.as_mut().expect("finished Windows audio sender disappeared").failure_reason().await;
+                    _audio_sender = None;
+                    append_portable_log(log_path, format!("Windows audio capture stopped: {failure}"));
+                    if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !audio_restart_attempted {
+                        audio_restart_attempted = true;
+                        pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                    } else {
+                        update_windows_tray_audio(true, &format!("Audio error: {failure}"), log_path);
+                    }
+                }
             },
             _ = config_refresh.tick() => {
                 match AppConfig::load(config_path).await {
                     Ok(updated) => {
-                        if updated.audio.enabled != audio_enabled {
-                            audio_enabled = updated.audio.enabled;
-                            audio_restart_attempted = false;
-                            if !audio_enabled {
-                                _audio_receiver = None;
-                            }
-                            update_windows_tray_audio(
-                                audio_enabled,
-                                if audio_enabled && peer_supports_audio { "Audio: Starting" } else if audio_enabled { "Audio: Unsupported by receiver" } else { "Audio: Off" },
-                                log_path,
-                            );
-                            append_portable_log(log_path, format!("applied saved audio setting enabled={audio_enabled}"));
-                            if peer_supports_audio {
-                                write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: audio_enabled })).await?;
-                            }
-                        }
                         runtime_config = updated;
                     }
                     Err(error) => tracing::warn!(%error, "failed to reload controller config"),
                 }
             },
             _ = connection_watchdog.tick() => {
+                if transition_deadline.is_some_and(|deadline| {
+                    tokio::time::Instant::now() >= deadline
+                }) && coordinator.is_transitioning() {
+                    transition_deadline = None;
+                    pending_role_readiness = None;
+                    let abort = coordinator.abort("peer did not complete role preflight in time")?;
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::Role(RoleEvent::Abort(abort)),
+                    )
+                    .await
+                    .ok();
+                    edge_windows_input::set_forwarding_enabled(
+                        local_is_controller && *input_forwarding_enabled && !session_paused,
+                    );
+                    edge_windows_input::update_tray_role(
+                        &local_name,
+                        &peer_name,
+                        local_is_controller,
+                        role_switch_available && !session_paused,
+                        false,
+                    )?;
+                    update_windows_tray_status("Connected: role switch timed out", log_path);
+                }
                 if let Some(transfer_id) = live_clipboard.incoming.expire_transfer_id() {
                     tracing::warn!(transfer_id, "expired incomplete receiver clipboard image");
                     write_secure_frame_writer(
@@ -1178,14 +1452,54 @@ async fn run_connected_inner(
                     )
                     .await?;
                 }
-                if last_receiver_activity.elapsed() > RECEIVER_STALL_TIMEOUT {
-                    anyhow::bail!(
-                        "receiver stopped responding for {:?}; reconnecting",
-                        last_receiver_activity.elapsed()
-                    );
+                let input_active = if local_is_controller {
+                    edge_windows_input::capture_stats().active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                match receiver_liveness.poll(tokio::time::Instant::now(), input_active) {
+                    Some(LivenessEvent::SoftInputTimeout) => {
+                        if local_is_controller {
+                            edge_windows_input::force_release_to_local();
+                        } else {
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                        }
+                        tracing::warn!("peer was silent for one second; released active input direction while keeping the session available");
+                        append_portable_log(log_path, "peer liveness soft timeout; released active input direction");
+                    }
+                    Some(LivenessEvent::HardSessionTimeout) => {
+                        anyhow::bail!(
+                            "peer stopped responding for {:?}; reconnecting",
+                            receiver_liveness.elapsed(tokio::time::Instant::now())
+                        );
+                    }
+                    None => {}
                 }
             },
+            _ = &mut heartbeat => {
+                heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                )
+                .await?;
+                let input_active = if local_is_controller {
+                    edge_windows_input::capture_stats().active
+                } else {
+                    input_epoch.accepts_input()
+                };
+                heartbeat.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + liveness_config.heartbeat_interval(
+                            input_active || coordinator.is_transitioning(),
+                        ),
+                );
+            },
             _ = clipboard_poll.tick() => {
+                if session_paused {
+                    continue;
+                }
                 match live_clipboard.local_change_offer(&runtime_config).await {
                     Ok(frames) => for frame in frames {
                         write_secure_frame_writer(&mut writer, &frame).await?;
@@ -1207,24 +1521,104 @@ async fn run_connected_inner(
                         *input_forwarding_enabled,
                     )? {
                         TrayCommandOutcome::Quit => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
-                            if peer_supports_audio {
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
+                            if audio_enabled {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::Shutdown })).await.ok();
                             }
                             return Ok(ConnectedSessionExit::Quit);
                         }
                         TrayCommandOutcome::Disconnect => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
-                            if peer_supports_audio {
+                            if role_switch_available && !coordinator.is_transitioning() {
+                                coordinator.set_paused(true)?;
+                                session_paused = true;
+                                CONNECTOR_SESSION_PAUSED
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                edge_windows_input::force_release_to_local();
+                                edge_windows_input::set_forwarding_enabled(false);
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::SetPaused { paused: true }),
+                                )
+                                .await?;
+                                if audio_enabled {
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
+                                }
+                                _audio_receiver = None;
+                                _audio_sender = None;
+                                pending_audio_socket = None;
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    false,
+                                    false,
+                                )?;
+                                update_windows_tray_status("Disconnected by user", log_path);
+                                continue;
+                            }
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
+                            if audio_enabled {
                                 write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::UserRequest })).await.ok();
                             }
                             _audio_receiver = None;
+                            _audio_sender = None;
                             edge_windows_input::force_release_to_local();
                             return Ok(ConnectedSessionExit::Disconnect);
                         }
-                        TrayCommandOutcome::Reconnect => {}
+                        TrayCommandOutcome::Reconnect => {
+                            if role_switch_available {
+                                coordinator.set_paused(false)?;
+                                session_paused = false;
+                                CONNECTOR_SESSION_PAUSED
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::SetPaused { paused: false }),
+                                )
+                                .await?;
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller && *input_forwarding_enabled,
+                                );
+                                if audio_enabled {
+                                    send_windows_audio_route(
+                                        &mut writer,
+                                        peer_supports_audio_route,
+                                        &audio_source,
+                                        &peer_fingerprint,
+                                    ).await?;
+                                    if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                        pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                                    }
+                                }
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available,
+                                    false,
+                                )?;
+                                update_windows_tray_status(&connection_status, log_path);
+                            }
+                        }
                         TrayCommandOutcome::Pair => {
-                            write_secure_frame_writer(&mut writer, &Frame::Input(InputEvent::AllKeysUp)).await.ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::input(role_epoch, InputEvent::AllKeysUp),
+                            )
+                            .await
+                            .ok();
                             edge_windows_input::force_release_to_local();
                             return Ok(ConnectedSessionExit::Pair);
                         }
@@ -1232,29 +1626,104 @@ async fn run_connected_inner(
                             if !enabled {
                                 write_secure_frame_writer(
                                     &mut writer,
-                                    &Frame::Input(InputEvent::AllKeysUp),
+                                    &Frame::input(role_epoch, InputEvent::AllKeysUp),
                                 )
                                 .await?;
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
                             }
                             *input_forwarding_enabled = enabled;
-                            edge_windows_input::set_forwarding_enabled(enabled);
+                            edge_windows_input::set_forwarding_enabled(
+                                local_is_controller && enabled && !session_paused,
+                            );
                             update_windows_tray_input_forwarding(enabled, log_path);
                             if peer_supports_input_toggle {
                                 write_secure_frame_writer(
                                     &mut writer,
-                                    &Frame::Control(ControlEvent::SetInputForwarding { enabled }),
+                                    &Frame::control(
+                                        role_epoch,
+                                        ControlEvent::SetInputForwarding { enabled },
+                                    ),
                                 )
                                 .await?;
                             }
                         }
-                        TrayCommandOutcome::AudioChanged(enabled) => {
-                            audio_enabled = enabled;
+                        TrayCommandOutcome::AudioChanged(choice) => {
+                            let requested_source = match choice {
+                                edge_windows_input::WindowsAudioChoice::Off => None,
+                                edge_windows_input::WindowsAudioChoice::Local if peer_supports_audio_playback && peer_supports_audio_route => Some(local_fingerprint.clone()),
+                                edge_windows_input::WindowsAudioChoice::Peer if peer_supports_audio_capture => Some(peer_fingerprint.clone()),
+                                _ => {
+                                    update_windows_tray_audio_route(
+                                        windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                                        peer_supports_audio_playback && peer_supports_audio_route,
+                                        peer_supports_audio_capture,
+                                        "Audio: Direction unavailable",
+                                        log_path,
+                                    );
+                                    continue;
+                                }
+                            };
+                            audio_source = requested_source;
+                            audio_enabled = audio_source.is_some();
                             audio_restart_attempted = false;
-                            if !enabled { _audio_receiver = None; }
-                            runtime_config.audio.enabled = enabled;
-                            update_windows_tray_audio(enabled, if enabled { "Audio: Starting" } else { "Audio: Off" }, log_path);
-                            if peer_supports_audio {
-                                write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled })).await?;
+                            _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
+                            runtime_config.audio.enabled = audio_enabled;
+                            let committed = audio_source.clone().map_or_else(CommittedAudioRoute::disabled, CommittedAudioRoute::from_source);
+                            audio_route_store.save(&committed).await?;
+                            update_windows_tray_audio_route(
+                                choice,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                if audio_enabled { "Audio: Starting" } else { "Audio: Off" },
+                                log_path,
+                            );
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                            }
+                        }
+                        TrayCommandOutcome::ControllerRequested(choice) => {
+                            let requested = match choice {
+                                edge_windows_input::WindowsControllerChoice::Local => {
+                                    local_fingerprint.as_str()
+                                }
+                                edge_windows_input::WindowsControllerChoice::Peer => {
+                                    peer_fingerprint.as_str()
+                                }
+                            };
+                            if !session_paused
+                                && role_switch_available
+                                && !coordinator.is_transitioning()
+                                && coordinator.state().controller_fingerprint.as_deref()
+                                    != Some(requested)
+                            {
+                                pending_role_readiness = begin_windows_role_switch(
+                                    requested,
+                                    &local_fingerprint,
+                                    &mut coordinator,
+                                    &mut input_epoch,
+                                    &mut injector,
+                                    &mut writer,
+                                )
+                                .await?;
+                                transition_deadline = pending_role_readiness
+                                    .as_ref()
+                                    .map(|_| tokio::time::Instant::now() + Duration::from_secs(5));
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    false,
+                                    pending_role_readiness.is_some(),
+                                )?;
                             }
                         }
                         TrayCommandOutcome::Continue => {}
@@ -1262,7 +1731,12 @@ async fn run_connected_inner(
                 }
             },
             event = recv_live_input(&mut input_rx) => {
-                if *input_forwarding_enabled && let Some(frame) = event {
+                if local_is_controller
+                    && *input_forwarding_enabled
+                    && !session_paused
+                    && let Some(frame) = event
+                {
+                    let frame = frame_with_role_epoch(frame, role_epoch);
                     for prepared in live_clipboard.prepare_input(frame, &runtime_config).await? {
                         write_secure_frame_writer(&mut writer, &prepared).await?;
                         stats.record_frame(&prepared);
@@ -1271,17 +1745,60 @@ async fn run_connected_inner(
                 }
             },
             frame = clipboard_rx.recv() => {
-                if let Some(frame) = frame {
+                if !session_paused && let Some(frame) = frame {
                     write_secure_frame_writer(&mut writer, &frame).await?;
                     stats.record_frame(&frame);
                 }
             },
             frame = receiver_rx.recv() => {
                 let frame = frame.context("receiver frame reader ended")??;
-                last_receiver_activity = Instant::now();
+                receiver_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 match frame {
                     Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
+                    Frame::Input(input) => {
+                        if input.role_epoch != role_epoch
+                            || local_is_controller
+                            || session_paused
+                        {
+                            tracing::trace!(
+                                role_epoch = input.role_epoch,
+                                "ignored input outside the committed Windows receiving epoch"
+                            );
+                            continue;
+                        }
+                        if input.event == InputEvent::AllKeysUp {
+                            injector.all_keys_up()?;
+                            edge_windows_input::record_tray_injected_input();
+                            // This is a held-key reset, not a pointer-leave
+                            // transition. Continue accepting this input epoch.
+                            continue;
+                        }
+                        if !*input_forwarding_enabled || !input_epoch.accepts_input() {
+                            continue;
+                        }
+                        let is_motion = matches!(input.event, InputEvent::PointerMotion { .. });
+                        injector.inject(input.event)?;
+                        edge_windows_input::record_tray_injected_input();
+                        if is_motion
+                            && let Some(control) = return_watcher.release_if_at_edge()?
+                        {
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                            write_secure_frame_writer(
+                                &mut writer,
+                                &Frame::control(role_epoch, control),
+                            )
+                            .await?;
+                        }
+                    }
                     Frame::Clipboard(event) => {
+                        if session_paused {
+                            continue;
+                        }
+                        let records_clipboard_event = matches!(
+                            &event,
+                            ClipboardEvent::TextOffer { .. } | ClipboardEvent::ImageStart { .. }
+                        );
                         if let Err(error) = live_clipboard
                             .handle_remote_event(
                                 event,
@@ -1293,35 +1810,281 @@ async fn run_connected_inner(
                         {
                             tracing::warn!(%error, "failed to synchronize receiver clipboard");
                             append_portable_log(log_path, format!("failed to synchronize receiver clipboard: {error}"));
+                        } else if records_clipboard_event {
+                            edge_windows_input::record_tray_clipboard_event();
                         }
                     }
                     Frame::ScreenInfo(info) => tracing::info!(primary = %info.primary_output, outputs = info.outputs.len(), "screen info"),
-                    Frame::Control(ControlEvent::ReleaseToLocal { reason }) => {
-                        if edge_windows_input::handle_receiver_release(reason) {
-                            tracing::info!(?reason, "accepted receiver-requested local release");
-                            append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
-                        } else {
-                            tracing::warn!(?reason, "ignored stale or implausible receiver release");
-                            append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
-                        }
-                    }
-                    Frame::Control(ControlEvent::SetInputForwarding { enabled }) => {
-                        if peer_supports_input_toggle {
-                            *input_forwarding_enabled = enabled;
-                            edge_windows_input::set_forwarding_enabled(enabled);
-                            update_windows_tray_input_forwarding(enabled, log_path);
-                            append_portable_log(
-                                log_path,
-                                format!("receiver set input forwarding to {enabled}"),
+                    Frame::Control(control) => {
+                        if control.role_epoch != role_epoch {
+                            tracing::debug!(
+                                role_epoch = control.role_epoch,
+                                "ignored receiver control from a stale role epoch"
                             );
+                            continue;
+                        }
+                        match control.event {
+                            ControlEvent::ReleaseToLocal { reason } => {
+                                if local_is_controller && edge_windows_input::handle_receiver_release(reason) {
+                                    tracing::info!(?reason, "accepted receiver-requested local release");
+                                    append_portable_log(log_path, format!("accepted receiver release: {reason:?}"));
+                                } else {
+                                    tracing::warn!(?reason, "ignored stale or implausible receiver release");
+                                    append_portable_log(log_path, format!("ignored receiver release: {reason:?}"));
+                                }
+                            }
+                            ControlEvent::LeaveRemote { .. } => {
+                                if local_is_controller && edge_windows_input::handle_receiver_release(
+                                    edge_protocol::ReleaseReason::UserRequest,
+                                ) {
+                                    tracing::info!("accepted receiver edge-return release");
+                                }
+                            }
+                            ControlEvent::SetInputForwarding { enabled } => {
+                                if peer_supports_input_toggle {
+                                    *input_forwarding_enabled = enabled;
+                                    edge_windows_input::set_forwarding_enabled(
+                                        local_is_controller && enabled && !session_paused,
+                                    );
+                                    if !enabled {
+                                        input_epoch.suspend();
+                                        injector.all_keys_up().ok();
+                                    }
+                                    return_watcher.record_control(
+                                        &ControlEvent::SetInputForwarding { enabled },
+                                    );
+                                    update_windows_tray_input_forwarding(enabled, log_path);
+                                    append_portable_log(
+                                        log_path,
+                                        format!("receiver set input forwarding to {enabled}"),
+                                    );
+                                }
+                            }
+                            event @ ControlEvent::EnterRemote { .. } => {
+                                if !local_is_controller {
+                                    input_epoch.observe_control(&event);
+                                    return_watcher.record_control(&event);
+                                }
+                                tracing::debug!(?event, "peer control frame")
+                            }
                         }
                     }
-                    Frame::Control(control) => tracing::debug!(?control, "receiver control frame"),
-                    Frame::Error(err) => anyhow::bail!("receiver error: {}: {}", err.code, err.message),
+                    Frame::Role(RoleEvent::Request { controller_fingerprint }) => {
+                        if !session_paused
+                            && role_switch_available
+                            && (controller_fingerprint == local_fingerprint
+                                || controller_fingerprint == peer_fingerprint)
+                            && !coordinator.is_transitioning()
+                            && coordinator.state().controller_fingerprint.as_deref()
+                                != Some(controller_fingerprint.as_str())
+                        {
+                            pending_role_readiness = begin_windows_role_switch(
+                                &controller_fingerprint,
+                                &local_fingerprint,
+                                &mut coordinator,
+                                &mut input_epoch,
+                                &mut injector,
+                                &mut writer,
+                            )
+                            .await?;
+                            transition_deadline = pending_role_readiness
+                                .as_ref()
+                                .map(|_| tokio::time::Instant::now() + Duration::from_secs(5));
+                            edge_windows_input::update_tray_role(
+                                &local_name,
+                                &peer_name,
+                                local_is_controller,
+                                false,
+                                pending_role_readiness.is_some(),
+                            )?;
+                        }
+                    }
+                    Frame::Role(RoleEvent::Ready {
+                        role_epoch: ready_epoch,
+                        capture_ready,
+                        inject_ready,
+                        failure_detail,
+                    }) => {
+                        let Some(local_ready) = pending_role_readiness.take() else {
+                            tracing::debug!(ready_epoch, "ignored unexpected role readiness");
+                            continue;
+                        };
+                        transition_deadline = None;
+                        let decision = match coordinator.finish_ready(
+                            ready_epoch,
+                            local_ready.0,
+                            local_ready.1,
+                            capture_ready,
+                            inject_ready,
+                            failure_detail.or_else(|| local_ready.2.clone()),
+                        ) {
+                            Ok(decision) => decision,
+                            Err(edge_runtime::RoleStateError::UnexpectedEpoch { .. }) => {
+                                pending_role_readiness = Some(local_ready);
+                                transition_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
+                                tracing::debug!(ready_epoch, "ignored stale role readiness");
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        match decision {
+                            RoleDecision::Commit(commit) => {
+                                let controller = commit.controller_fingerprint.as_deref()
+                                    .context("role commit omitted controller identity")?;
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::Commit(commit.clone())),
+                                )
+                                .await?;
+                                pending_role_persistence = Some((
+                                    commit.role_epoch,
+                                    controller.to_string(),
+                                ));
+                                append_portable_log(
+                                    log_path,
+                                    format!(
+                                        "role epoch {} committed in memory; waiting for peer apply confirmation before persisting {controller}",
+                                        commit.role_epoch,
+                                    ),
+                                );
+                                role_epoch = commit.role_epoch;
+                                local_is_controller = controller == local_fingerprint;
+                                input_epoch.suspend();
+                                injector.all_keys_up().ok();
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller
+                                        && *input_forwarding_enabled
+                                        && !session_paused,
+                                );
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available && !session_paused,
+                                    false,
+                                )?;
+                                update_windows_tray_status(&connection_status, log_path);
+                            }
+                            RoleDecision::Abort(abort) => {
+                                edge_windows_input::set_forwarding_enabled(
+                                    local_is_controller
+                                        && *input_forwarding_enabled
+                                        && !session_paused,
+                                );
+                                write_secure_frame_writer(
+                                    &mut writer,
+                                    &Frame::Role(RoleEvent::Abort(abort.clone())),
+                                )
+                                .await?;
+                                edge_windows_input::update_tray_role(
+                                    &local_name,
+                                    &peer_name,
+                                    local_is_controller,
+                                    role_switch_available && !session_paused,
+                                    false,
+                                )?;
+                                if let Some(detail) = abort.failure_detail {
+                                    update_windows_tray_status(
+                                        &format!("Connected: {detail}"),
+                                        log_path,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Frame::Role(RoleEvent::Applied { role_epoch: applied_epoch }) => {
+                        let Some((expected_epoch, controller)) =
+                            pending_role_persistence.take()
+                        else {
+                            tracing::debug!(applied_epoch, "ignored unexpected role apply confirmation");
+                            continue;
+                        };
+                        if applied_epoch != expected_epoch || applied_epoch != role_epoch {
+                            pending_role_persistence = Some((expected_epoch, controller));
+                            tracing::debug!(
+                                applied_epoch,
+                                expected_epoch,
+                                "ignored stale role apply confirmation"
+                            );
+                            continue;
+                        }
+                        role_store
+                            .save(&CommittedRole::new(&controller))
+                            .await
+                            .context("failed to persist peer-confirmed role handover")?;
+                        append_portable_log(
+                            log_path,
+                            format!(
+                                "peer applied role epoch {applied_epoch}; persisted controller {controller}"
+                            ),
+                        );
+                    }
+                    Frame::Role(RoleEvent::SetPaused { paused }) => {
+                        if coordinator.is_transitioning() {
+                            continue;
+                        }
+                        coordinator.set_paused(paused)?;
+                        session_paused = paused;
+                        CONNECTOR_SESSION_PAUSED
+                            .store(paused, std::sync::atomic::Ordering::Release);
+                        if paused {
+                            edge_windows_input::force_release_to_local();
+                            edge_windows_input::set_forwarding_enabled(false);
+                            input_epoch.suspend();
+                            injector.all_keys_up().ok();
+                            _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
+                        } else {
+                            edge_windows_input::set_forwarding_enabled(
+                                local_is_controller && *input_forwarding_enabled,
+                            );
+                            if audio_enabled {
+                                send_windows_audio_route(
+                                    &mut writer,
+                                    peer_supports_audio_route,
+                                    &audio_source,
+                                    &peer_fingerprint,
+                                ).await?;
+                                if audio_source.as_deref() == Some(local_fingerprint.as_str()) {
+                                    pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                                }
+                            }
+                        }
+                        write_secure_frame_writer(
+                            &mut writer,
+                            &Frame::Role(RoleEvent::SetPaused { paused }),
+                        )
+                        .await?;
+                        edge_windows_input::update_tray_role(
+                            &local_name,
+                            &peer_name,
+                            local_is_controller,
+                            role_switch_available && !paused,
+                            false,
+                        )?;
+                        update_windows_tray_status(
+                            if paused { "Disconnected by user" } else { &connection_status },
+                            log_path,
+                        );
+                    }
+                    Frame::Role(
+                        RoleEvent::SessionState(_)
+                        | RoleEvent::Prepare(_)
+                        | RoleEvent::Commit(_)
+                        | RoleEvent::Abort(_),
+                    ) => {
+                        tracing::warn!("ignored connector-authoritative role message from listener");
+                    }
+                    Frame::Error(err) => anyhow::bail!("peer error: {}: {}", err.code, err.message),
                     Frame::Audio(AudioControl::Offer { udp_port, codecs }) => {
-                        if audio_enabled && codecs.contains(&AudioCodec::PcmS16Stereo48Khz) {
+                        if audio_source.as_deref() == Some(peer_fingerprint.as_str())
+                            && codecs.contains(&AudioCodec::PcmS16Stereo48Khz)
+                        {
                             update_windows_tray_audio(true, "Audio: Starting", log_path);
-                            append_portable_log(log_path, format!("received Linux audio offer on UDP port {udp_port}"));
+                            append_portable_log(log_path, format!("received peer audio offer on UDP port {udp_port}"));
                             let secrets = SessionSecrets::generate();
                             let bind_addr = if peer_ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                             match UdpSocket::bind(bind_addr).await {
@@ -1344,7 +2107,7 @@ async fn run_connected_inner(
                                     ).await {
                                         Ok(receiver) => {
                                             _audio_receiver = Some(receiver);
-                                            tracing::info!(udp_port, "started Linux audio receiver");
+                                            tracing::info!(udp_port, "started peer audio receiver");
                                             append_portable_log(log_path, format!("opened Windows audio output on UDP port {windows_udp_port} and sent UDP probe"));
                                         }
                                         Err(error) => {
@@ -1363,9 +2126,134 @@ async fn run_connected_inner(
                             }
                         }
                     }
+                    Frame::Audio(AudioControl::Start {
+                        udp_port,
+                        session_id,
+                        session_salt,
+                        session_key,
+                        codec: AudioCodec::PcmS16Stereo48Khz,
+                        ..
+                    }) if audio_source.as_deref() == Some(local_fingerprint.as_str()) => {
+                        let Some(socket) = pending_audio_socket.take() else {
+                            tracing::warn!("ignored audio start without a pending local offer");
+                            continue;
+                        };
+                        let secrets = SessionSecrets { session_id, session_salt, session_key };
+                        let cipher = edge_audio::PacketCipher::new(&secrets);
+                        match edge_windows_audio::establish_peer(
+                            &socket,
+                            &cipher,
+                            std::net::SocketAddr::new(peer_ip, udp_port),
+                            peer_ip,
+                            Duration::from_secs(5),
+                        ).await {
+                            Ok(destination) => match edge_windows_audio::WindowsAudioSender::start(
+                                socket, destination, secrets,
+                            ).await {
+                                Ok(sender) => {
+                                    _audio_sender = Some(sender);
+                                    append_portable_log(
+                                        log_path,
+                                        format!(
+                                            "Windows loopback audio is streaming to {destination}"
+                                        ),
+                                    );
+                                    update_windows_tray_audio_route(
+                                        edge_windows_input::WindowsAudioChoice::Local,
+                                        peer_supports_audio_playback && peer_supports_audio_route,
+                                        peer_supports_audio_capture,
+                                        "Audio: Streaming",
+                                        log_path,
+                                    );
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::State {
+                                        state: AudioStreamState::Streaming,
+                                        detail: None,
+                                    })).await?;
+                                }
+                                Err(error) => {
+                                    append_portable_log(
+                                        log_path,
+                                        format!("failed to start Windows loopback capture: {error:#}"),
+                                    );
+                                    update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
+                                    write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::Stop { reason: AudioStopReason::CaptureFailure })).await.ok();
+                                }
+                            },
+                            Err(error) => {
+                                append_portable_log(
+                                    log_path,
+                                    format!("failed to establish Windows audio UDP path: {error:#}"),
+                                );
+                                update_windows_tray_audio(true, &format!("Audio error: {error}"), log_path);
+                            }
+                        }
+                    }
+                    Frame::Audio(AudioControl::RequestRoute { source_fingerprint }) => {
+                        let valid = source_fingerprint.as_deref().is_none_or(|source| {
+                            source == local_fingerprint && peer_supports_audio_playback && peer_supports_audio_route
+                                || source == peer_fingerprint && peer_supports_audio_capture
+                        });
+                        if valid {
+                            audio_source = source_fingerprint;
+                            audio_enabled = audio_source.is_some();
+                            _audio_receiver = None;
+                            _audio_sender = None;
+                            pending_audio_socket = None;
+                            let committed = audio_source.clone().map_or_else(CommittedAudioRoute::disabled, CommittedAudioRoute::from_source);
+                            audio_route_store.save(&committed).await?;
+                            let choice = windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint);
+                            update_windows_tray_audio_route(
+                                choice,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                if audio_enabled { "Audio: Starting" } else { "Audio: Off" },
+                                log_path,
+                            );
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                            if audio_source.as_deref() == Some(local_fingerprint.as_str()) && !session_paused {
+                                pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                            }
+                        } else {
+                            send_windows_audio_route(
+                                &mut writer,
+                                peer_supports_audio_route,
+                                &audio_source,
+                                &peer_fingerprint,
+                            ).await?;
+                        }
+                    }
+                    Frame::Audio(AudioControl::SetRoute { .. }) => {
+                        tracing::warn!("ignored connector-authoritative audio route from listener");
+                    }
                     Frame::Audio(AudioControl::State { state, detail }) => {
                         tracing::info!(?state, ?detail, "Linux audio state changed");
                         append_portable_log(log_path, format!("Linux audio state changed: {state:?}{}", detail.as_deref().map(|detail| format!(": {detail}")).unwrap_or_default()));
+                        if state == AudioStreamState::Error
+                            && audio_source.as_deref() == Some(local_fingerprint.as_str())
+                            && !audio_restart_attempted
+                            && !session_paused
+                        {
+                            audio_restart_attempted = true;
+                            _audio_sender = None;
+                            pending_audio_socket = Some(send_windows_audio_offer(&mut writer).await?);
+                            append_portable_log(
+                                log_path,
+                                "Linux playback failed; renegotiating Windows audio once",
+                            );
+                            update_windows_tray_audio_route(
+                                edge_windows_input::WindowsAudioChoice::Local,
+                                peer_supports_audio_playback && peer_supports_audio_route,
+                                peer_supports_audio_capture,
+                                "Audio: Restarting",
+                                log_path,
+                            );
+                            continue;
+                        }
                         if state == AudioStreamState::Streaming
                             && let Some(receiver) = &_audio_receiver
                         {
@@ -1377,38 +2265,56 @@ async fn run_connected_inner(
                             AudioStreamState::Streaming => "Audio: Streaming".to_string(),
                             AudioStreamState::Error => format!("Audio error: {}", detail.as_deref().unwrap_or("unknown error")),
                         };
-                        update_windows_tray_audio(audio_enabled, &status, log_path);
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            &status,
+                            log_path,
+                        );
                     }
-                    Frame::Audio(AudioControl::Stop { .. } | AudioControl::SetEnabled { enabled: false }) => {
-                        audio_enabled = false;
+                    Frame::Audio(AudioControl::Stop { reason }) => {
                         _audio_receiver = None;
-                        runtime_config.audio.enabled = false;
-                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| runtime_config.clone());
-                        updated.audio.enabled = false;
-                        if let Err(error) = updated.save_blocking(config_path) {
-                            tracing::warn!(%error, "failed to persist Linux audio toggle");
-                        }
-                        update_windows_tray_audio(false, "Audio: Off", log_path);
+                        _audio_sender = None;
+                        pending_audio_socket = None;
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            &format!("Audio stopped: {reason:?}"),
+                            log_path,
+                        );
                     }
-                    Frame::Audio(AudioControl::SetEnabled { enabled: true }) => {
-                        audio_enabled = true;
-                        audio_restart_attempted = false;
-                        runtime_config.audio.enabled = true;
-                        let mut updated = AppConfig::load_blocking(config_path).unwrap_or_else(|_| runtime_config.clone());
-                        updated.audio.enabled = true;
-                        if let Err(error) = updated.save_blocking(config_path) {
-                            tracing::warn!(%error, "failed to persist Linux audio toggle");
-                        }
-                        update_windows_tray_audio(true, "Audio: Starting", log_path);
-                        if peer_supports_audio {
-                            write_secure_frame_writer(&mut writer, &Frame::Audio(AudioControl::SetEnabled { enabled: true })).await?;
-                        }
+                    Frame::Audio(AudioControl::SetEnabled { enabled }) => {
+                        audio_source = enabled.then(|| peer_fingerprint.clone());
+                        audio_enabled = enabled;
+                        _audio_receiver = None;
+                        _audio_sender = None;
+                        pending_audio_socket = None;
+                        let committed = audio_source.clone().map_or_else(
+                            CommittedAudioRoute::disabled,
+                            CommittedAudioRoute::from_source,
+                        );
+                        audio_route_store.save(&committed).await?;
+                        update_windows_tray_audio_route(
+                            windows_audio_choice(&audio_source, &local_fingerprint, &peer_fingerprint),
+                            peer_supports_audio_playback && peer_supports_audio_route,
+                            peer_supports_audio_capture,
+                            if enabled { "Audio: Starting" } else { "Audio: Off" },
+                            log_path,
+                        );
+                        send_windows_audio_route(
+                            &mut writer,
+                            peer_supports_audio_route,
+                            &audio_source,
+                            &peer_fingerprint,
+                        ).await?;
                     }
                     Frame::Audio(other) => tracing::debug!(?other, "audio control frame"),
                     other => tracing::debug!(?other, "receiver frame"),
                 }
             },
-            _ = clipboard_send.tick(), if live_clipboard.needs_send_tick() => {
+            _ = clipboard_send.tick(), if !session_paused && live_clipboard.needs_send_tick() => {
                 if live_clipboard.paste_barrier_expired() {
                     if let Some(cancel) = live_clipboard.cancel_expired_paste_barrier() {
                         write_secure_frame_writer(&mut writer, &cancel).await?;
@@ -1438,6 +2344,200 @@ async fn run_connected_inner(
     }
 }
 
+fn frame_with_role_epoch(frame: Frame, role_epoch: u64) -> Frame {
+    match frame {
+        Frame::Input(mut input) => {
+            input.role_epoch = role_epoch;
+            Frame::Input(input)
+        }
+        Frame::Control(mut control) => {
+            control.role_epoch = role_epoch;
+            Frame::Control(control)
+        }
+        frame => frame,
+    }
+}
+
+#[cfg(windows)]
+fn windows_audio_choice(
+    source: &Option<String>,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> edge_windows_input::WindowsAudioChoice {
+    match source.as_deref() {
+        Some(source) if source == local_fingerprint => {
+            edge_windows_input::WindowsAudioChoice::Local
+        }
+        Some(source) if source == peer_fingerprint => edge_windows_input::WindowsAudioChoice::Peer,
+        _ => edge_windows_input::WindowsAudioChoice::Off,
+    }
+}
+
+#[cfg(windows)]
+async fn send_windows_audio_offer(
+    writer: &mut ScheduledNoiseWriter,
+) -> Result<std::sync::Arc<UdpSocket>> {
+    let socket = std::sync::Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let udp_port = socket.local_addr()?.port();
+    write_secure_frame_writer(
+        writer,
+        &Frame::Audio(AudioControl::Offer {
+            udp_port,
+            codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+        }),
+    )
+    .await?;
+    Ok(socket)
+}
+
+#[cfg(windows)]
+async fn send_windows_audio_route(
+    writer: &mut ScheduledNoiseWriter,
+    peer_supports_route: bool,
+    source: &Option<String>,
+    peer_fingerprint: &str,
+) -> Result<()> {
+    let control = if peer_supports_route {
+        AudioControl::SetRoute {
+            source_fingerprint: source.clone(),
+        }
+    } else {
+        AudioControl::SetEnabled {
+            enabled: source.as_deref() == Some(peer_fingerprint),
+        }
+    };
+    write_secure_frame_writer(writer, &Frame::Audio(control)).await
+}
+
+#[cfg(windows)]
+async fn begin_windows_role_switch(
+    requested_controller: &str,
+    local_fingerprint: &str,
+    coordinator: &mut RoleCoordinator,
+    input_epoch: &mut InputEpochGate,
+    injector: &mut edge_windows_input::WindowsInputInjector,
+    writer: &mut ScheduledNoiseWriter,
+) -> Result<Option<(bool, bool, Option<String>)>> {
+    let old_local_controller =
+        coordinator.state().controller_fingerprint.as_deref() == Some(local_fingerprint);
+    if old_local_controller {
+        edge_windows_input::set_forwarding_enabled(false);
+        edge_windows_input::force_release_to_local();
+        write_secure_frame_writer(
+            writer,
+            &Frame::input(coordinator.state().role_epoch, InputEvent::AllKeysUp),
+        )
+        .await
+        .ok();
+    } else {
+        input_epoch.suspend();
+        injector.all_keys_up().ok();
+    }
+    let prepare = coordinator.prepare(requested_controller)?;
+    write_secure_frame_writer(writer, &Frame::Role(RoleEvent::Prepare(prepare))).await?;
+    Ok(Some((true, true, None)))
+}
+
+#[cfg(windows)]
+struct WindowsRemoteReturnWatcher {
+    output: Option<OutputInfo>,
+    entry_edge: Option<Edge>,
+    entered_at: Option<Instant>,
+    last_poll: Instant,
+    confirmations: u8,
+}
+
+#[cfg(windows)]
+impl WindowsRemoteReturnWatcher {
+    fn new(screen_info: ScreenInfo) -> Self {
+        let output = screen_info
+            .outputs
+            .iter()
+            .find(|output| output.name == screen_info.primary_output)
+            .cloned()
+            .or_else(|| screen_info.outputs.first().cloned());
+        Self {
+            output,
+            entry_edge: None,
+            entered_at: None,
+            last_poll: Instant::now() - RETURN_EDGE_POLL_INTERVAL,
+            confirmations: 0,
+        }
+    }
+
+    fn record_control(&mut self, control: &ControlEvent) {
+        match control {
+            ControlEvent::EnterRemote { edge, .. } => {
+                self.entry_edge = Some(*edge);
+                self.entered_at = Some(Instant::now());
+                self.last_poll = Instant::now() - RETURN_EDGE_POLL_INTERVAL;
+                self.confirmations = 0;
+            }
+            ControlEvent::LeaveRemote { .. }
+            | ControlEvent::ReleaseToLocal { .. }
+            | ControlEvent::SetInputForwarding { enabled: false } => {
+                self.entry_edge = None;
+                self.entered_at = None;
+                self.confirmations = 0;
+            }
+            ControlEvent::SetInputForwarding { enabled: true } => {}
+        }
+    }
+
+    fn release_if_at_edge(&mut self) -> Result<Option<ControlEvent>> {
+        let (Some(edge), Some(output)) = (self.entry_edge, self.output.as_ref()) else {
+            return Ok(None);
+        };
+        if self
+            .entered_at
+            .is_some_and(|entered| entered.elapsed() < RETURN_EDGE_ENTRY_GRACE)
+            || self.last_poll.elapsed() < RETURN_EDGE_POLL_INTERVAL
+        {
+            return Ok(None);
+        }
+        self.last_poll = Instant::now();
+        let (x, y) = edge_windows_input::cursor_position()?;
+        let left = output.x;
+        let top = output.y;
+        let right = output.x + output.width.saturating_sub(1) as i32;
+        let bottom = output.y + output.height.saturating_sub(1) as i32;
+        let reached = match edge {
+            Edge::Left => x >= right - RETURN_EDGE_MARGIN,
+            Edge::Right => x <= left + RETURN_EDGE_MARGIN,
+            Edge::Top => y >= bottom - RETURN_EDGE_MARGIN,
+            Edge::Bottom => y <= top + RETURN_EDGE_MARGIN,
+        };
+        if !reached {
+            self.confirmations = 0;
+            return Ok(None);
+        }
+        self.confirmations = self.confirmations.saturating_add(1);
+        if self.confirmations < RETURN_EDGE_CONFIRMATIONS {
+            return Ok(None);
+        }
+        let normalized_position = normalized_perpendicular(
+            edge,
+            Point {
+                x: f64::from(x),
+                y: f64::from(y),
+            },
+            Rect {
+                x: f64::from(output.x),
+                y: f64::from(output.y),
+                width: output.width,
+                height: output.height,
+            },
+        );
+        self.entry_edge = None;
+        self.entered_at = None;
+        self.confirmations = 0;
+        Ok(Some(ControlEvent::LeaveRemote {
+            edge,
+            normalized_position,
+        }))
+    }
+}
+
 #[derive(Default)]
 struct ControllerInputStats {
     frames: u64,
@@ -1452,26 +2552,34 @@ struct ControllerInputStats {
 impl ControllerInputStats {
     fn record_frame(&mut self, frame: &Frame) {
         self.frames = self.frames.saturating_add(1);
-        match frame {
-            Frame::Input(InputEvent::PointerMotion { .. }) => {
+        match frame.input_event() {
+            Some(InputEvent::PointerMotion { .. }) => {
                 self.motion = self.motion.saturating_add(1);
             }
-            Frame::Input(InputEvent::PointerButton { .. }) => {
+            Some(InputEvent::PointerButton { .. }) => {
                 self.buttons = self.buttons.saturating_add(1);
             }
-            Frame::Input(InputEvent::PointerWheel { .. }) => {
+            Some(InputEvent::PointerWheel { .. }) => {
                 self.wheel = self.wheel.saturating_add(1);
             }
-            Frame::Input(InputEvent::Key { .. }) => {
+            Some(InputEvent::Key { .. }) => {
                 self.keys = self.keys.saturating_add(1);
             }
-            Frame::Input(InputEvent::AllKeysUp) => {
+            Some(InputEvent::AllKeysUp) => {
                 self.keys = self.keys.saturating_add(1);
             }
-            Frame::Clipboard(_) => {
+            None if matches!(frame, Frame::Clipboard(_)) => {
                 self.clipboard = self.clipboard.saturating_add(1);
+                if matches!(
+                    frame,
+                    Frame::Clipboard(
+                        ClipboardEvent::TextOffer { .. } | ClipboardEvent::ImageStart { .. }
+                    )
+                ) {
+                    edge_windows_input::record_tray_clipboard_event();
+                }
             }
-            Frame::Control(_) => {
+            None if matches!(frame, Frame::Control(_)) => {
                 self.control = self.control.saturating_add(1);
             }
             _ => {}
@@ -1525,7 +2633,7 @@ impl ControllerInputStats {
 }
 
 fn spawn_receiver_reader(
-    mut reader: NoiseReader,
+    mut reader: TcpFrameReader,
 ) -> tokio::sync::mpsc::UnboundedReceiver<Result<Frame>> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -1613,7 +2721,7 @@ impl LiveClipboardState {
                 // through instead of freezing the cursor for the length of the
                 // transfer. Keys, buttons, and wheel stay queued: releasing those
                 // ahead of the held paste could move focus and land it elsewhere.
-                if matches!(frame, Frame::Input(InputEvent::PointerMotion { .. })) {
+                if matches!(frame.input_event(), Some(InputEvent::PointerMotion { .. })) {
                     return Ok(vec![frame]);
                 }
                 self.held_input.push_back(frame);
@@ -1624,8 +2732,8 @@ impl LiveClipboardState {
             }
 
             if matches!(
-                &frame,
-                Frame::Input(InputEvent::Key {
+                frame.input_event(),
+                Some(InputEvent::Key {
                     evdev_code: 47,
                     down: true
                 })
@@ -1679,8 +2787,8 @@ impl LiveClipboardState {
     ) {
         #[cfg(windows)]
         {
-            match frame {
-                Frame::Input(InputEvent::Key { evdev_code, down }) => match *evdev_code {
+            match frame.input_event() {
+                Some(InputEvent::Key { evdev_code, down }) => match *evdev_code {
                     29 | 97 => {
                         self.ctrl_down = *down;
                     }
@@ -1699,7 +2807,7 @@ impl LiveClipboardState {
                     }
                     _ => {}
                 },
-                Frame::Input(InputEvent::AllKeysUp) => {
+                Some(InputEvent::AllKeysUp) => {
                     self.ctrl_down = false;
                 }
                 _ => {}
@@ -2021,11 +3129,6 @@ fn start_live_input(
     config: &AppConfig,
     screen_info: Option<ScreenInfo>,
 ) -> Result<Option<mpsc::Receiver<Frame>>> {
-    let peer = config
-        .peer
-        .laptop
-        .as_ref()
-        .context("missing [peer.laptop] config")?;
     let (remote_size, used_fallback_size) = remote_size(screen_info.as_ref());
     if used_fallback_size {
         tracing::warn!(
@@ -2035,9 +3138,9 @@ fn start_live_input(
         );
     }
     let capture = edge_windows_input::start_capture(edge_windows_input::CaptureConfig {
-        edge: peer_position_to_edge(peer.position),
+        edge: peer_position_to_edge(config.layout.listener_position),
         remote_size,
-        game_compatibility: config.input.game_compatibility,
+        game_compatibility: config.input.capture.game_compatibility,
     })
     .context("failed to start Windows live input capture")?;
     let (sender, receiver) = mpsc::channel(LIVE_INPUT_QUEUE_CAPACITY);
@@ -2098,8 +3201,10 @@ async fn recv_live_input(receiver: &mut Option<mpsc::Receiver<Frame>>) -> Option
 #[cfg(windows)]
 fn captured_input_to_frame(event: edge_windows_input::CapturedInput) -> Frame {
     match event {
-        edge_windows_input::CapturedInput::Input(event) => Frame::Input(event),
-        edge_windows_input::CapturedInput::Control(event) => Frame::Control(event),
+        edge_windows_input::CapturedInput::Input(event) => Frame::input(INITIAL_ROLE_EPOCH, event),
+        edge_windows_input::CapturedInput::Control(event) => {
+            Frame::control(INITIAL_ROLE_EPOCH, event)
+        }
     }
 }
 
@@ -2113,7 +3218,7 @@ struct PendingMotion {
 #[cfg(windows)]
 impl PendingMotion {
     fn coalesce(&mut self, frame: &Frame) -> bool {
-        if let Frame::Input(InputEvent::PointerMotion { dx, dy }) = frame {
+        if let Some(InputEvent::PointerMotion { dx, dy }) = frame.input_event() {
             self.dx += dx;
             self.dy += dy;
             true
@@ -2126,10 +3231,13 @@ impl PendingMotion {
         if self.dx == 0.0 && self.dy == 0.0 {
             return true;
         }
-        let frame = Frame::Input(InputEvent::PointerMotion {
-            dx: self.dx,
-            dy: self.dy,
-        });
+        let frame = Frame::input(
+            INITIAL_ROLE_EPOCH,
+            InputEvent::PointerMotion {
+                dx: self.dx,
+                dy: self.dy,
+            },
+        );
         self.dx = 0.0;
         self.dy = 0.0;
         match sender.try_send(frame) {
@@ -2207,7 +3315,6 @@ mod windows_tests {
     }
 }
 
-#[cfg(windows)]
 fn peer_position_to_edge(position: PeerPosition) -> Edge {
     match position {
         PeerPosition::Left => Edge::Left,
@@ -2243,32 +3350,8 @@ async fn write_secure_frame(session: &mut NoiseSession<TcpStream>, frame: &Frame
     Ok(())
 }
 
-struct ScheduledNoiseWriter {
-    inner: NoiseWriter,
-    image_schedule: ImageTransferSchedule,
-}
-
-impl ScheduledNoiseWriter {
-    fn new(inner: NoiseWriter) -> Self {
-        Self {
-            inner,
-            image_schedule: ImageTransferSchedule::default(),
-        }
-    }
-
-    fn bulk_is_due(&self) -> bool {
-        self.image_schedule.image_chunk_is_due()
-    }
-
-    fn record_sent(&mut self, frame: &Frame) {
-        self.image_schedule.record_sent_frame(frame);
-    }
-}
-
 async fn write_secure_frame_writer(writer: &mut ScheduledNoiseWriter, frame: &Frame) -> Result<()> {
-    let payload = encode_frame(frame)?;
-    writer.inner.write_packet(&payload).await?;
-    writer.record_sent(frame);
+    writer.write(frame).await?;
     Ok(())
 }
 
@@ -2277,47 +3360,13 @@ async fn read_secure_frame(session: &mut NoiseSession<TcpStream>) -> Result<Fram
     Ok(decode_frame(&payload)?)
 }
 
-async fn read_secure_frame_reader(reader: &mut NoiseReader) -> Result<Frame> {
-    let payload = reader.read_packet().await?;
-    Ok(decode_frame(&payload)?)
+async fn read_secure_frame_reader(reader: &mut TcpFrameReader) -> Result<Frame> {
+    Ok(reader.read().await?)
 }
 
 async fn load_or_create_config(path: &PathBuf) -> Result<AppConfig> {
-    match AppConfig::load(path).await {
-        Ok(mut config) => {
-            let text = tokio::fs::read_to_string(path).await.with_context(|| {
-                format!("failed to inspect controller config at {}", path.display())
-            })?;
-            let has_audio_table = text.lines().any(|line| line.trim() == "[audio]");
-            let has_image_setting = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("images_enabled"));
-            let has_text_only = text
-                .lines()
-                .any(|line| line.trim_start().starts_with("text_only"));
-            let mut migrated = false;
-            if !has_audio_table {
-                config.audio = AppConfig::controller_default().audio;
-                migrated = true;
-                tracing::info!(path = %path.display(), "enabled audio while migrating legacy controller config");
-            }
-            if !has_image_setting {
-                config.clipboard.images_enabled = true;
-                config.clipboard.max_image_bytes = 4 * 1024 * 1024;
-                migrated = true;
-                tracing::info!(path = %path.display(), "enabled clipboard images while migrating legacy controller config");
-            }
-            if has_text_only {
-                migrated = true;
-                tracing::info!(path = %path.display(), "dropped obsolete text_only key from controller config");
-            }
-            if migrated {
-                config.save(path).await.with_context(|| {
-                    format!("failed to migrate controller config at {}", path.display())
-                })?;
-            }
-            Ok(config)
-        }
+    match AppConfig::load_migrating(path).await {
+        Ok(config) => Ok(config),
         Err(edge_common::CommonError::ReadConfig { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -2349,9 +3398,23 @@ mod config_tests {
             public_key_fingerprint: "actual".to_string(),
             capabilities: Vec::new(),
             extensions: Vec::new(),
+            node_capabilities: Vec::new(),
         };
         assert!(validate_receiver_hello(&hello, "actual").is_ok());
         assert!(validate_receiver_hello(&hello, "different").is_err());
+    }
+
+    #[test]
+    fn authenticated_v1_rejection_is_a_non_retrying_upgrade_error() {
+        assert!(is_protocol_mismatch_message(
+            "peer error: invalid_hello: controller protocol version 2 is incompatible with 1"
+        ));
+        assert!(is_protocol_mismatch_message(
+            "Upgrade the other computer: receiver protocol version 1 is incompatible with 2"
+        ));
+        assert!(!is_protocol_mismatch_message(
+            "peer error: invalid_hello: fingerprint mismatch"
+        ));
     }
 
     #[tokio::test]
@@ -2504,10 +3567,13 @@ jitter_target_ms = 60
         state.outgoing = Some(OutgoingImageTransfer::new(1, 1, image));
         state.outgoing_image_id = Some(image_id);
         state.paste_barrier_deadline = Some(Instant::now() + Duration::from_secs(1));
-        state.held_input.push_back(Frame::Input(InputEvent::Key {
-            evdev_code: 47,
-            down: true,
-        }));
+        state.held_input.push_back(Frame::input(
+            INITIAL_ROLE_EPOCH,
+            InputEvent::Key {
+                evdev_code: 47,
+                down: true,
+            },
+        ));
         while let Some((_, completed)) = state.next_image_frame() {
             if completed {
                 break;

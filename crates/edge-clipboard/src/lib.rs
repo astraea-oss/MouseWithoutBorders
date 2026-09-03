@@ -604,7 +604,10 @@ mod tests {
     }
 
     fn motion_frame() -> Frame {
-        Frame::Input(edge_protocol::InputEvent::PointerMotion { dx: 1.0, dy: 0.0 })
+        Frame::input(
+            edge_protocol::INITIAL_ROLE_EPOCH,
+            edge_protocol::InputEvent::PointerMotion { dx: 1.0, dy: 0.0 },
+        )
     }
 
     #[test]

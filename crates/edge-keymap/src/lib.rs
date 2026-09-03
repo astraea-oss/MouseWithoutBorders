@@ -114,6 +114,55 @@ pub fn windows_scancode_to_evdev(key: WindowsScanCode) -> Option<u16> {
     Some(code)
 }
 
+pub fn evdev_to_windows_scancode(code: u16) -> Option<WindowsScanCode> {
+    let (scan_code, extended) = match code {
+        2..=11 => (code - 2 + 0x02, false),
+        16..=25 => (code - 16 + 0x10, false),
+        30..=38 => (code - 30 + 0x1e, false),
+        44..=50 => (code - 44 + 0x2c, false),
+        1 => (0x01, false),
+        14 => (0x0e, false),
+        15 => (0x0f, false),
+        28 => (0x1c, false),
+        57 => (0x39, false),
+        58 => (0x3a, false),
+        42 => (0x2a, false),
+        54 => (0x36, false),
+        29 => (0x1d, false),
+        97 => (0x1d, true),
+        56 => (0x38, false),
+        100 => (0x38, true),
+        125 => (0x5b, true),
+        126 => (0x5c, true),
+        103 => (0x48, true),
+        108 => (0x50, true),
+        105 => (0x4b, true),
+        106 => (0x4d, true),
+        110 => (0x52, true),
+        111 => (0x53, true),
+        102 => (0x47, true),
+        107 => (0x4f, true),
+        104 => (0x49, true),
+        109 => (0x51, true),
+        59..=68 => (code - 59 + 0x3b, false),
+        87 => (0x57, false),
+        88 => (0x58, false),
+        12 => (0x0c, false),
+        13 => (0x0d, false),
+        26 => (0x1a, false),
+        27 => (0x1b, false),
+        39 => (0x27, false),
+        40 => (0x28, false),
+        41 => (0x29, false),
+        43 => (0x2b, false),
+        51 => (0x33, false),
+        52 => (0x34, false),
+        53 => (0x35, false),
+        _ => return None,
+    };
+    Some(WindowsScanCode::new(scan_code, extended))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +209,15 @@ mod tests {
             windows_scancode_to_evdev(WindowsScanCode::new(0x3b, false)),
             Some(59)
         );
+    }
+
+    #[test]
+    fn supported_keymap_round_trips_for_injection() {
+        for evdev_code in 0..=130 {
+            let Some(windows) = evdev_to_windows_scancode(evdev_code) else {
+                continue;
+            };
+            assert_eq!(windows_scancode_to_evdev(windows), Some(evdev_code));
+        }
     }
 }

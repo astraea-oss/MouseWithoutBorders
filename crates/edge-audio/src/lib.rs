@@ -186,8 +186,8 @@ impl PcmCodec {
         }
         output.clear();
         output.reserve(PCM_BYTES_PER_FRAME.saturating_sub(output.capacity()));
-        for bytes in input.chunks_exact(size_of::<f32>()) {
-            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
+        for bytes in input.as_chunks::<{ size_of::<f32>() }>().0 {
+            let sample = f32::from_le_bytes(*bytes);
             let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
             output.extend_from_slice(&value.to_le_bytes());
         }
@@ -202,9 +202,48 @@ impl PcmCodec {
             return Err(AudioError::InvalidPacket);
         }
         Ok(packet
-            .chunks_exact(2)
-            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / i16::MAX as f32)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_le_bytes(*bytes) as f32 / i16::MAX as f32)
             .collect())
+    }
+}
+
+/// Smooths one missing PCM frame and fades the next real frame back in.
+/// Receivers on every platform use the same concealment behaviour.
+#[derive(Default)]
+pub struct PcmConcealer {
+    last_sample: [f32; CHANNELS],
+    recovering: bool,
+}
+
+impl PcmConcealer {
+    pub fn decode(&mut self, packet: Option<&[u8]>) -> Result<Vec<f32>> {
+        let Some(packet) = packet else {
+            self.recovering = true;
+            let mut concealed = Vec::with_capacity(SAMPLES_PER_FRAME);
+            for frame in 0..SAMPLES_PER_CHANNEL {
+                let gain = 1.0 - (frame + 1) as f32 / SAMPLES_PER_CHANNEL as f32;
+                concealed.push(self.last_sample[0] * gain);
+                concealed.push(self.last_sample[1] * gain);
+            }
+            self.last_sample = [0.0; CHANNELS];
+            return Ok(concealed);
+        };
+
+        let mut pcm = PcmCodec::decode(Some(packet))?;
+        if self.recovering {
+            let fade_frames = 48.min(SAMPLES_PER_CHANNEL);
+            for frame in 0..fade_frames {
+                let gain = (frame + 1) as f32 / fade_frames as f32;
+                pcm[frame * CHANNELS] *= gain;
+                pcm[frame * CHANNELS + 1] *= gain;
+            }
+            self.recovering = false;
+        }
+        self.last_sample = [pcm[pcm.len() - CHANNELS], pcm[pcm.len() - CHANNELS + 1]];
+        Ok(pcm)
     }
 }
 

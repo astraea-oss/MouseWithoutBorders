@@ -1,0 +1,22 @@
+[package]
+name = "edge-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+edge-clipboard = { path = "../edge-clipboard" }
+edge-crypto = { path = "../edge-crypto" }
+edge-protocol = { path = "../edge-protocol" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+edge-common = { path = "../edge-common" }
+tempfile.workspace = true
