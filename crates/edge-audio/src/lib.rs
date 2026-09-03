@@ -186,8 +186,8 @@ impl PcmCodec {
         }
         output.clear();
         output.reserve(PCM_BYTES_PER_FRAME.saturating_sub(output.capacity()));
-        for bytes in input.chunks_exact(size_of::<f32>()) {
-            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
+        for bytes in input.as_chunks::<{ size_of::<f32>() }>().0 {
+            let sample = f32::from_le_bytes(*bytes);
             let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
             output.extend_from_slice(&value.to_le_bytes());
         }
@@ -202,8 +202,10 @@ impl PcmCodec {
             return Err(AudioError::InvalidPacket);
         }
         Ok(packet
-            .chunks_exact(2)
-            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / i16::MAX as f32)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_le_bytes(*bytes) as f32 / i16::MAX as f32)
             .collect())
     }
 }
