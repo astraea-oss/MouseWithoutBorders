@@ -11,7 +11,9 @@ use edge_audio::{
     AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
     PcmConcealer, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
-use edge_audio_output::{AudioPlayer, PlaybackStats, PlaybackStatsSnapshot};
+use edge_audio_output::{
+    AudioLossReport, AudioLossReporter, AudioPlayer, PlaybackStats, PlaybackStatsSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncReadExt,
@@ -297,6 +299,7 @@ impl LinuxAudioReceiver {
             let mut status = tokio::time::interval(PLAYBACK_STATUS_INTERVAL);
             status.tick().await;
             let mut last_status = PlaybackStatsSnapshot::default();
+            let mut losses = AudioLossReporter::default();
             let started = tokio::time::Instant::now();
             let mut last_media = started;
             let mut received_media = false;
@@ -328,6 +331,9 @@ impl LinuxAudioReceiver {
                                             Err(error) => tracing::debug!(%error, "rejected PCM audio frame"),
                                         }
                                     }
+                                    if let Some(report) = losses.check(&task_stats.snapshot(), std::time::Instant::now()) {
+                                        warn_audio_loss(&report);
+                                    }
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
@@ -345,6 +351,10 @@ impl LinuxAudioReceiver {
                         }
                     }
                     _ = watchdog.tick() => {
+                        // Flush losses held back by the warning interval.
+                        if let Some(report) = losses.check(&task_stats.snapshot(), std::time::Instant::now()) {
+                            warn_audio_loss(&report);
+                        }
                         if received_media
                             && !media_stalled
                             && last_media.elapsed() > Duration::from_secs(2)
@@ -369,7 +379,7 @@ impl LinuxAudioReceiver {
                                 late = current.late_packets,
                                 concealed = current.concealed_packets,
                                 output_underruns = current.output_underruns,
-                                dropped_output_frames = current.dropped_output_frames,
+                                dropped_output_ms = current.dropped_output_ms,
                                 queued_output_ms = current.queued_output_ms,
                                 "Linux audio playback status"
                             );
@@ -401,6 +411,24 @@ impl LinuxAudioReceiver {
             Ok(reason) => reason,
             Err(error) => format!("Linux audio receiver task failed: {error}"),
         }
+    }
+}
+
+/// Logs audio lost since the previous warning, as soon as it happens.
+fn warn_audio_loss(report: &AudioLossReport) {
+    if report.concealed_packets > 0 {
+        tracing::warn!(
+            concealed_packets = report.concealed_packets,
+            concealed_ms = report.concealed_ms,
+            "Linux audio packets missing; filled with faded silence"
+        );
+    }
+    if report.dropped_output_frames > 0 {
+        tracing::warn!(
+            dropped_output_ms = report.dropped_output_ms,
+            dropped_output_frames = report.dropped_output_frames,
+            "Linux audio output queue full; decoded audio discarded"
+        );
     }
 }
 

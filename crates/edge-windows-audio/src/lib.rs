@@ -16,7 +16,7 @@ mod implementation {
         AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
         PcmConcealer, SAMPLE_RATE, SAMPLES_PER_CHANNEL, SessionSecrets,
     };
-    use edge_audio_output::{AudioPlayer, PlaybackStats};
+    use edge_audio_output::{AudioLossReport, AudioLossReporter, AudioPlayer, PlaybackStats};
     use tokio::{
         net::UdpSocket,
         sync::{mpsc, oneshot},
@@ -76,6 +76,7 @@ mod implementation {
         pub concealed_packets: u64,
         pub output_underruns: u64,
         pub dropped_output_frames: u64,
+        pub dropped_output_ms: u64,
         pub queued_output_ms: usize,
     }
 
@@ -329,6 +330,7 @@ mod implementation {
                 let mut player = player;
                 let mut jitter = JitterBuffer::new(jitter_target_ms);
                 let mut concealer = PcmConcealer::default();
+                let mut losses = AudioLossReporter::default();
                 let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
                 let mut media_watchdog = time::interval(Duration::from_millis(500));
                 let mut probe_retry = time::interval(Duration::from_millis(250));
@@ -361,6 +363,9 @@ mod implementation {
                                         } else {
                                             task_stats.late_packets.fetch_add(1, Ordering::Relaxed);
                                         }
+                                        if let Some(report) = losses.check(&task_stats.snapshot(), Instant::now()) {
+                                            warn_audio_loss(&report);
+                                        }
                                     }
                                     Ok(_) => {}
                                     Err(error) => {
@@ -381,6 +386,10 @@ mod implementation {
                             }
                         }
                         _ = media_watchdog.tick() => {
+                            // Flush losses held back by the warning interval.
+                            if let Some(report) = losses.check(&task_stats.snapshot(), Instant::now()) {
+                                warn_audio_loss(&report);
+                            }
                             if !expecting_media && task_linux_streaming.load(Ordering::Acquire) {
                                 expecting_media = true;
                                 last_authenticated_media = Instant::now();
@@ -436,6 +445,7 @@ mod implementation {
                 concealed_packets: snapshot.concealed_packets,
                 output_underruns: snapshot.output_underruns,
                 dropped_output_frames: snapshot.dropped_output_frames,
+                dropped_output_ms: snapshot.dropped_output_ms,
                 queued_output_ms: snapshot.queued_output_ms,
             }
         }
@@ -453,6 +463,24 @@ mod implementation {
 
     pub fn play_test_tone() -> Result<()> {
         edge_audio_output::play_test_tone()
+    }
+
+    /// Logs audio lost since the previous warning, as soon as it happens.
+    fn warn_audio_loss(report: &AudioLossReport) {
+        if report.concealed_packets > 0 {
+            tracing::warn!(
+                concealed_packets = report.concealed_packets,
+                concealed_ms = report.concealed_ms,
+                "Windows audio packets missing; filled with faded silence"
+            );
+        }
+        if report.dropped_output_frames > 0 {
+            tracing::warn!(
+                dropped_output_ms = report.dropped_output_ms,
+                dropped_output_frames = report.dropped_output_frames,
+                "Windows audio output queue full; decoded audio discarded"
+            );
+        }
     }
 
     #[cfg(test)]

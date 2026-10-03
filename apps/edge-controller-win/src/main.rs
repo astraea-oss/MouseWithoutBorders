@@ -1434,13 +1434,13 @@ async fn run_connected_inner(
                     append_portable_log(
                         log_path,
                         format!(
-                            "Windows audio status authenticated={} rejected={} late={} concealed={} output_underruns={} dropped_output_frames={} queued_output_ms={}",
+                            "Windows audio status authenticated={} rejected={} late={} concealed={} output_underruns={} dropped_output_ms={} queued_output_ms={}",
                             audio.authenticated_packets,
                             audio.rejected_packets,
                             audio.late_packets,
                             audio.concealed_packets,
                             audio.output_underruns,
-                            audio.dropped_output_frames,
+                            audio.dropped_output_ms,
                             audio.queued_output_ms,
                         ),
                     );

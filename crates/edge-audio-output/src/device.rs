@@ -170,6 +170,10 @@ fn open_stream(stats: Arc<PlaybackStats>) -> Result<(Stream, OpenedStream)> {
         duration_samples(output_rate, output_channels, 1).max(1),
         Ordering::Relaxed,
     );
+    stats.output_frames_per_ms.store(
+        duration_samples(output_rate, 1, 1).max(1),
+        Ordering::Relaxed,
+    );
     let playout = PlayoutState::new(
         ring.clone(),
         stats,
@@ -244,7 +248,7 @@ pub fn play_test_tone() -> Result<()> {
     // Draining the final queue counts as one underrun; more indicate glitches.
     tracing::info!(
         output_underruns = snapshot.output_underruns,
-        dropped_output_frames = snapshot.dropped_output_frames,
+        dropped_output_ms = snapshot.dropped_output_ms,
         queued_output_ms = snapshot.queued_output_ms,
         "audio test tone finished"
     );

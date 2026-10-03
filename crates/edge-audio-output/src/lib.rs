@@ -13,9 +13,10 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-use edge_audio::{CHANNELS, SAMPLE_RATE};
+use edge_audio::{CHANNELS, FRAME_MS, SAMPLE_RATE};
 
 #[cfg(any(windows, target_os = "linux"))]
 mod device;
@@ -39,6 +40,9 @@ const CLOCK_CORRECTION_GAIN: f64 = 4.0;
 const QUEUE_SMOOTHING: f64 = 0.01;
 /// Fade length for underruns and restarts: 1 ms at 48 kHz.
 const FADE_FRAMES: usize = 48;
+/// Minimum spacing between audio loss warnings. The first loss is reported
+/// immediately; losses inside this window are added to the next warning.
+pub const AUDIO_LOSS_WARNING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Single-producer, single-consumer ring of interleaved output samples.
 pub struct AudioRing {
@@ -120,9 +124,12 @@ pub struct PlaybackStats {
     pub late_packets: AtomicU64,
     pub concealed_packets: AtomicU64,
     pub output_underruns: AtomicU64,
+    /// Output frames (one sample per channel) discarded because the output
+    /// queue was full.
     pub dropped_output_frames: AtomicU64,
     pub queued_output_samples: AtomicUsize,
     pub output_samples_per_ms: AtomicUsize,
+    pub output_frames_per_ms: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -133,21 +140,83 @@ pub struct PlaybackStatsSnapshot {
     pub concealed_packets: u64,
     pub output_underruns: u64,
     pub dropped_output_frames: u64,
+    /// Duration of the discarded output frames.
+    pub dropped_output_ms: u64,
     pub queued_output_ms: usize,
 }
 
 impl PlaybackStats {
     pub fn snapshot(&self) -> PlaybackStatsSnapshot {
         let samples_per_ms = self.output_samples_per_ms.load(Ordering::Relaxed).max(1);
+        let frames_per_ms = self.output_frames_per_ms.load(Ordering::Relaxed).max(1) as u64;
+        let dropped_output_frames = self.dropped_output_frames.load(Ordering::Relaxed);
         PlaybackStatsSnapshot {
             authenticated_packets: self.authenticated_packets.load(Ordering::Relaxed),
             rejected_packets: self.rejected_packets.load(Ordering::Relaxed),
             late_packets: self.late_packets.load(Ordering::Relaxed),
             concealed_packets: self.concealed_packets.load(Ordering::Relaxed),
             output_underruns: self.output_underruns.load(Ordering::Relaxed),
-            dropped_output_frames: self.dropped_output_frames.load(Ordering::Relaxed),
+            dropped_output_frames,
+            dropped_output_ms: dropped_output_frames / frames_per_ms,
             queued_output_ms: self.queued_output_samples.load(Ordering::Relaxed) / samples_per_ms,
         }
+    }
+}
+
+/// Audio lost since the previous warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLossReport {
+    /// Packets that never arrived and were replaced with faded silence.
+    pub concealed_packets: u64,
+    pub concealed_ms: u64,
+    /// Decoded audio discarded because the output queue was full.
+    pub dropped_output_ms: u64,
+    /// Output frames behind `dropped_output_ms`, kept for sub-millisecond losses.
+    pub dropped_output_frames: u64,
+}
+
+/// Turns the running loss counters into prompt, rate-limited warnings.
+#[derive(Debug, Default)]
+pub struct AudioLossReporter {
+    reported: PlaybackStatsSnapshot,
+    last_warning: Option<Instant>,
+}
+
+impl AudioLossReporter {
+    /// Returns the losses since the last report when there are any and the
+    /// warning interval has passed. Losses held back by the interval stay
+    /// pending and are included in the next report.
+    pub fn check(
+        &mut self,
+        current: &PlaybackStatsSnapshot,
+        now: Instant,
+    ) -> Option<AudioLossReport> {
+        let concealed_packets = current
+            .concealed_packets
+            .saturating_sub(self.reported.concealed_packets);
+        let dropped_output_frames = current
+            .dropped_output_frames
+            .saturating_sub(self.reported.dropped_output_frames);
+        if concealed_packets == 0 && dropped_output_frames == 0 {
+            return None;
+        }
+        if self
+            .last_warning
+            .is_some_and(|last| now.saturating_duration_since(last) < AUDIO_LOSS_WARNING_INTERVAL)
+        {
+            return None;
+        }
+        let report = AudioLossReport {
+            concealed_packets,
+            concealed_ms: concealed_packets * u64::from(FRAME_MS),
+            dropped_output_ms: current
+                .dropped_output_ms
+                .saturating_sub(self.reported.dropped_output_ms),
+            dropped_output_frames,
+        };
+        self.reported = *current;
+        self.last_warning = Some(now);
+        Some(report)
     }
 }
 
@@ -352,6 +421,62 @@ mod tests {
         assert!((clock_correction(0.0, 100) - 1.0).abs() <= MAX_CLOCK_CORRECTION + f64::EPSILON);
         assert!(
             (clock_correction(10_000.0, 100) - 1.0).abs() <= MAX_CLOCK_CORRECTION + f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn dropped_output_is_reported_in_milliseconds() {
+        let stats = PlaybackStats::default();
+        stats.output_frames_per_ms.store(48, Ordering::Relaxed);
+        stats.dropped_output_frames.store(51_237, Ordering::Relaxed);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.dropped_output_frames, 51_237);
+        assert_eq!(snapshot.dropped_output_ms, 1_067);
+    }
+
+    #[test]
+    fn loss_reporter_warns_immediately_then_batches() {
+        let mut reporter = AudioLossReporter::default();
+        let start = Instant::now();
+        let mut current = PlaybackStatsSnapshot::default();
+        assert_eq!(reporter.check(&current, start), None, "no loss, no warning");
+
+        current.concealed_packets = 2;
+        assert_eq!(
+            reporter.check(&current, start),
+            Some(AudioLossReport {
+                concealed_packets: 2,
+                concealed_ms: 10,
+                dropped_output_ms: 0,
+                dropped_output_frames: 0,
+            }),
+            "first loss is reported immediately"
+        );
+
+        current.concealed_packets = 5;
+        current.dropped_output_frames = 4_800;
+        current.dropped_output_ms = 100;
+        let soon = start + Duration::from_millis(100);
+        assert_eq!(
+            reporter.check(&current, soon),
+            None,
+            "held inside the interval"
+        );
+
+        let later = start + AUDIO_LOSS_WARNING_INTERVAL;
+        assert_eq!(
+            reporter.check(&current, later),
+            Some(AudioLossReport {
+                concealed_packets: 3,
+                concealed_ms: 15,
+                dropped_output_ms: 100,
+                dropped_output_frames: 4_800,
+            }),
+            "held losses are included in the next warning"
+        );
+        assert_eq!(
+            reporter.check(&current, later + AUDIO_LOSS_WARNING_INTERVAL),
+            None
         );
     }
 
