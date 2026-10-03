@@ -3,8 +3,8 @@ use std::time::Duration;
 use edge_clipboard::ImageTransferSchedule;
 use edge_crypto::{CryptoError, NoiseReader, NoiseSession, NoiseWriter};
 use edge_protocol::{
-    ClipboardEvent, ControlEvent, Edge, Frame, InputEvent, ProtocolError, ScreenInfo, decode_frame,
-    encode_frame,
+    ClipboardEvent, ControlEvent, Edge, Frame, InputEvent, MAX_SECURE_FRAME_BYTES, ProtocolError,
+    ScreenInfo, decode_frame, encode_frame,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
@@ -49,7 +49,7 @@ where
     }
 
     pub async fn write(&mut self, frame: &Frame) -> Result<()> {
-        let payload = encode_frame(frame)?;
+        let payload = encode_secure_frame(frame)?;
         self.inner.write_packet(&payload).await?;
         Ok(())
     }
@@ -69,6 +69,18 @@ where
             },
         )
     }
+}
+
+/// Serializes a frame and rejects it before encryption if it cannot fit in one
+/// Noise transport message. Rejection leaves the session usable.
+fn encode_secure_frame(frame: &Frame) -> Result<Vec<u8>> {
+    let payload = encode_frame(frame)?;
+    if payload.len() > MAX_SECURE_FRAME_BYTES {
+        return Err(
+            ProtocolError::FrameTooLarge(u32::try_from(payload.len()).unwrap_or(u32::MAX)).into(),
+        );
+    }
+    Ok(payload)
 }
 
 pub struct SecureFrameReader<R> {
@@ -95,7 +107,7 @@ where
     W: AsyncWrite + Unpin,
 {
     pub async fn write(&mut self, frame: &Frame) -> Result<()> {
-        let payload = encode_frame(frame)?;
+        let payload = encode_secure_frame(frame)?;
         self.inner.write_packet(&payload).await?;
         self.image_schedule.record_sent_frame(frame);
         Ok(())

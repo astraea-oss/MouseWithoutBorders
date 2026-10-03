@@ -17,10 +17,11 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
+use edge_clipboard::ClipboardPeerFeatures;
 #[cfg(windows)]
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
-    IncomingImageTransfer, OutgoingImageTransfer,
+    IncomingClipboardTransfer, OutgoingClipboardTransfer, TransferLimits,
 };
 use edge_common::PeerPosition;
 use edge_common::{
@@ -33,10 +34,11 @@ use edge_geometry::{Point, Rect, Size, normalized_perpendicular};
 use edge_protocol::Edge;
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStopReason, AudioStreamState,
-    CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, ControlEvent, Frame,
-    Heartbeat, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton,
-    NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent,
-    RoleEvent, RoleState, RoleTransitionState, ScreenInfo, decode_frame, encode_frame,
+    CLIPBOARD_IMAGE_EXTENSION, CLIPBOARD_TEXT_CHUNKS_EXTENSION, ClipboardCancelReason,
+    ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH,
+    INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, NodeCapability, OutputInfo,
+    PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent, RoleState,
+    RoleTransitionState, ScreenInfo, decode_frame, encode_frame, fits_secure_frame,
 };
 use edge_runtime::{
     AudioRouteStore, CommittedAudioRoute, CommittedRole, InputDirectionCapabilities,
@@ -1001,6 +1003,7 @@ async fn connect_session(
             capabilities: Vec::new(),
             extensions: vec![
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                CLIPBOARD_TEXT_CHUNKS_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
                 AUDIO_ROUTE_EXTENSION.to_string(),
@@ -1225,10 +1228,7 @@ async fn run_connected_inner(
         .extensions
         .iter()
         .any(|extension| extension == INPUT_TOGGLE_EXTENSION);
-    let peer_supports_images = initial_receiver
-        .extensions
-        .iter()
-        .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+    let peer_clipboard = ClipboardPeerFeatures::from_extensions(&initial_receiver.extensions);
     let screen_info = initial_receiver.screen_info.clone();
     let initial_role_state = initial_receiver
         .role_state
@@ -1291,7 +1291,7 @@ async fn run_connected_inner(
         update_windows_tray_status("Disconnected by user", log_path);
     }
     let mut runtime_config = config.clone();
-    let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_supports_images).await?;
+    let mut live_clipboard = LiveClipboardState::new(&runtime_config, peer_clipboard).await?;
     let mut clipboard_poll = time::interval(CLIPBOARD_POLL_INTERVAL);
     clipboard_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut clipboard_send = time::interval(Duration::from_millis(2));
@@ -1299,6 +1299,7 @@ async fn run_connected_inner(
     let mut stats = ControllerInputStats::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut config_refresh = time::interval(Duration::from_millis(500));
+    let mut config_reload: Option<tokio::task::JoinHandle<edge_common::Result<AppConfig>>> = None;
     let mut audio_watch = time::interval(Duration::from_millis(500));
     let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel();
     let (reader, mut writer) = SecureFrameSession::new(connection.session).split();
@@ -1476,7 +1477,15 @@ async fn run_connected_inner(
                 }
             },
             _ = config_refresh.tick() => {
-                match AppConfig::load(config_path).await {
+                // Reload off the session loop: a slow disk or antivirus scan
+                // must not delay the input frames queued behind this tick.
+                if config_reload.is_none() {
+                    let path = config_path.to_path_buf();
+                    config_reload = Some(tokio::spawn(async move { AppConfig::load(path).await }));
+                }
+            },
+            reloaded = finished_config_reload(&mut config_reload) => {
+                match reloaded {
                     Ok(updated) => {
                         runtime_config = updated;
                     }
@@ -1567,7 +1576,13 @@ async fn run_connected_inner(
                 if session_paused {
                     continue;
                 }
-                match live_clipboard.local_change_offer(&runtime_config).await {
+                live_clipboard.poll_local_change(&runtime_config);
+            },
+            finished = live_clipboard.finished_local_read() => {
+                if session_paused {
+                    continue;
+                }
+                match live_clipboard.complete_local_read(&runtime_config, finished) {
                     Ok(frames) => for frame in frames {
                         write_secure_frame_writer(&mut writer, &frame).await?;
                         stats.record_frame(&frame);
@@ -2716,6 +2731,29 @@ fn spawn_receiver_reader(
     receiver
 }
 
+#[cfg(windows)]
+struct PendingClipboardRead {
+    sequence: u32,
+    generation: u64,
+    task: tokio::task::JoinHandle<edge_windows_input::Result<Option<ClipboardItem>>>,
+}
+
+#[cfg(windows)]
+impl Drop for PendingClipboardRead {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct FinishedClipboardRead {
+    #[cfg(windows)]
+    sequence: u32,
+    #[cfg(windows)]
+    generation: u64,
+    #[cfg(windows)]
+    result: Result<Option<ClipboardItem>>,
+}
+
 #[derive(Default)]
 struct LiveClipboardState {
     #[cfg(windows)]
@@ -2725,13 +2763,19 @@ struct LiveClipboardState {
     #[cfg(windows)]
     last_clipboard_sequence: u32,
     #[cfg(windows)]
-    outgoing: Option<OutgoingImageTransfer>,
+    outgoing: Option<OutgoingClipboardTransfer>,
     #[cfg(windows)]
-    incoming: IncomingImageTransfer,
+    incoming: IncomingClipboardTransfer,
     #[cfg(windows)]
     next_transfer_id: u64,
     #[cfg(windows)]
-    peer_supports_images: bool,
+    peer: ClipboardPeerFeatures,
+    /// Incremented whenever a peer item is written into the local clipboard.
+    /// A background read started before that write is discarded as stale.
+    #[cfg(windows)]
+    apply_generation: u64,
+    #[cfg(windows)]
+    pending_read: Option<PendingClipboardRead>,
     #[cfg(windows)]
     outgoing_image_id: Option<ClipboardContentId>,
     #[cfg(windows)]
@@ -2743,7 +2787,7 @@ struct LiveClipboardState {
 }
 
 impl LiveClipboardState {
-    async fn new(config: &AppConfig, peer_supports_images: bool) -> Result<Self> {
+    async fn new(config: &AppConfig, peer: ClipboardPeerFeatures) -> Result<Self> {
         #[cfg(windows)]
         {
             let last_observed = if config.clipboard.enabled {
@@ -2762,9 +2806,11 @@ impl LiveClipboardState {
                 tracker: ClipboardChangeTracker::new(last_observed),
                 last_clipboard_sequence: edge_windows_input::clipboard_sequence_number(),
                 outgoing: None,
-                incoming: IncomingImageTransfer::default(),
+                incoming: IncomingClipboardTransfer::default(),
                 next_transfer_id: 0,
-                peer_supports_images,
+                peer,
+                apply_generation: 0,
+                pending_read: None,
                 outgoing_image_id: None,
                 last_sent_image_id: None,
                 held_input: VecDeque::new(),
@@ -2774,7 +2820,7 @@ impl LiveClipboardState {
 
         #[cfg(not(windows))]
         {
-            let _ = (config, peer_supports_images);
+            let _ = (config, peer);
             Ok(Self::default())
         }
     }
@@ -2814,7 +2860,7 @@ impl LiveClipboardState {
                     }
                 };
                 if let Some(ClipboardItem::Image(image)) = &current
-                    && self.peer_supports_images
+                    && self.peer.images
                     && config.clipboard.images_enabled
                 {
                     let image_id = ClipboardContentId::Image(image.content_sha256);
@@ -2831,6 +2877,18 @@ impl LiveClipboardState {
                     }
                 } else {
                     let mut frames = self.offer_item(config, current, true)?;
+                    if self
+                        .outgoing
+                        .as_ref()
+                        .is_some_and(OutgoingClipboardTransfer::is_text)
+                    {
+                        // Large text is chunked. Hold the paste until the
+                        // transfer completes, exactly like an image paste.
+                        self.held_input.push_back(frame);
+                        self.paste_barrier_deadline =
+                            Some(Instant::now() + CLIPBOARD_PASTE_BARRIER_TIMEOUT);
+                        return Ok(frames);
+                    }
                     frames.push(frame);
                     return Ok(frames);
                 }
@@ -2860,12 +2918,11 @@ impl LiveClipboardState {
                     }
                     46 if *down && self.ctrl_down && config.clipboard.enabled => {
                         let clipboard_tx = clipboard_tx.clone();
-                        let request =
-                            if self.peer_supports_images && config.clipboard.images_enabled {
-                                ClipboardEvent::ContentRequest
-                            } else {
-                                ClipboardEvent::TextRequest
-                            };
+                        let request = if self.peer.images && config.clipboard.images_enabled {
+                            ClipboardEvent::ContentRequest
+                        } else {
+                            ClipboardEvent::TextRequest
+                        };
                         tokio::spawn(async move {
                             time::sleep(Duration::from_millis(200)).await;
                             let _ = clipboard_tx.send(Frame::Clipboard(request));
@@ -2902,29 +2959,22 @@ impl LiveClipboardState {
 
             match event {
                 ClipboardEvent::TextOffer { text, .. } => {
-                    let remote = ClipboardItem::Text(text.clone());
-                    if self
-                        .prefer_newer_local_clipboard(remote.id(), config, writer)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                    edge_windows_input::write_clipboard_text(&text, config.clipboard.max_bytes)
-                        .context("failed to write Windows clipboard")?;
-                    self.tracker.mark_observed(Some(remote.id()));
-                    self.last_clipboard_sequence = edge_windows_input::clipboard_sequence_number();
-                    tracing::info!("updated Windows clipboard from receiver");
+                    self.apply_remote_text(text, config, writer).await?;
                 }
                 ClipboardEvent::TextRequest => {
                     let text = edge_windows_input::read_clipboard_text(config.clipboard.max_bytes)
                         .context("failed to read Windows clipboard")?;
                     if let Some(text) = text {
                         let item = ClipboardItem::Text(text.clone());
-                        let Some(sequence) = self.tracker.offer_current(Some(item.id())) else {
+                        let id = item.id();
+                        let Some(sequence) = self.tracker.offer_current(Some(id)) else {
                             return Ok(());
                         };
-                        let frame = Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text });
-                        write_secure_frame_writer(writer, &frame).await?;
+                        let mut frames = Vec::new();
+                        self.push_text_offer(sequence, text, Some(id), &mut frames);
+                        for frame in frames {
+                            write_secure_frame_writer(writer, &frame).await?;
+                        }
                         tracing::info!("sent Windows clipboard to receiver");
                     }
                 }
@@ -2936,8 +2986,11 @@ impl LiveClipboardState {
                 event @ (ClipboardEvent::ImageStart { .. }
                 | ClipboardEvent::ImageChunk { .. }
                 | ClipboardEvent::ImageEnd { .. }
-                | ClipboardEvent::ImageCancel { .. }) => {
-                    let transfer_id = event.image_transfer_id();
+                | ClipboardEvent::ImageCancel { .. }
+                | ClipboardEvent::TextStart { .. }
+                | ClipboardEvent::TextChunk { .. }
+                | ClipboardEvent::TextEnd { .. }) => {
+                    let transfer_id = event.transfer_id();
                     let is_cancel = matches!(&event, ClipboardEvent::ImageCancel { .. });
                     if is_cancel
                         && self
@@ -2946,15 +2999,22 @@ impl LiveClipboardState {
                             .is_some_and(|active| Some(active.transfer_id()) == transfer_id)
                     {
                         self.outgoing = None;
-                        tracing::info!("receiver cancelled Windows clipboard image transfer");
+                        tracing::info!("receiver cancelled Windows clipboard transfer");
                         for held in self.take_held_input() {
                             write_secure_frame_writer(writer, &held).await?;
                             self.after_input_sent(&held, config, clipboard_tx);
                         }
                         return Ok(());
                     }
-                    if !self.peer_supports_images || !config.clipboard.images_enabled {
-                        if let Some(transfer_id) = transfer_id.filter(|_| !is_cancel) {
+                    let supported = if is_cancel {
+                        true
+                    } else if event.is_text_transfer() {
+                        self.peer.text_chunks
+                    } else {
+                        self.peer.images && config.clipboard.images_enabled
+                    };
+                    if !supported {
+                        if let Some(transfer_id) = transfer_id {
                             write_secure_frame_writer(
                                 writer,
                                 &Frame::Clipboard(ClipboardEvent::ImageCancel {
@@ -2966,11 +3026,16 @@ impl LiveClipboardState {
                         }
                         return Ok(());
                     }
-                    match self
-                        .incoming
-                        .handle(event, config.clipboard.max_image_bytes)
-                    {
-                        Ok(Some(image)) => {
+                    let limits = TransferLimits {
+                        max_image_bytes: config.clipboard.max_image_bytes,
+                        max_text_bytes: config.clipboard.max_bytes,
+                    };
+                    match self.incoming.handle(event, limits) {
+                        Ok(Some(ClipboardItem::Text(text))) => {
+                            tracing::info!(bytes = text.len(), "received chunked clipboard text");
+                            self.apply_remote_text(text, config, writer).await?;
+                        }
+                        Ok(Some(ClipboardItem::Image(image))) => {
                             let remote_id = ClipboardContentId::Image(image.content_sha256);
                             if self
                                 .prefer_newer_local_clipboard(remote_id, config, writer)
@@ -2983,6 +3048,7 @@ impl LiveClipboardState {
                             edge_windows_input::write_clipboard_image(image)
                                 .await
                                 .context("failed to write Windows image clipboard")?;
+                            self.apply_generation = self.apply_generation.wrapping_add(1);
                             self.tracker.mark_observed(Some(remote_id));
                             self.last_clipboard_sequence =
                                 edge_windows_input::clipboard_sequence_number();
@@ -3014,7 +3080,7 @@ impl LiveClipboardState {
                                 )
                                 .await?;
                             }
-                            tracing::warn!(%error, "rejected receiver clipboard image transfer");
+                            tracing::warn!(%error, "rejected receiver clipboard transfer");
                         }
                     }
                 }
@@ -3042,10 +3108,15 @@ impl LiveClipboardState {
         self.offer_item(config, current, force)
     }
 
+    /// Starts a background read when the Windows clipboard changed.
+    ///
+    /// Reading (and normalizing images) can take long enough to stall input, so
+    /// it runs off the session loop. Applying a peer offer stays inline because
+    /// a following paste depends on the clipboard already being written.
     #[cfg(windows)]
-    async fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
-        if !config.clipboard.enabled {
-            return Ok(Vec::new());
+    fn poll_local_change(&mut self, config: &AppConfig) {
+        if !config.clipboard.enabled || self.pending_read.is_some() {
+            return;
         }
         // GetClipboardSequenceNumber returns 0 when the process has no clipboard
         // access to the window station. Treating that as a real sequence would
@@ -3053,16 +3124,74 @@ impl LiveClipboardState {
         // fall back to reading the clipboard instead.
         let sequence = edge_windows_input::clipboard_sequence_number();
         if sequence != 0 && sequence == self.last_clipboard_sequence {
+            return;
+        }
+        let clipboard = config.clipboard.clone();
+        self.pending_read = Some(PendingClipboardRead {
+            sequence,
+            generation: self.apply_generation,
+            task: tokio::spawn(
+                async move { edge_windows_input::read_clipboard_item(&clipboard).await },
+            ),
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn poll_local_change(&mut self, config: &AppConfig) {
+        let _ = config;
+    }
+
+    /// Completes when a background read finishes; pending while idle. Polling
+    /// the join handle by reference keeps this cancellation-safe.
+    #[cfg(windows)]
+    async fn finished_local_read(&mut self) -> FinishedClipboardRead {
+        let Some(pending) = self.pending_read.as_mut() else {
+            return std::future::pending().await;
+        };
+        let joined = (&mut pending.task).await;
+        let pending = self
+            .pending_read
+            .take()
+            .expect("background clipboard read disappeared");
+        let result = match joined {
+            Ok(result) => result.context("failed to read Windows clipboard"),
+            Err(error) => Err(anyhow::anyhow!("clipboard read task failed: {error}")),
+        };
+        FinishedClipboardRead {
+            sequence: pending.sequence,
+            generation: pending.generation,
+            result,
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn finished_local_read(&mut self) -> FinishedClipboardRead {
+        std::future::pending().await
+    }
+
+    /// Offers a finished background read. A read that raced with a peer write
+    /// is discarded without recording its sequence, so the next poll re-reads.
+    #[cfg(windows)]
+    fn complete_local_read(
+        &mut self,
+        config: &AppConfig,
+        finished: FinishedClipboardRead,
+    ) -> Result<Vec<Frame>> {
+        if finished.generation != self.apply_generation {
             return Ok(Vec::new());
         }
-        let frames = self.local_clipboard_offer(config, false).await?;
-        self.last_clipboard_sequence = sequence;
+        let frames = self.offer_item(config, finished.result?, false)?;
+        self.last_clipboard_sequence = finished.sequence;
         Ok(frames)
     }
 
     #[cfg(not(windows))]
-    async fn local_change_offer(&mut self, config: &AppConfig) -> Result<Vec<Frame>> {
-        let _ = config;
+    fn complete_local_read(
+        &mut self,
+        config: &AppConfig,
+        finished: FinishedClipboardRead,
+    ) -> Result<Vec<Frame>> {
+        let _ = (config, finished);
         Ok(Vec::new())
     }
 
@@ -3112,19 +3241,10 @@ impl LiveClipboardState {
         let mut frames = Vec::new();
         match current {
             Some(ClipboardItem::Text(text)) => {
-                if let Some(active) = self.outgoing.take() {
-                    frames.push(Frame::Clipboard(
-                        active.cancel_event(ClipboardCancelReason::Replaced),
-                    ));
-                }
-                self.outgoing_image_id = None;
-                frames.push(Frame::Clipboard(ClipboardEvent::TextOffer {
-                    sequence,
-                    text,
-                }));
+                self.push_text_offer(sequence, text, current_id, &mut frames);
             }
             Some(ClipboardItem::Image(image))
-                if self.peer_supports_images && config.clipboard.images_enabled =>
+                if self.peer.images && config.clipboard.images_enabled =>
             {
                 if let Some(active) = self.outgoing.take() {
                     frames.push(Frame::Clipboard(
@@ -3132,7 +3252,7 @@ impl LiveClipboardState {
                     ));
                 }
                 self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
-                self.outgoing = Some(OutgoingImageTransfer::new(
+                self.outgoing = Some(OutgoingClipboardTransfer::image(
                     self.next_transfer_id,
                     sequence,
                     image,
@@ -3144,11 +3264,82 @@ impl LiveClipboardState {
         Ok(frames)
     }
 
+    /// Queues text inline when it fits in one encrypted frame, otherwise starts
+    /// a chunked transfer. Text too large for a peer without chunking is
+    /// skipped with a warning instead of failing the session.
+    #[cfg(windows)]
+    fn push_text_offer(
+        &mut self,
+        sequence: u64,
+        text: String,
+        content_id: Option<ClipboardContentId>,
+        frames: &mut Vec<Frame>,
+    ) {
+        if let Some(active) = self.outgoing.take() {
+            frames.push(Frame::Clipboard(
+                active.cancel_event(ClipboardCancelReason::Replaced),
+            ));
+        }
+        self.outgoing_image_id = None;
+        let frame = Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text });
+        if fits_secure_frame(&frame) {
+            frames.push(frame);
+            return;
+        }
+        let Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) = frame else {
+            unreachable!("frame was constructed as a text offer");
+        };
+        if !self.peer.text_chunks {
+            tracing::warn!(
+                bytes = text.len(),
+                "clipboard text is too large for one frame and the peer cannot receive chunked text; not sent"
+            );
+            return;
+        }
+        tracing::info!(
+            bytes = text.len(),
+            "sending clipboard text as a chunked transfer"
+        );
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        self.outgoing = Some(OutgoingClipboardTransfer::text(
+            self.next_transfer_id,
+            sequence,
+            text,
+        ));
+        self.outgoing_image_id = content_id;
+    }
+
+    #[cfg(windows)]
+    async fn apply_remote_text(
+        &mut self,
+        text: String,
+        config: &AppConfig,
+        writer: &mut ScheduledNoiseWriter,
+    ) -> Result<()> {
+        let remote = ClipboardItem::Text(text.clone());
+        if self
+            .prefer_newer_local_clipboard(remote.id(), config, writer)
+            .await?
+        {
+            return Ok(());
+        }
+        edge_windows_input::write_clipboard_text(&text, config.clipboard.max_bytes)
+            .context("failed to write Windows clipboard")?;
+        self.apply_generation = self.apply_generation.wrapping_add(1);
+        self.tracker.mark_observed(Some(remote.id()));
+        self.last_clipboard_sequence = edge_windows_input::clipboard_sequence_number();
+        tracing::info!("updated Windows clipboard from receiver");
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn next_image_frame(&mut self) -> Option<(Frame, bool)> {
         let transfer = self.outgoing.as_mut()?;
         let event = transfer.next_event()?;
-        let completed = matches!(event, ClipboardEvent::ImageEnd { .. });
+        let completed = matches!(
+            event,
+            ClipboardEvent::ImageEnd { .. } | ClipboardEvent::TextEnd { .. }
+        );
         if completed {
             self.outgoing = None;
             self.last_sent_image_id = self.outgoing_image_id.take();
@@ -3255,6 +3446,21 @@ fn start_live_input(
     _screen_info: Option<ScreenInfo>,
 ) -> Result<Option<mpsc::Receiver<Frame>>> {
     Ok(None)
+}
+
+/// Completes when a background config reload finishes; pending while idle.
+async fn finished_config_reload(
+    reload: &mut Option<tokio::task::JoinHandle<edge_common::Result<AppConfig>>>,
+) -> Result<AppConfig> {
+    let Some(task) = reload.as_mut() else {
+        return std::future::pending().await;
+    };
+    let joined = task.await;
+    *reload = None;
+    match joined {
+        Ok(result) => Ok(result?),
+        Err(error) => Err(anyhow::anyhow!("config reload task failed: {error}")),
+    }
 }
 
 async fn recv_live_input(receiver: &mut Option<mpsc::Receiver<Frame>>) -> Option<Frame> {
@@ -3621,9 +3827,14 @@ jitter_target_ms = 60
             tracker: ClipboardChangeTracker::new(None),
             last_clipboard_sequence: 0,
             outgoing: None,
-            incoming: IncomingImageTransfer::default(),
+            incoming: IncomingClipboardTransfer::default(),
             next_transfer_id: 0,
-            peer_supports_images,
+            peer: ClipboardPeerFeatures {
+                images: peer_supports_images,
+                text_chunks: true,
+            },
+            apply_generation: 0,
+            pending_read: None,
             outgoing_image_id: None,
             last_sent_image_id: None,
             held_input: VecDeque::new(),
@@ -3647,12 +3858,45 @@ jitter_target_ms = 60
 
     #[cfg(windows)]
     #[test]
+    fn oversized_text_is_chunked_or_skipped_without_an_oversized_frame() {
+        let config = AppConfig::controller_default();
+        let text = "x".repeat(edge_protocol::MAX_SECURE_FRAME_BYTES + 1);
+
+        let mut state = test_clipboard_state(true);
+        let frames = state
+            .offer_item(&config, Some(ClipboardItem::Text(text.clone())), true)
+            .unwrap();
+        assert!(frames.iter().all(fits_secure_frame));
+        assert!(
+            state
+                .outgoing
+                .as_ref()
+                .is_some_and(OutgoingClipboardTransfer::is_text)
+        );
+        let mut completed = false;
+        while let Some((frame, done)) = state.next_image_frame() {
+            assert!(fits_secure_frame(&frame));
+            completed |= done;
+        }
+        assert!(completed);
+
+        let mut legacy = test_clipboard_state(true);
+        legacy.peer.text_chunks = false;
+        let frames = legacy
+            .offer_item(&config, Some(ClipboardItem::Text(text)), true)
+            .unwrap();
+        assert!(frames.is_empty());
+        assert!(legacy.outgoing.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn paste_barrier_releases_after_end_and_timeout() {
         let image =
             edge_clipboard::CanonicalImage::from_rgba(1, 1, vec![1, 2, 3, 255], 1024).unwrap();
         let image_id = ClipboardContentId::Image(image.content_sha256);
         let mut state = test_clipboard_state(true);
-        state.outgoing = Some(OutgoingImageTransfer::new(1, 1, image));
+        state.outgoing = Some(OutgoingClipboardTransfer::image(1, 1, image));
         state.outgoing_image_id = Some(image_id);
         state.paste_barrier_deadline = Some(Instant::now() + Duration::from_secs(1));
         state.held_input.push_back(Frame::input(
@@ -3671,7 +3915,7 @@ jitter_target_ms = 60
         assert_eq!(state.take_held_input().len(), 1);
 
         state.paste_barrier_deadline = Some(Instant::now() - Duration::from_millis(1));
-        state.outgoing = Some(OutgoingImageTransfer::new(
+        state.outgoing = Some(OutgoingClipboardTransfer::image(
             2,
             2,
             edge_clipboard::CanonicalImage::from_rgba(1, 1, vec![4, 5, 6, 255], 1024).unwrap(),

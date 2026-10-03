@@ -76,9 +76,9 @@ The executable is still named `edge-receiver-linux` as a compatibility entry
 point. A role-neutral package name will follow a deprecation window; retaining
 the current name keeps existing scripts and portable layouts stable meanwhile.
 
-Linux audio capture and playback use the PipeWire-Pulse command-line tools
-`pactl`, `parec`, and `pacat`. On Arch/CachyOS these are normally provided by
-`libpulse` alongside `pipewire-pulse`. Verify capture routing without a peer:
+Linux audio capture uses the PipeWire-Pulse command-line tools `pactl` and
+`parec`. On Arch/CachyOS these are normally provided by `libpulse` alongside
+`pipewire-pulse`. Verify capture routing without a peer:
 
 ```bash
 ./edge-receiver-linux --test-audio-route
@@ -86,6 +86,26 @@ Linux audio capture and playback use the PipeWire-Pulse command-line tools
 
 The diagnostic temporarily creates the `edge_kvm_remote` sink and restores the
 previous default before exiting.
+
+Linux audio playback opens a PipeWire stream directly and follows the default
+output. The audio device's clock paces playback, and the playback rate is
+trimmed by up to 0.5% to keep a 60 ms queue. Network bursts and gaps are
+absorbed, and clock drift between the two computers cannot build up into
+dropouts. If PipeWire is unavailable it falls back to ALSA. Set
+`EDGE_KVM_AUDIO_HOST=ALSA` or `EDGE_KVM_AUDIO_HOST=PipeWire` to force a backend.
+Check playback without a peer:
+
+```bash
+./edge-receiver-linux --test-audio-playback
+```
+
+Every ten seconds while audio is playing, the Linux log records a
+`Linux audio playback status` line with underrun and dropped-frame counts.
+
+Building the Linux node needs the PipeWire, SPA, and ALSA development headers
+and libclang. On Arch/CachyOS these come from `pipewire`, `alsa-lib`, and
+`clang`. On Debian/Ubuntu install `libpipewire-0.3-dev`, `libspa-0.2-dev`,
+`libasound2-dev`, and `libclang-dev`.
 
 Useful checks:
 
@@ -116,6 +136,11 @@ images_enabled = true
 max_bytes = 1048576
 max_image_bytes = 4194304
 ```
+
+Text that does not fit in one encrypted frame, roughly 64 KB, is sent in
+chunks up to `max_bytes` when both computers run this version. An older peer
+cannot receive chunked text. Oversized text is then skipped with a warning
+instead of dropping the connection.
 
 Multiple copied files, arbitrary files, and file paths themselves are
 intentionally not transferred.

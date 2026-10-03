@@ -8,8 +8,10 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 edge-audio = { path = "../edge-audio" }
+edge-audio-output = { path = "../edge-audio-output" }
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
 

@@ -18,7 +18,7 @@ use clap::{Parser, ValueEnum};
 use edge_audio::SessionSecrets;
 use edge_clipboard::{
     ClipboardChangeTracker, ClipboardContentId, ClipboardError, ClipboardItem,
-    IncomingImageTransfer, OutgoingImageTransfer,
+    ClipboardPeerFeatures, IncomingClipboardTransfer, OutgoingClipboardTransfer, TransferLimits,
 };
 use edge_common::{
     AppConfig, AudioLocalPlayback, AudioRoutePreference, Role, TransportMode, default_state_dir,
@@ -40,10 +40,11 @@ use edge_linux_input::{
 };
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
-    INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, NodeCapability, OutputInfo,
-    PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError,
-    RoleEvent, ScreenInfo, decode_frame, encode_frame,
+    CLIPBOARD_TEXT_CHUNKS_EXTENSION, ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge,
+    Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent,
+    NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent,
+    ReleaseReason, RemoteError, RoleEvent, ScreenInfo, decode_frame, encode_frame,
+    fits_secure_frame,
 };
 #[cfg(target_os = "linux")]
 use edge_runtime::{
@@ -78,6 +79,8 @@ const RETURN_EDGE_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const RETURN_EDGE_MARGIN: i32 = 12;
 const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
 const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
+const RETURN_EDGE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+const RETURN_EDGE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod tray;
@@ -104,6 +107,8 @@ struct Args {
     test_clipboard: bool,
     #[arg(long, help = "Exercise and restore the Linux audio routing path")]
     test_audio_route: bool,
+    #[arg(long, help = "Play a short test tone through the audio playback path")]
+    test_audio_playback: bool,
     #[arg(long, help = "Disable the StatusNotifier tray item")]
     no_tray: bool,
     #[arg(long, hide = true)]
@@ -222,6 +227,11 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         {
             restart_after_settings(parent_pid, &restart_config_path, &receiver_log).await?;
         }
+        return Ok(());
+    }
+
+    if args.test_audio_playback {
+        edge_linux_audio::test_audio_playback().await?;
         return Ok(());
     }
 
@@ -453,7 +463,7 @@ struct LinuxPeerConnection {
     peer_supports_audio_capture: bool,
     peer_supports_audio_playback: bool,
     peer_supports_audio_route: bool,
-    peer_supports_images: bool,
+    peer_clipboard: ClipboardPeerFeatures,
 }
 
 #[cfg(target_os = "linux")]
@@ -670,6 +680,7 @@ async fn connect_linux_peer(
             capabilities: Vec::new(),
             extensions: vec![
                 CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                CLIPBOARD_TEXT_CHUNKS_EXTENSION.to_string(),
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
                 AUDIO_ROUTE_EXTENSION.to_string(),
@@ -840,10 +851,7 @@ async fn connect_linux_peer(
         }
     };
     let peer_screen_info = read_initial_peer_screen(&mut session).await?;
-    let peer_supports_images = hello
-        .extensions
-        .iter()
-        .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+    let peer_clipboard = ClipboardPeerFeatures::from_extensions(&hello.extensions);
     Ok(LinuxPeerConnection {
         session,
         local_name: config.device_name.clone(),
@@ -860,7 +868,7 @@ async fn connect_linux_peer(
         peer_supports_audio_capture,
         peer_supports_audio_playback,
         peer_supports_audio_route,
-        peer_supports_images,
+        peer_clipboard,
     })
 }
 
@@ -914,7 +922,7 @@ async fn run_linux_controller_session(
         peer_supports_audio_capture,
         peer_supports_audio_playback,
         peer_supports_audio_route,
-        peer_supports_images,
+        peer_clipboard,
     } = connection;
     if let Some(info) = &peer_screen_info {
         tracing::info!(
@@ -1065,7 +1073,8 @@ async fn run_linux_controller_session(
         send_linux_audio_offer(&mut writer, &audio_socket).await?;
     }
     let mut frame_rx = spawn_controller_reader(reader);
-    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
+    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_clipboard).await?;
+    let mut clipboard_read = BackgroundClipboardRead::default();
     let mut clipboard_watcher = config
         .clipboard
         .enabled
@@ -1575,17 +1584,65 @@ async fn run_linux_controller_session(
                 event = recv_clipboard_change(&mut clipboard_watcher) => {
                     match event {
                         ClipboardWatchEvent::Changed => {
-                            if !session_paused
-                                && clipboard_sync.send_changed_offer(config, &mut writer).await?
-                                && let Some(tray) = tray
-                            {
-                                tray.clipboard_event();
+                            if !session_paused {
+                                clipboard_read.request(
+                                    &config.clipboard,
+                                    clipboard_sync.apply_generation,
+                                );
                             }
                         }
                         ClipboardWatchEvent::Closed => {
                             clipboard_watcher = Some(spawn_clipboard_change_watcher());
                         }
                     }
+                }
+                (read_generation, result) = clipboard_read.finished() => {
+                    let Some(result) = accept_background_clipboard_read(
+                        &mut clipboard_read,
+                        &config.clipboard,
+                        clipboard_sync.apply_generation,
+                        read_generation,
+                        result,
+                    ) else {
+                        continue;
+                    };
+                    if session_paused {
+                        continue;
+                    }
+                    let offered = match result {
+                        Ok(current) => {
+                            clipboard_sync.offer_item(config, &mut writer, current, false).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match offered {
+                        Ok(true) => {
+                            if let Some(tray) = tray {
+                                tray.clipboard_event();
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to synchronize changed Linux clipboard");
+                        }
+                    }
+                }
+                control = return_watcher.next_release() => {
+                    if local_is_controller
+                        || !input_forwarding_enabled
+                        || session_paused
+                        || !input_epoch.accepts_input()
+                    {
+                        continue;
+                    }
+                    tracing::info!(?control, "real cursor reached return edge");
+                    input_epoch.suspend();
+                    injector.all_keys_up().await.ok();
+                    write_secure_frame_writer(
+                        &mut writer,
+                        &Frame::control(role_epoch, control),
+                    )
+                    .await?;
                 }
                 frame = frame_rx.recv() => {
                     let frame = frame.context("Linux peer frame reader ended")??;
@@ -1634,16 +1691,8 @@ async fn run_linux_controller_session(
                             }
                             let is_motion = matches!(input.event, InputEvent::PointerMotion { .. });
                             injector.inject(input.event).await?;
-                            if is_motion
-                                && let Some(control) = return_watcher.release_if_at_edge().await?
-                            {
-                                input_epoch.suspend();
-                                injector.all_keys_up().await.ok();
-                                write_secure_frame_writer(
-                                    &mut writer,
-                                    &Frame::control(role_epoch, control),
-                                )
-                                .await?;
+                            if is_motion {
+                                return_watcher.note_motion();
                             }
                             if let Some(tray) = tray {
                                 tray.input_event();
@@ -2632,6 +2681,7 @@ async fn run_receiver(
                 capabilities: Vec::new(),
                 extensions: vec![
                     CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                    CLIPBOARD_TEXT_CHUNKS_EXTENSION.to_string(),
                     INPUT_TOGGLE_EXTENSION.to_string(),
                     PAIRING_CONFIRMATION_EXTENSION.to_string(),
                     AUDIO_ROUTE_EXTENSION.to_string(),
@@ -2789,10 +2839,7 @@ async fn run_receiver(
             .extensions
             .iter()
             .any(|extension| extension == INPUT_TOGGLE_EXTENSION);
-        let controller_supports_images = hello
-            .extensions
-            .iter()
-            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION);
+        let controller_clipboard = ClipboardPeerFeatures::from_extensions(&hello.extensions);
         if let Some(tray) = &tray {
             tray.audio_route(
                 tray::AudioChoice::Off,
@@ -2840,7 +2887,7 @@ async fn run_receiver(
             controller_supports_audio_capture,
             controller_supports_audio_route,
             controller_supports_input_toggle,
-            controller_supports_images,
+            controller_clipboard,
             controller_supports_input_capture,
             controller_supports_input_injection,
             controller_supports_role_switch,
@@ -3101,7 +3148,7 @@ async fn handle_controller(
     controller_supports_audio_capture: bool,
     controller_supports_audio_route: bool,
     controller_supports_input_toggle: bool,
-    controller_supports_images: bool,
+    controller_clipboard: ClipboardPeerFeatures,
     controller_supports_input_capture: bool,
     controller_supports_input_injection: bool,
     controller_supports_role_switch: bool,
@@ -3126,8 +3173,8 @@ async fn handle_controller(
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info.clone());
-    let mut clipboard_sync =
-        ReceiverClipboardState::new(config, controller_supports_images).await?;
+    let mut clipboard_sync = ReceiverClipboardState::new(config, controller_clipboard).await?;
+    let mut clipboard_read = BackgroundClipboardRead::default();
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut clipboard_watcher = config
@@ -3642,22 +3689,11 @@ async fn handle_controller(
             event = recv_clipboard_change(&mut clipboard_watcher) => {
                 match event {
                     ClipboardWatchEvent::Changed => {
-                        if session_paused {
-                            continue;
-                        }
-                        match clipboard_sync.send_changed_offer(config, &mut writer).await {
-                            Ok(true) => {
-                                stats.clipboard = stats.clipboard.saturating_add(1);
-                                tracing::info!("sent changed Linux clipboard to controller");
-                                if let Some(tray) = tray {
-                                    tray.clipboard_event();
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, "failed to synchronize changed Linux clipboard");
-                                append_portable_log(log_path, format!("failed to synchronize changed Linux clipboard: {error}"));
-                            }
+                        if !session_paused {
+                            clipboard_read.request(
+                                &config.clipboard,
+                                clipboard_sync.apply_generation,
+                            );
                         }
                     }
                     ClipboardWatchEvent::Closed => {
@@ -3666,6 +3702,60 @@ async fn handle_controller(
                         clipboard_watcher = Some(spawn_clipboard_change_watcher());
                     }
                 }
+            }
+            (read_generation, result) = clipboard_read.finished() => {
+                let Some(result) = accept_background_clipboard_read(
+                    &mut clipboard_read,
+                    &config.clipboard,
+                    clipboard_sync.apply_generation,
+                    read_generation,
+                    result,
+                ) else {
+                    continue;
+                };
+                if session_paused {
+                    continue;
+                }
+                let offered = match result {
+                    Ok(current) => clipboard_sync.offer_item(config, &mut writer, current, false).await,
+                    Err(error) => Err(error),
+                };
+                match offered {
+                    Ok(true) => {
+                        stats.clipboard = stats.clipboard.saturating_add(1);
+                        tracing::info!("sent changed Linux clipboard to controller");
+                        if let Some(tray) = tray {
+                            tray.clipboard_event();
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to synchronize changed Linux clipboard");
+                        append_portable_log(log_path, format!("failed to synchronize changed Linux clipboard: {error}"));
+                    }
+                }
+            }
+            control = return_watcher.next_release() => {
+                if local_is_controller
+                    || !input_forwarding_enabled
+                    || session_paused
+                    || !input_epoch.accepts_input()
+                {
+                    continue;
+                }
+                stats.return_releases = stats.return_releases.saturating_add(1);
+                tracing::info!(?control, "real cursor reached return edge");
+                append_portable_log(
+                    log_path,
+                    format!("real cursor reached return edge: {control:?}"),
+                );
+                input_epoch.suspend();
+                backend.all_keys_up().await.ok();
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::control(role_epoch, control),
+                )
+                .await?;
             }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
@@ -3707,25 +3797,7 @@ async fn handle_controller(
                         let is_motion = matches!(event, InputEvent::PointerMotion { .. });
                         backend.inject(event).await?;
                         if is_motion {
-                            match return_watcher.release_if_at_edge().await {
-                                Ok(Some(control)) => {
-                                    stats.return_releases = stats.return_releases.saturating_add(1);
-                                    tracing::info!(?control, "real cursor reached return edge");
-                                    append_portable_log(
-                                        log_path,
-                                        format!("real cursor reached return edge: {control:?}"),
-                                    );
-                                    input_epoch.suspend();
-                                    backend.all_keys_up().await.ok();
-                                    write_secure_frame_writer(
-                                        &mut writer,
-                                        &Frame::control(role_epoch, control),
-                                    )
-                                    .await?;
-                                }
-                                Ok(None) => {}
-                                Err(err) => tracing::warn!(%err, "failed to check Hyprland cursor position"),
-                            }
+                            return_watcher.note_motion();
                         }
                         if let Some(tray) = tray {
                             tray.input_event();
@@ -4443,7 +4515,7 @@ async fn handle_controller(
     _controller_supports_audio_capture: bool,
     _controller_supports_audio_route: bool,
     _controller_supports_input_toggle: bool,
-    _controller_supports_images: bool,
+    _controller_clipboard: ClipboardPeerFeatures,
     _controller_supports_input_capture: bool,
     _controller_supports_input_injection: bool,
     _controller_supports_role_switch: bool,
@@ -4457,10 +4529,14 @@ async fn handle_controller(
 #[derive(Default)]
 struct ReceiverClipboardState {
     tracker: ClipboardChangeTracker,
-    outgoing: Option<OutgoingImageTransfer>,
-    incoming: IncomingImageTransfer,
+    outgoing: Option<OutgoingClipboardTransfer>,
+    incoming: IncomingClipboardTransfer,
     next_transfer_id: u64,
-    peer_supports_images: bool,
+    peer: ClipboardPeerFeatures,
+    /// Incremented whenever a remote item is written into the local clipboard.
+    /// A background read started before that write may have observed the old
+    /// content, so its result is discarded and the clipboard read again.
+    apply_generation: u64,
 }
 
 #[cfg(not(unix))]
@@ -4469,8 +4545,84 @@ async fn shutdown_signal() -> Result<&'static str> {
     Ok("Ctrl+C")
 }
 
+/// Reads the local clipboard off the session loop.
+///
+/// `wl-paste` runs as a subprocess, so awaiting it inline delayed every input
+/// frame queued behind a local copy. Only reads triggered by local change
+/// notifications run here. Applying a remote offer stays inline, because a
+/// paste that follows it depends on the clipboard already being written.
+#[derive(Default)]
+struct BackgroundClipboardRead {
+    task: Option<(
+        u64,
+        tokio::task::JoinHandle<edge_linux_input::Result<Option<ClipboardItem>>>,
+    )>,
+    rerun: bool,
+}
+
+impl BackgroundClipboardRead {
+    fn request(&mut self, config: &edge_common::ClipboardConfig, generation: u64) {
+        if self.task.is_some() {
+            self.rerun = true;
+            return;
+        }
+        let config = config.clone();
+        self.task = Some((
+            generation,
+            tokio::spawn(async move { read_clipboard_item(&config).await }),
+        ));
+    }
+
+    /// Completes when the in-flight read finishes and stays pending while idle.
+    /// Polling the join handle by reference keeps this cancellation-safe.
+    async fn finished(&mut self) -> (u64, Result<Option<ClipboardItem>>) {
+        let Some((_, task)) = self.task.as_mut() else {
+            return future::pending().await;
+        };
+        let joined = task.await;
+        let (generation, _) = self
+            .task
+            .take()
+            .expect("background clipboard read disappeared");
+        let result = match joined {
+            Ok(result) => result.map_err(anyhow::Error::from),
+            Err(error) => Err(anyhow::anyhow!("clipboard read task failed: {error}")),
+        };
+        (generation, result)
+    }
+
+    fn take_rerun(&mut self) -> bool {
+        std::mem::take(&mut self.rerun)
+    }
+}
+
+impl Drop for BackgroundClipboardRead {
+    fn drop(&mut self) {
+        if let Some((_, task)) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Starts a fresh background read when a change arrived mid-read or a remote
+/// write made the finished result stale. Returns the result only when it is
+/// still current.
+fn accept_background_clipboard_read(
+    reader: &mut BackgroundClipboardRead,
+    config: &edge_common::ClipboardConfig,
+    current_generation: u64,
+    read_generation: u64,
+    result: Result<Option<ClipboardItem>>,
+) -> Option<Result<Option<ClipboardItem>>> {
+    let stale = read_generation != current_generation;
+    if reader.take_rerun() || stale {
+        reader.request(config, current_generation);
+    }
+    (!stale).then_some(result)
+}
+
 impl ReceiverClipboardState {
-    async fn new(config: &AppConfig, peer_supports_images: bool) -> Result<Self> {
+    async fn new(config: &AppConfig, peer: ClipboardPeerFeatures) -> Result<Self> {
         let last_observed = match read_clipboard_item(&config.clipboard).await {
             Ok(item) => item.as_ref().map(ClipboardItem::id),
             Err(error) => {
@@ -4481,10 +4633,18 @@ impl ReceiverClipboardState {
         Ok(Self {
             tracker: ClipboardChangeTracker::new(last_observed),
             outgoing: None,
-            incoming: IncomingImageTransfer::default(),
+            incoming: IncomingClipboardTransfer::default(),
             next_transfer_id: 0,
-            peer_supports_images,
+            peer,
+            apply_generation: 0,
         })
+    }
+
+    fn transfer_limits(config: &AppConfig) -> TransferLimits {
+        TransferLimits {
+            max_image_bytes: config.clipboard.max_image_bytes,
+            max_text_bytes: config.clipboard.max_bytes,
+        }
     }
 
     async fn handle_event(
@@ -4503,8 +4663,11 @@ impl ReceiverClipboardState {
             event @ (ClipboardEvent::ImageStart { .. }
             | ClipboardEvent::ImageChunk { .. }
             | ClipboardEvent::ImageEnd { .. }
-            | ClipboardEvent::ImageCancel { .. }) => {
-                let transfer_id = event.image_transfer_id();
+            | ClipboardEvent::ImageCancel { .. }
+            | ClipboardEvent::TextStart { .. }
+            | ClipboardEvent::TextChunk { .. }
+            | ClipboardEvent::TextEnd { .. }) => {
+                let transfer_id = event.transfer_id();
                 let is_cancel = matches!(&event, ClipboardEvent::ImageCancel { .. });
                 if is_cancel
                     && self
@@ -4513,11 +4676,18 @@ impl ReceiverClipboardState {
                         .is_some_and(|active| Some(active.transfer_id()) == transfer_id)
                 {
                     self.outgoing = None;
-                    tracing::info!("controller cancelled Linux clipboard image transfer");
+                    tracing::info!("peer cancelled Linux clipboard transfer");
                     return Ok(false);
                 }
-                if !self.peer_supports_images || !config.clipboard.images_enabled {
-                    if let Some(transfer_id) = transfer_id.filter(|_| !is_cancel) {
+                let supported = if is_cancel {
+                    true
+                } else if event.is_text_transfer() {
+                    self.peer.text_chunks
+                } else {
+                    self.peer.images && config.clipboard.images_enabled
+                };
+                if !supported {
+                    if let Some(transfer_id) = transfer_id {
                         write_secure_frame_writer(
                             writer,
                             &Frame::Clipboard(ClipboardEvent::ImageCancel {
@@ -4529,11 +4699,8 @@ impl ReceiverClipboardState {
                     }
                     return Ok(false);
                 }
-                match self
-                    .incoming
-                    .handle(event, config.clipboard.max_image_bytes)
-                {
-                    Ok(Some(image)) => {
+                match self.incoming.handle(event, Self::transfer_limits(config)) {
+                    Ok(Some(ClipboardItem::Image(image))) => {
                         let remote_id = ClipboardContentId::Image(image.content_sha256);
                         let current = read_clipboard_item(&config.clipboard).await?;
                         let current_id = current.as_ref().map(ClipboardItem::id);
@@ -4546,13 +4713,19 @@ impl ReceiverClipboardState {
                             return Ok(false);
                         }
                         write_clipboard_image(&config.clipboard, &image).await?;
+                        self.apply_generation = self.apply_generation.wrapping_add(1);
                         self.tracker.mark_observed(Some(remote_id));
                         tracing::info!(
                             width = image.width,
                             height = image.height,
                             bytes = image.png.len(),
-                            "updated Linux image clipboard from controller"
+                            "updated Linux image clipboard from peer"
                         );
+                        Ok(true)
+                    }
+                    Ok(Some(ClipboardItem::Text(text))) => {
+                        tracing::info!(bytes = text.len(), "received chunked clipboard text");
+                        self.handle_text_offer(config, writer, text).await?;
                         Ok(true)
                     }
                     Ok(None) => Ok(false),
@@ -4576,7 +4749,7 @@ impl ReceiverClipboardState {
                             )
                             .await?;
                         }
-                        tracing::warn!(%error, "rejected controller clipboard image transfer");
+                        tracing::warn!(%error, "rejected peer clipboard transfer");
                         Ok(false)
                     }
                 }
@@ -4603,8 +4776,9 @@ impl ReceiverClipboardState {
             return Ok(());
         }
         write_clipboard_text(&config.clipboard, &remote_text).await?;
+        self.apply_generation = self.apply_generation.wrapping_add(1);
         self.tracker.mark_observed(Some(remote_id));
-        tracing::info!("updated Linux clipboard from controller");
+        tracing::info!("updated Linux clipboard from peer");
         Ok(())
     }
 
@@ -4629,21 +4803,7 @@ impl ReceiverClipboardState {
         let Some(sequence) = self.tracker.offer_current(Some(item.id())) else {
             return Ok(false);
         };
-        write_secure_frame_writer(
-            writer,
-            &Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text }),
-        )
-        .await?;
-        Ok(true)
-    }
-
-    async fn send_changed_offer(
-        &mut self,
-        config: &AppConfig,
-        writer: &mut ScheduledNoiseWriter,
-    ) -> Result<bool> {
-        let current = read_clipboard_item(&config.clipboard).await?;
-        self.offer_item(config, writer, current, false).await
+        self.send_text(writer, sequence, text).await
     }
 
     async fn offer_item(
@@ -4663,34 +4823,13 @@ impl ReceiverClipboardState {
             return Ok(false);
         };
         match current {
-            Some(ClipboardItem::Text(text)) => {
-                if let Some(active) = self.outgoing.take() {
-                    write_secure_frame_writer(
-                        writer,
-                        &Frame::Clipboard(active.cancel_event(ClipboardCancelReason::Replaced)),
-                    )
-                    .await?;
-                }
-                write_secure_frame_writer(
-                    writer,
-                    &Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text }),
-                )
-                .await?;
-                Ok(true)
-            }
+            Some(ClipboardItem::Text(text)) => self.send_text(writer, sequence, text).await,
             Some(ClipboardItem::Image(image))
-                if self.peer_supports_images && config.clipboard.images_enabled =>
+                if self.peer.images && config.clipboard.images_enabled =>
             {
-                if let Some(active) = self.outgoing.take() {
-                    write_secure_frame_writer(
-                        writer,
-                        &Frame::Clipboard(active.cancel_event(ClipboardCancelReason::Replaced)),
-                    )
-                    .await?;
-                }
-                self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
-                self.outgoing = Some(OutgoingImageTransfer::new(
-                    self.next_transfer_id,
+                self.cancel_outgoing(writer).await?;
+                self.outgoing = Some(OutgoingClipboardTransfer::image(
+                    self.next_transfer_id(),
                     sequence,
                     image,
                 ));
@@ -4698,6 +4837,59 @@ impl ReceiverClipboardState {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Sends text inline when it fits in one encrypted frame, otherwise as a
+    /// chunked transfer. Text that is too large for a peer without chunking is
+    /// skipped with a warning instead of failing the session.
+    async fn send_text(
+        &mut self,
+        writer: &mut ScheduledNoiseWriter,
+        sequence: u64,
+        text: String,
+    ) -> Result<bool> {
+        self.cancel_outgoing(writer).await?;
+        let frame = Frame::Clipboard(ClipboardEvent::TextOffer { sequence, text });
+        if fits_secure_frame(&frame) {
+            write_secure_frame_writer(writer, &frame).await?;
+            return Ok(true);
+        }
+        let Frame::Clipboard(ClipboardEvent::TextOffer { text, .. }) = frame else {
+            unreachable!("frame was constructed as a text offer");
+        };
+        if !self.peer.text_chunks {
+            tracing::warn!(
+                bytes = text.len(),
+                "clipboard text is too large for one frame and the peer cannot receive chunked text; not sent"
+            );
+            return Ok(false);
+        }
+        tracing::info!(
+            bytes = text.len(),
+            "sending clipboard text as a chunked transfer"
+        );
+        self.outgoing = Some(OutgoingClipboardTransfer::text(
+            self.next_transfer_id(),
+            sequence,
+            text,
+        ));
+        Ok(true)
+    }
+
+    async fn cancel_outgoing(&mut self, writer: &mut ScheduledNoiseWriter) -> Result<()> {
+        if let Some(active) = self.outgoing.take() {
+            write_secure_frame_writer(
+                writer,
+                &Frame::Clipboard(active.cancel_event(ClipboardCancelReason::Replaced)),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn next_transfer_id(&mut self) -> u64 {
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        self.next_transfer_id
     }
 
     async fn send_next_image_frame(&mut self, writer: &mut ScheduledNoiseWriter) -> Result<bool> {
@@ -4708,7 +4900,10 @@ impl ReceiverClipboardState {
             self.outgoing = None;
             return Ok(false);
         };
-        let completed = matches!(event, ClipboardEvent::ImageEnd { .. });
+        let completed = matches!(
+            event,
+            ClipboardEvent::ImageEnd { .. } | ClipboardEvent::TextEnd { .. }
+        );
         write_secure_frame_writer(writer, &Frame::Clipboard(event)).await?;
         if completed {
             self.outgoing = None;
@@ -4780,12 +4975,22 @@ fn should_release_legacy_controller(
         && matches!(control, ControlEvent::EnterRemote { .. })
 }
 
+/// Watches the real cursor while this node receives remote input and reports
+/// when it reaches the return edge.
+///
+/// The cursor query runs in a background task, so it never delays input
+/// injection. Edge confirmations are counted inside that task, so every
+/// confirmation is a fresh sample rather than a re-read of a cached position.
+/// Each result carries the arming generation; results from an earlier arming
+/// are ignored.
 struct RemoteReturnWatcher {
     output: Option<OutputInfo>,
     edge: Option<Edge>,
-    last_poll: Instant,
-    entered_at: Option<Instant>,
-    consecutive_edge_polls: u8,
+    generation: u64,
+    motion_seen: Arc<AtomicBool>,
+    poller: Option<JoinHandle<()>>,
+    release_tx: mpsc::UnboundedSender<(u64, ControlEvent)>,
+    release_rx: mpsc::UnboundedReceiver<(u64, ControlEvent)>,
 }
 
 impl RemoteReturnWatcher {
@@ -4797,67 +5002,128 @@ impl RemoteReturnWatcher {
                 .cloned()
                 .or_else(|| info.outputs.first().cloned())
         });
-
+        let (release_tx, release_rx) = mpsc::unbounded_channel();
         Self {
             output,
             edge: None,
-            last_poll: Instant::now() - RETURN_EDGE_POLL_INTERVAL,
-            entered_at: None,
-            consecutive_edge_polls: 0,
+            generation: 0,
+            motion_seen: Arc::new(AtomicBool::new(false)),
+            poller: None,
+            release_tx,
+            release_rx,
         }
     }
 
     fn record_control(&mut self, control: &ControlEvent) {
         match control {
-            ControlEvent::EnterRemote { edge, .. } => {
-                self.edge = Some(*edge);
-                self.last_poll = Instant::now() - RETURN_EDGE_POLL_INTERVAL;
-                self.entered_at = Some(Instant::now());
-                self.consecutive_edge_polls = 0;
-            }
-            ControlEvent::ReleaseToLocal { .. } | ControlEvent::LeaveRemote { .. } => {
-                self.edge = None;
-                self.entered_at = None;
-                self.consecutive_edge_polls = 0;
-            }
-            ControlEvent::SetInputForwarding { enabled: false } => {
-                self.edge = None;
-                self.entered_at = None;
-                self.consecutive_edge_polls = 0;
-            }
+            ControlEvent::EnterRemote { edge, .. } => self.arm(*edge),
+            ControlEvent::ReleaseToLocal { .. }
+            | ControlEvent::LeaveRemote { .. }
+            | ControlEvent::SetInputForwarding { enabled: false } => self.disarm(),
             ControlEvent::SetInputForwarding { enabled: true } => {}
         }
     }
 
-    async fn release_if_at_edge(&mut self) -> Result<Option<ControlEvent>> {
-        let Some(edge) = self.edge else {
-            return Ok(None);
+    fn arm(&mut self, edge: Edge) {
+        self.disarm();
+        self.edge = Some(edge);
+        let Some(output) = self.output.clone() else {
+            return;
         };
-        let Some(output) = &self.output else {
-            return Ok(None);
-        };
-        if self
-            .entered_at
-            .is_some_and(|entered_at| entered_at.elapsed() < RETURN_EDGE_ENTRY_GRACE)
+        self.motion_seen.store(false, Ordering::Relaxed);
+        self.poller = Some(tokio::spawn(poll_return_edge(
+            self.generation,
+            edge,
+            output,
+            self.motion_seen.clone(),
+            self.release_tx.clone(),
+        )));
+    }
+
+    fn disarm(&mut self) {
+        self.edge = None;
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(poller) = self.poller.take() {
+            poller.abort();
+        }
+    }
+
+    /// Records that remote motion was injected. The poller only samples the
+    /// cursor while motion is arriving, matching the previous inline check.
+    fn note_motion(&self) {
+        if self.poller.is_some() {
+            self.motion_seen.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Resolves with the release control once the poller confirms the edge.
+    /// Receiving from the channel is cancellation-safe inside `select!`.
+    async fn next_release(&mut self) -> ControlEvent {
+        loop {
+            let Some((generation, control)) = self.release_rx.recv().await else {
+                return future::pending().await;
+            };
+            if generation == self.generation && self.edge.is_some() {
+                self.disarm();
+                return control;
+            }
+        }
+    }
+}
+
+impl Drop for RemoteReturnWatcher {
+    fn drop(&mut self) {
+        if let Some(poller) = self.poller.take() {
+            poller.abort();
+        }
+    }
+}
+
+async fn poll_return_edge(
+    generation: u64,
+    edge: Edge,
+    output: OutputInfo,
+    motion_seen: Arc<AtomicBool>,
+    release_tx: mpsc::UnboundedSender<(u64, ControlEvent)>,
+) {
+    time::sleep(RETURN_EDGE_ENTRY_GRACE).await;
+    let mut poll = time::interval(RETURN_EDGE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut confirmations = 0_u8;
+    let mut last_failure_log: Option<Instant> = None;
+    loop {
+        poll.tick().await;
+        if !motion_seen.swap(false, Ordering::Relaxed) {
+            continue;
+        }
+        let cursor = match time::timeout(RETURN_EDGE_QUERY_TIMEOUT, hyprland_cursor_position())
+            .await
         {
-            return Ok(None);
+            Ok(Ok(cursor)) => cursor,
+            failure => {
+                confirmations = 0;
+                if last_failure_log
+                    .is_none_or(|logged| logged.elapsed() >= RETURN_EDGE_FAILURE_LOG_INTERVAL)
+                {
+                    match failure {
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "failed to query the cursor for the return edge");
+                        }
+                        _ => tracing::warn!("cursor query for the return edge timed out"),
+                    }
+                    last_failure_log = Some(Instant::now());
+                }
+                continue;
+            }
+        };
+        if !real_cursor_at_return_edge(cursor, &output, edge) {
+            confirmations = 0;
+            continue;
         }
-        if self.last_poll.elapsed() < RETURN_EDGE_POLL_INTERVAL {
-            return Ok(None);
+        confirmations = confirmations.saturating_add(1);
+        if confirmations < RETURN_EDGE_CONFIRMATIONS {
+            continue;
         }
-        self.last_poll = Instant::now();
-
-        let cursor = hyprland_cursor_position().await?;
-        if !real_cursor_at_return_edge(cursor, output, edge) {
-            self.consecutive_edge_polls = 0;
-            return Ok(None);
-        }
-
-        self.consecutive_edge_polls = self.consecutive_edge_polls.saturating_add(1);
-        if self.consecutive_edge_polls < RETURN_EDGE_CONFIRMATIONS {
-            return Ok(None);
-        }
-
         let normalized_position = normalized_perpendicular(
             edge,
             Point {
@@ -4871,13 +5137,14 @@ impl RemoteReturnWatcher {
                 height: output.height,
             },
         );
-        self.edge = None;
-        self.entered_at = None;
-        self.consecutive_edge_polls = 0;
-        Ok(Some(ControlEvent::LeaveRemote {
-            edge,
-            normalized_position,
-        }))
+        let _ = release_tx.send((
+            generation,
+            ControlEvent::LeaveRemote {
+                edge,
+                normalized_position,
+            },
+        ));
+        return;
     }
 }
 
@@ -5116,6 +5383,57 @@ fn desktop_names_include_niri(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn return_watcher_ignores_results_from_an_earlier_arming() {
+        let mut watcher = RemoteReturnWatcher::new(None);
+        watcher.record_control(&ControlEvent::EnterRemote {
+            edge: Edge::Left,
+            normalized_position: 0.5,
+        });
+        let stale = watcher.generation.wrapping_sub(1);
+        let current = watcher.generation;
+        for (generation, normalized_position) in [(stale, 0.1), (current, 0.9)] {
+            watcher
+                .release_tx
+                .send((
+                    generation,
+                    ControlEvent::LeaveRemote {
+                        edge: Edge::Left,
+                        normalized_position,
+                    },
+                ))
+                .unwrap();
+        }
+        let control = tokio::time::timeout(Duration::from_secs(1), watcher.next_release())
+            .await
+            .unwrap();
+        assert_eq!(
+            control,
+            ControlEvent::LeaveRemote {
+                edge: Edge::Left,
+                normalized_position: 0.9,
+            }
+        );
+        assert!(watcher.edge.is_none());
+
+        watcher
+            .release_tx
+            .send((
+                current,
+                ControlEvent::LeaveRemote {
+                    edge: Edge::Left,
+                    normalized_position: 0.9,
+                },
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watcher.next_release())
+                .await
+                .is_err(),
+            "a disarmed watcher must not release again"
+        );
+    }
 
     #[test]
     fn recognizes_niri_in_desktop_name_lists() {

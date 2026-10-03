@@ -826,13 +826,69 @@ pub async fn hyprland_screen_info(primary: &str) -> Result<ScreenInfo> {
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HyprCursorPosition {
     pub x: i32,
     pub y: i32,
 }
 
+/// Upper bound for one Hyprland IPC cursor query.
+#[cfg(unix)]
+const HYPRLAND_IPC_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Queries the cursor position, preferring Hyprland's IPC socket.
+///
+/// A socket request takes well under a millisecond, while spawning `hyprctl`
+/// takes several. The `hyprctl` process is kept as a fallback for sessions
+/// where the socket path cannot be resolved.
 pub async fn hyprland_cursor_position() -> Result<HyprCursorPosition> {
+    #[cfg(unix)]
+    if let Some(path) = hyprland_socket_path() {
+        match hyprland_ipc_request(&path, "cursorpos").await {
+            Ok(text) => {
+                if let Some(position) = parse_hypr_cursor_position(text.trim()) {
+                    return Ok(position);
+                }
+                tracing::debug!(response = %text.trim(), "unexpected Hyprland IPC cursor response");
+            }
+            Err(error) => tracing::debug!(%error, "Hyprland IPC cursor query failed"),
+        }
+    }
+    hyprctl_cursor_position().await
+}
+
+#[cfg(unix)]
+fn hyprland_socket_path() -> Option<std::path::PathBuf> {
+    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    [
+        runtime_dir.map(|dir| dir.join("hypr")),
+        Some(std::path::PathBuf::from("/tmp/hypr")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|base| base.join(&signature).join(".socket.sock"))
+    .find(|path| path.exists())
+}
+
+#[cfg(unix)]
+async fn hyprland_ipc_request(path: &std::path::Path, request: &str) -> Result<String> {
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(path).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::with_capacity(64);
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    };
+    let response = time::timeout(HYPRLAND_IPC_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "Hyprland IPC timed out")
+        })??;
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+async fn hyprctl_cursor_position() -> Result<HyprCursorPosition> {
     let output = Command::new("hyprctl").arg("cursorpos").output().await?;
     if !output.status.success() {
         return Err(LinuxInputError::CommandFailed {
@@ -1102,4 +1158,42 @@ struct HyprMonitor {
     scale: f32,
     x: i32,
     y: i32,
+}
+
+#[cfg(all(test, unix))]
+mod hyprland_ipc_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipc_request_reads_the_full_response_and_parses_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".socket.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 32];
+            let length = stream.read(&mut request).await.unwrap();
+            assert_eq!(&request[..length], b"cursorpos");
+            stream.write_all(b"1256, 1263").await.unwrap();
+        });
+
+        let response = hyprland_ipc_request(&path, "cursorpos").await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            parse_hypr_cursor_position(response.trim()),
+            Some(HyprCursorPosition { x: 1256, y: 1263 })
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_request_times_out_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".socket.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let _server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(hyprland_ipc_request(&path, "cursorpos").await.is_err());
+    }
 }

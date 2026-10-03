@@ -10,6 +10,12 @@ pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
 pub const INPUT_TOGGLE_EXTENSION: &str = "input-toggle-v1";
 pub const PAIRING_CONFIRMATION_EXTENSION: &str = "pairing-confirmation-v1";
 pub const AUDIO_ROUTE_EXTENSION: &str = "audio-route-v1";
+/// Peers advertising this extension accept large clipboard text as a chunked
+/// `TextStart`/`TextChunk`/`TextEnd` transfer instead of a single `TextOffer`.
+pub const CLIPBOARD_TEXT_CHUNKS_EXTENSION: &str = "clipboard-text-chunks-v1";
+/// Largest serialized frame that fits in one encrypted transport message.
+/// Noise caps a transport message at 65,535 bytes, including its 16-byte tag.
+pub const MAX_SECURE_FRAME_BYTES: usize = 65_535 - 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -227,9 +233,27 @@ pub enum ClipboardEvent {
     ImageEnd {
         transfer_id: u64,
     },
+    /// Cancels any chunked clipboard transfer, image or text, by transfer id.
+    /// The name is kept for wire compatibility with image-only peers.
     ImageCancel {
         transfer_id: u64,
         reason: ClipboardCancelReason,
+    },
+    /// Starts a chunked UTF-8 text transfer. Only sent to peers that
+    /// advertise `CLIPBOARD_TEXT_CHUNKS_EXTENSION`.
+    TextStart {
+        transfer_id: u64,
+        sequence: u64,
+        total_bytes: u32,
+        content_sha256: [u8; 32],
+    },
+    TextChunk {
+        transfer_id: u64,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    TextEnd {
+        transfer_id: u64,
     },
 }
 
@@ -240,8 +264,31 @@ impl ClipboardEvent {
             | Self::ImageChunk { transfer_id, .. }
             | Self::ImageEnd { transfer_id }
             | Self::ImageCancel { transfer_id, .. } => Some(*transfer_id),
-            Self::TextOffer { .. } | Self::TextRequest | Self::ContentRequest => None,
+            Self::TextStart { .. }
+            | Self::TextChunk { .. }
+            | Self::TextEnd { .. }
+            | Self::TextOffer { .. }
+            | Self::TextRequest
+            | Self::ContentRequest => None,
         }
+    }
+
+    /// Transfer id of any chunked clipboard transfer frame, image or text.
+    pub fn transfer_id(&self) -> Option<u64> {
+        match self {
+            Self::TextStart { transfer_id, .. }
+            | Self::TextChunk { transfer_id, .. }
+            | Self::TextEnd { transfer_id } => Some(*transfer_id),
+            _ => self.image_transfer_id(),
+        }
+    }
+
+    /// Whether this frame belongs to a chunked text transfer.
+    pub fn is_text_transfer(&self) -> bool {
+        matches!(
+            self,
+            Self::TextStart { .. } | Self::TextChunk { .. } | Self::TextEnd { .. }
+        )
     }
 }
 
@@ -346,6 +393,11 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>> {
     rmp_serde::to_vec_named(frame).map_err(ProtocolError::from)
 }
 
+/// Returns whether `frame` can be sent as a single encrypted transport message.
+pub fn fits_secure_frame(frame: &Frame) -> bool {
+    encode_frame(frame).is_ok_and(|payload| payload.len() <= MAX_SECURE_FRAME_BYTES)
+}
+
 pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
     rmp_serde::from_slice(bytes).map_err(ProtocolError::from)
 }
@@ -397,6 +449,45 @@ mod tests {
         let decoded = decode_frame(&encoded).unwrap();
 
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn text_transfer_frames_round_trip_and_report_transfer_ids() {
+        let frames = [
+            ClipboardEvent::TextStart {
+                transfer_id: 9,
+                sequence: 4,
+                total_bytes: 70_000,
+                content_sha256: [3; 32],
+            },
+            ClipboardEvent::TextChunk {
+                transfer_id: 9,
+                offset: 0,
+                bytes: vec![b'a'; 16],
+            },
+            ClipboardEvent::TextEnd { transfer_id: 9 },
+        ];
+        for event in frames {
+            assert!(event.is_text_transfer());
+            assert_eq!(event.transfer_id(), Some(9));
+            assert_eq!(event.image_transfer_id(), None);
+            let frame = Frame::Clipboard(event);
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn secure_frame_limit_matches_noise_message_size() {
+        let fits = Frame::Clipboard(ClipboardEvent::TextOffer {
+            sequence: 1,
+            text: "a".repeat(MAX_SECURE_FRAME_BYTES - 64),
+        });
+        assert!(fits_secure_frame(&fits));
+        let oversized = Frame::Clipboard(ClipboardEvent::TextOffer {
+            sequence: 1,
+            text: "a".repeat(MAX_SECURE_FRAME_BYTES),
+        });
+        assert!(!fits_secure_frame(&oversized));
     }
 
     #[test]

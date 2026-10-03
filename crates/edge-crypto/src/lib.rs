@@ -8,7 +8,10 @@ use tokio::{
     sync::Mutex,
 };
 
-const MAX_NOISE_PACKET_BYTES: u32 = 4 * 1024 * 1024 + 16;
+/// Noise caps every handshake and transport message at 65,535 bytes.
+const MAX_NOISE_PACKET_BYTES: usize = 65_535;
+const NOISE_TAG_BYTES: usize = 16;
+const LENGTH_PREFIX_BYTES: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -196,6 +199,7 @@ pub fn noise_builder(identity: &IdentityKey) -> Result<Builder<'_>> {
 pub struct NoiseSession<S> {
     io: S,
     transport: snow::TransportState,
+    scratch: Vec<u8>,
 }
 
 impl<S> NoiseSession<S>
@@ -203,10 +207,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn write_packet(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut encrypted = vec![0; plaintext.len() + 16];
-        let len = self.transport.write_message(plaintext, &mut encrypted)?;
-        encrypted.truncate(len);
-        write_packet(&mut self.io, &encrypted).await
+        seal_packet(&mut self.transport, plaintext, &mut self.scratch)?;
+        write_sealed(&mut self.io, &self.scratch).await
     }
 
     pub async fn read_packet(&mut self) -> Result<Vec<u8>> {
@@ -232,6 +234,7 @@ where
             NoiseWriter {
                 io: writer,
                 transport,
+                scratch: self.scratch,
             },
         )
     }
@@ -261,6 +264,7 @@ where
 pub struct NoiseWriter<W> {
     io: W,
     transport: Arc<Mutex<snow::TransportState>>,
+    scratch: Vec<u8>,
 }
 
 impl<W> NoiseWriter<W>
@@ -268,13 +272,11 @@ where
     W: AsyncWrite + Unpin,
 {
     pub async fn write_packet(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut encrypted = vec![0; plaintext.len() + 16];
-        let len = {
+        {
             let mut transport = self.transport.lock().await;
-            transport.write_message(plaintext, &mut encrypted)?
-        };
-        encrypted.truncate(len);
-        write_packet(&mut self.io, &encrypted).await
+            seal_packet(&mut transport, plaintext, &mut self.scratch)?;
+        }
+        write_sealed(&mut self.io, &self.scratch).await
     }
 }
 
@@ -314,6 +316,7 @@ where
         NoiseSession {
             io,
             transport: noise.into_transport_mode()?,
+            scratch: Vec::new(),
         },
         remote_fingerprint,
     ))
@@ -344,23 +347,58 @@ where
         NoiseSession {
             io,
             transport: noise.into_transport_mode()?,
+            scratch: Vec::new(),
         },
         remote_fingerprint,
     ))
+}
+
+fn packet_too_large(len: usize) -> CryptoError {
+    CryptoError::PacketTooLarge(u32::try_from(len).unwrap_or(u32::MAX))
+}
+
+/// Encrypts `plaintext` into `out` as a complete length-prefixed packet.
+///
+/// The size check runs before encryption, so an oversized message is rejected
+/// without consuming a transport nonce and the session stays usable.
+fn seal_packet(
+    transport: &mut snow::TransportState,
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let sealed_len = plaintext.len() + NOISE_TAG_BYTES;
+    if sealed_len > MAX_NOISE_PACKET_BYTES {
+        return Err(packet_too_large(sealed_len));
+    }
+    out.clear();
+    out.resize(LENGTH_PREFIX_BYTES + sealed_len, 0);
+    let len = transport.write_message(plaintext, &mut out[LENGTH_PREFIX_BYTES..])?;
+    out.truncate(LENGTH_PREFIX_BYTES + len);
+    out[..LENGTH_PREFIX_BYTES].copy_from_slice(&(len as u32).to_be_bytes());
+    Ok(())
+}
+
+/// Writes an already length-prefixed packet with a single buffered write.
+async fn write_sealed<W>(writer: &mut W, packet: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(packet).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 async fn write_packet<W>(writer: &mut W, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let len = u32::try_from(payload.len()).map_err(|_| CryptoError::PacketTooLarge(u32::MAX))?;
-    if len > MAX_NOISE_PACKET_BYTES {
-        return Err(CryptoError::PacketTooLarge(len));
+    if payload.len() > MAX_NOISE_PACKET_BYTES {
+        return Err(packet_too_large(payload.len()));
     }
-    writer.write_u32(len).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
+    let mut packet = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    packet.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    packet.extend_from_slice(payload);
+    write_sealed(writer, &packet).await
 }
 
 async fn read_packet<R>(reader: &mut R) -> Result<Vec<u8>>
@@ -368,7 +406,7 @@ where
     R: AsyncRead + Unpin,
 {
     let len = reader.read_u32().await?;
-    if len > MAX_NOISE_PACKET_BYTES {
+    if len as usize > MAX_NOISE_PACKET_BYTES {
         return Err(CryptoError::PacketTooLarge(len));
     }
     let mut payload = vec![0; len as usize];
@@ -467,6 +505,45 @@ mod tests {
         assert_eq!(responder_peer, expected_initiator);
         assert_eq!(message, b"hello");
         assert_eq!(reply, b"world");
+    }
+
+    #[tokio::test]
+    async fn oversized_packet_is_rejected_without_breaking_the_session() {
+        let initiator_identity = IdentityKey::generate().unwrap();
+        let responder_identity = IdentityKey::generate().unwrap();
+        let expected_responder = responder_identity.fingerprint();
+        let (client, server) = tokio::io::duplex(1 << 20);
+
+        let initiator = tokio::spawn(async move {
+            let (session, _) =
+                initiate_noise_session(client, &initiator_identity, Some(&expected_responder))
+                    .await
+                    .unwrap();
+            let (_reader, mut writer) = session.split();
+            let oversized = vec![0; MAX_NOISE_PACKET_BYTES];
+            assert!(matches!(
+                writer.write_packet(&oversized).await,
+                Err(CryptoError::PacketTooLarge(_))
+            ));
+            let largest = vec![7; MAX_NOISE_PACKET_BYTES - NOISE_TAG_BYTES];
+            writer.write_packet(&largest).await.unwrap();
+            writer.write_packet(b"still in sync").await.unwrap();
+        });
+
+        let responder = tokio::spawn(async move {
+            let (session, _) = accept_noise_session(server, &responder_identity)
+                .await
+                .unwrap();
+            let (mut reader, _writer) = session.split();
+            let largest = reader.read_packet().await.unwrap();
+            let next = reader.read_packet().await.unwrap();
+            (largest.len(), next)
+        });
+
+        initiator.await.unwrap();
+        let (largest, next) = responder.await.unwrap();
+        assert_eq!(largest, MAX_NOISE_PACKET_BYTES - NOISE_TAG_BYTES);
+        assert_eq!(next, b"still in sync");
     }
 
     #[tokio::test]

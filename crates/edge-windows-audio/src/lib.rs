@@ -1,26 +1,22 @@
 #[cfg(windows)]
 mod implementation {
     use std::{
-        cell::UnsafeCell,
         collections::VecDeque,
         net::{IpAddr, SocketAddr},
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         thread,
         time::{Duration, Instant},
     };
 
     use anyhow::{Context, Result};
-    use cpal::{
-        Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
-        traits::{DeviceTrait, HostTrait, StreamTrait},
-    };
     use edge_audio::{
-        AudioPacket, CHANNELS, FLAG_PROBE, FRAME_MS, JitterBuffer, MAX_DATAGRAM_BYTES,
-        PacketCipher, PcmCodec, PcmConcealer, SAMPLE_RATE, SAMPLES_PER_CHANNEL, SessionSecrets,
+        AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
+        PcmConcealer, SAMPLE_RATE, SAMPLES_PER_CHANNEL, SessionSecrets,
     };
+    use edge_audio_output::{AudioPlayer, PlaybackStats};
     use tokio::{
         net::UdpSocket,
         sync::{mpsc, oneshot},
@@ -70,88 +66,7 @@ mod implementation {
         }
     }
 
-    const OUTPUT_PREBUFFER_MS: u32 = 30;
-    const OUTPUT_TARGET_MS: u32 = 60;
-    const OUTPUT_QUEUE_LIMIT_MS: u32 = 180;
-    const MAX_CLOCK_CORRECTION: f64 = 0.005;
     const MAX_PLAYOUT_FRAMES_PER_DATAGRAM: usize = 8;
-
-    struct AudioRing {
-        samples: Box<[UnsafeCell<f32>]>,
-        capacity: usize,
-        read: AtomicUsize,
-        write: AtomicUsize,
-    }
-
-    // AudioRing has exactly one producer and one consumer. The producer writes
-    // only slots outside the consumer's readable range and publishes them with
-    // Release; the callback reads only published slots after an Acquire load.
-    unsafe impl Sync for AudioRing {}
-
-    impl AudioRing {
-        fn new(capacity: usize) -> Self {
-            let capacity = capacity.max(2);
-            let samples = (0..capacity)
-                .map(|_| UnsafeCell::new(0.0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            Self {
-                samples,
-                capacity,
-                read: AtomicUsize::new(0),
-                write: AtomicUsize::new(0),
-            }
-        }
-
-        fn len(&self) -> usize {
-            self.write
-                .load(Ordering::Acquire)
-                .wrapping_sub(self.read.load(Ordering::Acquire))
-                .min(self.capacity)
-        }
-
-        fn push_slice_aligned(&self, input: &[f32], alignment: usize) -> usize {
-            let write = self.write.load(Ordering::Relaxed);
-            let read = self.read.load(Ordering::Acquire);
-            let available = self.capacity.saturating_sub(write.wrapping_sub(read));
-            let alignment = alignment.max(1);
-            let count = input.len().min(available) / alignment * alignment;
-            for (offset, sample) in input[..count].iter().enumerate() {
-                let index = write.wrapping_add(offset) % self.capacity;
-                // SAFETY: this is the single producer, and free-space accounting
-                // guarantees the consumer cannot currently access this slot.
-                unsafe { *self.samples[index].get() = *sample };
-            }
-            self.write
-                .store(write.wrapping_add(count), Ordering::Release);
-            count
-        }
-
-        fn pop(&self) -> Option<f32> {
-            let read = self.read.load(Ordering::Relaxed);
-            if read == self.write.load(Ordering::Acquire) {
-                return None;
-            }
-            let index = read % self.capacity;
-            // SAFETY: this is the single consumer, and the producer published
-            // this slot before advancing write with Release ordering.
-            let sample = unsafe { *self.samples[index].get() };
-            self.read.store(read.wrapping_add(1), Ordering::Release);
-            Some(sample)
-        }
-    }
-
-    #[derive(Default)]
-    struct PlaybackStats {
-        authenticated_packets: AtomicU64,
-        rejected_packets: AtomicU64,
-        late_packets: AtomicU64,
-        concealed_packets: AtomicU64,
-        output_underruns: AtomicU64,
-        dropped_output_frames: AtomicU64,
-        queued_output_samples: AtomicUsize,
-        output_samples_per_ms: AtomicUsize,
-    }
 
     #[derive(Debug, Clone, Copy)]
     pub struct WindowsAudioStats {
@@ -162,215 +77,6 @@ mod implementation {
         pub output_underruns: u64,
         pub dropped_output_frames: u64,
         pub queued_output_ms: usize,
-    }
-
-    pub struct AudioPlayer {
-        ring: Arc<AudioRing>,
-        _stream: Stream,
-        output_name: String,
-        converter: OutputConverter,
-        stats: Arc<PlaybackStats>,
-        target_queue_samples: usize,
-    }
-
-    impl AudioPlayer {
-        pub fn open_default() -> Result<Self> {
-            Self::open_default_with_stats(Arc::new(PlaybackStats::default()))
-        }
-
-        fn open_default_with_stats(stats: Arc<PlaybackStats>) -> Result<Self> {
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .context("Windows has no default audio output")?;
-            let output_name = device.to_string();
-            let supported = device
-                .default_output_config()
-                .context("failed to query the default Windows audio format")?;
-            let sample_format = supported.sample_format();
-            let config: StreamConfig = supported.into();
-            let output_rate = config.sample_rate;
-            let output_channels = config.channels as usize;
-            let prebuffer_samples =
-                duration_samples(output_rate, output_channels, OUTPUT_PREBUFFER_MS);
-            let queue_limit_samples =
-                duration_samples(output_rate, output_channels, OUTPUT_QUEUE_LIMIT_MS);
-            let target_queue_samples =
-                duration_samples(output_rate, output_channels, OUTPUT_TARGET_MS);
-            let ring = Arc::new(AudioRing::new(queue_limit_samples));
-            stats.output_samples_per_ms.store(
-                duration_samples(output_rate, output_channels, 1).max(1),
-                Ordering::Relaxed,
-            );
-            let stream = match sample_format {
-                SampleFormat::F32 => build_stream::<f32>(
-                    &device,
-                    config,
-                    ring.clone(),
-                    prebuffer_samples,
-                    stats.clone(),
-                )?,
-                SampleFormat::I16 => build_stream::<i16>(
-                    &device,
-                    config,
-                    ring.clone(),
-                    prebuffer_samples,
-                    stats.clone(),
-                )?,
-                SampleFormat::U16 => build_stream::<u16>(
-                    &device,
-                    config,
-                    ring.clone(),
-                    prebuffer_samples,
-                    stats.clone(),
-                )?,
-                format => anyhow::bail!("unsupported Windows output sample format: {format}"),
-            };
-            stream
-                .play()
-                .context("failed to start Windows audio output")?;
-            tracing::info!(
-                output_rate,
-                output_channels,
-                output_name,
-                "opened default Windows audio output"
-            );
-            Ok(Self {
-                ring,
-                _stream: stream,
-                output_name,
-                converter: OutputConverter::new(output_rate, output_channels),
-                stats,
-                target_queue_samples,
-            })
-        }
-
-        fn default_output_name() -> Result<String> {
-            let device = cpal::default_host()
-                .default_output_device()
-                .context("Windows has no default audio output")?;
-            Ok(device.to_string())
-        }
-
-        pub fn push_48k_stereo(&mut self, pcm: &[f32]) {
-            let queued = self.ring.len();
-            let target = self.target_queue_samples.max(1);
-            let error = (target as f64 - queued as f64) / target as f64;
-            let correction =
-                (error * MAX_CLOCK_CORRECTION).clamp(-MAX_CLOCK_CORRECTION, MAX_CLOCK_CORRECTION);
-            let converted = self.converter.convert(pcm, 1.0 + correction);
-            let channels = self.converter.output_channels.max(1);
-            let pushed = self.ring.push_slice_aligned(&converted, channels);
-            if pushed < converted.len() {
-                self.stats.dropped_output_frames.fetch_add(
-                    ((converted.len() - pushed) / channels) as u64,
-                    Ordering::Relaxed,
-                );
-            }
-            self.stats
-                .queued_output_samples
-                .store(self.ring.len(), Ordering::Relaxed);
-        }
-    }
-
-    fn build_stream<T>(
-        device: &Device,
-        config: StreamConfig,
-        ring: Arc<AudioRing>,
-        prebuffer_samples: usize,
-        stats: Arc<PlaybackStats>,
-    ) -> Result<Stream>
-    where
-        T: SizedSample + Sample + FromSample<f32>,
-    {
-        let mut playback_started = false;
-        device
-            .build_output_stream(
-                config,
-                move |output: &mut [T], _| {
-                    if !playback_started && ring.len() >= prebuffer_samples {
-                        playback_started = true;
-                    }
-                    for sample in output {
-                        let value = if playback_started {
-                            match ring.pop() {
-                                Some(value) => value,
-                                None => {
-                                    playback_started = false;
-                                    stats.output_underruns.fetch_add(1, Ordering::Relaxed);
-                                    0.0
-                                }
-                            }
-                        } else {
-                            0.0
-                        };
-                        *sample = T::from_sample(value);
-                    }
-                    stats
-                        .queued_output_samples
-                        .store(ring.len(), Ordering::Relaxed);
-                },
-                |error| tracing::warn!(%error, "Windows audio output error"),
-                None,
-            )
-            .context("failed to build Windows output stream")
-    }
-
-    fn duration_samples(rate: u32, channels: usize, duration_ms: u32) -> usize {
-        ((rate as u64 * channels as u64 * duration_ms as u64) / 1_000) as usize
-    }
-
-    struct OutputConverter {
-        output_rate: u32,
-        output_channels: usize,
-        source_position: f64,
-        input_frames: VecDeque<[f32; CHANNELS]>,
-    }
-
-    impl OutputConverter {
-        fn new(output_rate: u32, output_channels: usize) -> Self {
-            Self {
-                output_rate,
-                output_channels,
-                source_position: 0.0,
-                input_frames: VecDeque::new(),
-            }
-        }
-
-        fn convert(&mut self, input: &[f32], rate_scale: f64) -> Vec<f32> {
-            if input.is_empty() || self.output_channels == 0 || self.output_rate == 0 {
-                return Vec::new();
-            }
-            self.input_frames
-                .extend(input.as_chunks::<CHANNELS>().0.iter().copied());
-            let step = SAMPLE_RATE as f64 / (self.output_rate as f64 * rate_scale);
-            let estimated_frames =
-                ((self.input_frames.len() as f64 - self.source_position).max(0.0) / step).ceil()
-                    as usize;
-            let mut output = Vec::with_capacity(estimated_frames * self.output_channels);
-            while self.source_position + 1.0 < self.input_frames.len() as f64 {
-                let left_index = self.source_position.floor() as usize;
-                let fraction = (self.source_position - left_index as f64) as f32;
-                let left = self.input_frames[left_index];
-                let right = self.input_frames[left_index + 1];
-                let stereo = [
-                    left[0] + (right[0] - left[0]) * fraction,
-                    left[1] + (right[1] - left[1]) * fraction,
-                ];
-                for channel in 0..self.output_channels {
-                    output.push(match channel {
-                        0 => stereo[0],
-                        1 => stereo[1],
-                        _ => (stereo[0] + stereo[1]) * 0.5,
-                    });
-                }
-                self.source_position += step;
-            }
-            let consumed = self.source_position.floor() as usize;
-            self.input_frames.drain(..consumed);
-            self.source_position -= consumed as f64;
-            output
-        }
     }
 
     pub struct WindowsAudioReceiver {
@@ -571,7 +277,7 @@ mod implementation {
             jitter_target_ms: u32,
         ) -> Result<Self> {
             let stats = Arc::new(PlaybackStats::default());
-            let player = AudioPlayer::open_default_with_stats(stats.clone())?;
+            let player = AudioPlayer::open_default(stats.clone())?;
             socket
                 .connect(linux_endpoint)
                 .await
@@ -592,7 +298,7 @@ mod implementation {
             let task_linux_streaming = linux_streaming.clone();
             let task_stats = stats.clone();
             let task = tokio::spawn(async move {
-                let initial_output_name = player.output_name.clone();
+                let initial_output_name = player.output_name().to_string();
                 let (output_change_tx, mut output_change_rx) = mpsc::channel(1);
                 let output_monitor = tokio::spawn(async move {
                     let mut current_name = initial_output_name;
@@ -690,11 +396,11 @@ mod implementation {
                         }
                         changed = output_change_rx.recv() => {
                             if let Some(name) = changed
-                                && name != player.output_name
+                                && name != player.output_name()
                             {
-                                match AudioPlayer::open_default_with_stats(task_stats.clone()) {
+                                match AudioPlayer::open_default(task_stats.clone()) {
                                     Ok(updated) => {
-                                        tracing::info!(previous = %player.output_name, current = %updated.output_name, "followed Windows default audio output change");
+                                        tracing::info!(previous = %player.output_name(), current = %updated.output_name(), "followed Windows default audio output change");
                                         player = updated;
                                     }
                                     Err(error) => tracing::warn!(%error, "failed to follow Windows default audio output change"),
@@ -722,20 +428,15 @@ mod implementation {
         }
 
         pub fn stats(&self) -> WindowsAudioStats {
-            let samples_per_ms = self
-                .stats
-                .output_samples_per_ms
-                .load(Ordering::Relaxed)
-                .max(1);
+            let snapshot = self.stats.snapshot();
             WindowsAudioStats {
-                authenticated_packets: self.stats.authenticated_packets.load(Ordering::Relaxed),
-                rejected_packets: self.stats.rejected_packets.load(Ordering::Relaxed),
-                late_packets: self.stats.late_packets.load(Ordering::Relaxed),
-                concealed_packets: self.stats.concealed_packets.load(Ordering::Relaxed),
-                output_underruns: self.stats.output_underruns.load(Ordering::Relaxed),
-                dropped_output_frames: self.stats.dropped_output_frames.load(Ordering::Relaxed),
-                queued_output_ms: self.stats.queued_output_samples.load(Ordering::Relaxed)
-                    / samples_per_ms,
+                authenticated_packets: snapshot.authenticated_packets,
+                rejected_packets: snapshot.rejected_packets,
+                late_packets: snapshot.late_packets,
+                concealed_packets: snapshot.concealed_packets,
+                output_underruns: snapshot.output_underruns,
+                dropped_output_frames: snapshot.dropped_output_frames,
+                queued_output_ms: snapshot.queued_output_ms,
             }
         }
 
@@ -751,59 +452,12 @@ mod implementation {
     }
 
     pub fn play_test_tone() -> Result<()> {
-        let mut player = AudioPlayer::open_default()?;
-        for frame in 0..200 {
-            let mut pcm = Vec::with_capacity(SAMPLES_PER_CHANNEL * 2);
-            for sample in 0..SAMPLES_PER_CHANNEL {
-                let t = (frame * SAMPLES_PER_CHANNEL + sample) as f32 / SAMPLE_RATE as f32;
-                let value = (t * 440.0 * std::f32::consts::TAU).sin() * 0.18;
-                pcm.extend_from_slice(&[value, value]);
-            }
-            player.push_48k_stereo(&pcm);
-            std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
-        }
-        Ok(())
+        edge_audio_output::play_test_tone()
     }
 
     #[cfg(test)]
     mod tests {
-        use super::*;
-
-        #[test]
-        fn resampler_preserves_duration_and_channels() {
-            let input = vec![0.25; 480 * 2];
-            let mut converter = OutputConverter::new(44_100, 2);
-            let mut output = Vec::new();
-            for frame in input.as_chunks::<{ SAMPLES_PER_CHANNEL * CHANNELS }>().0 {
-                output.extend(converter.convert(frame, 1.0));
-            }
-            assert_eq!(output.len(), 441 * 2);
-            assert!(
-                output
-                    .iter()
-                    .all(|sample| (*sample - 0.25).abs() < f32::EPSILON)
-            );
-        }
-
-        #[test]
-        fn audio_ring_is_bounded_and_preserves_order() {
-            let ring = AudioRing::new(4);
-            assert_eq!(ring.push_slice_aligned(&[1.0, 2.0, 3.0], 1), 3);
-            assert_eq!(ring.pop(), Some(1.0));
-            assert_eq!(ring.push_slice_aligned(&[4.0, 5.0, 6.0], 1), 2);
-            assert_eq!(ring.len(), 4);
-            assert_eq!(ring.pop(), Some(2.0));
-            assert_eq!(ring.pop(), Some(3.0));
-            assert_eq!(ring.pop(), Some(4.0));
-            assert_eq!(ring.pop(), Some(5.0));
-            assert_eq!(ring.pop(), None);
-
-            let frame_ring = AudioRing::new(5);
-            assert_eq!(
-                frame_ring.push_slice_aligned(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2),
-                4
-            );
-        }
+        use edge_audio::{CHANNELS, PcmCodec, PcmConcealer, SAMPLES_PER_CHANNEL};
 
         #[test]
         fn packet_loss_is_faded_out_and_recovery_is_faded_in() {

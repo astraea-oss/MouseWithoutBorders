@@ -2,27 +2,28 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use edge_audio::{
-    AudioPacket, FLAG_PROBE, FRAME_MS, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
+    AudioPacket, FLAG_PROBE, JitterBuffer, MAX_DATAGRAM_BYTES, PacketCipher, PcmCodec,
     PcmConcealer, SAMPLES_PER_CHANNEL, SAMPLES_PER_FRAME, SessionSecrets,
 };
+use edge_audio_output::{AudioPlayer, PlaybackStats, PlaybackStatsSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     net::UdpSocket,
     process::{Child, Command},
-    sync::{mpsc, oneshot},
+    sync::oneshot,
     task::JoinHandle,
 };
 
 const VIRTUAL_SINK: &str = "edge_kvm_remote";
-const PLAYBACK_QUEUE_TARGET_MS: usize = 40;
-const PLAYBACK_QUEUE_FRAMES: usize = PLAYBACK_QUEUE_TARGET_MS / FRAME_MS as usize;
+const MAX_PLAYOUT_FRAMES_PER_DATAGRAM: usize = 8;
+const PLAYBACK_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoutingJournal {
@@ -243,6 +244,7 @@ pub struct LinuxAudioSender {
 
 pub struct LinuxAudioReceiver {
     task: Option<JoinHandle<String>>,
+    stats: Arc<PlaybackStats>,
 }
 
 impl Drop for LinuxAudioReceiver {
@@ -254,14 +256,25 @@ impl Drop for LinuxAudioReceiver {
 }
 
 impl LinuxAudioReceiver {
+    /// Starts authenticated UDP reception and clock-driven playback.
+    ///
+    /// Packets are decoded as they arrive and queued in the shared output ring.
+    /// The audio device drains that ring at its own rate, and the player trims
+    /// the playback rate to keep the queue near its target, so network bursts,
+    /// gaps, and clock drift are absorbed instead of dropped.
     pub async fn start(
         socket: Arc<UdpSocket>,
         source_endpoint: SocketAddr,
         secrets: SessionSecrets,
         jitter_target_ms: u32,
     ) -> Result<Self> {
-        let mut playback = spawn_playback()?;
-        let mut stdin = playback.stdin.take().context("pacat stdin was not piped")?;
+        let stats = Arc::new(PlaybackStats::default());
+        let player_stats = stats.clone();
+        let mut player =
+            tokio::task::spawn_blocking(move || AudioPlayer::open_default(player_stats))
+                .await
+                .context("audio output open task failed")?
+                .context("failed to open Linux audio output")?;
         let cipher = PacketCipher::new(&secrets);
         let probe = cipher.seal(&AudioPacket {
             sequence: 0,
@@ -274,35 +287,21 @@ impl LinuxAudioReceiver {
             .await
             .context("failed to send Linux playback UDP probe")?;
 
+        let task_stats = stats.clone();
         let task = tokio::spawn(async move {
             let mut jitter = JitterBuffer::new(jitter_target_ms);
             let mut concealer = PcmConcealer::default();
             let mut buffer = vec![0; MAX_DATAGRAM_BYTES];
-            // pacat deliberately paces writes to the physical audio device. Keep
-            // that backpressure off the UDP receive loop so short scheduler or
-            // sender bursts are absorbed here instead of overflowing the kernel
-            // socket queue and turning into audible packet loss.
-            // The jitter buffer already absorbs network variation. Keep this
-            // queue small so pacat backpressure cannot turn into audible lag.
-            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(PLAYBACK_QUEUE_FRAMES);
-            let mut playback_writer = tokio::spawn(async move {
-                while let Some(encoded) = playback_rx.recv().await {
-                    stdin
-                        .write_all(&encoded)
-                        .await
-                        .map_err(|error| format!("Linux audio playback failed: {error}"))?;
-                }
-                Ok::<(), String>(())
-            });
             let mut probe_retry = tokio::time::interval(Duration::from_millis(250));
             let mut watchdog = tokio::time::interval(Duration::from_millis(500));
+            let mut status = tokio::time::interval(PLAYBACK_STATUS_INTERVAL);
+            status.tick().await;
+            let mut last_status = PlaybackStatsSnapshot::default();
             let started = tokio::time::Instant::now();
             let mut last_media = started;
             let mut received_media = false;
             let mut media_stalled = false;
-            let mut playback_queue_drops = 0_u64;
-            let mut last_queue_warning = started;
-            let reason = 'receive: loop {
+            loop {
                 tokio::select! {
                     received = socket.recv_from(&mut buffer) => {
                         match received {
@@ -314,42 +313,27 @@ impl LinuxAudioReceiver {
                                         tracing::info!("Linux audio media recovered after a UDP gap");
                                         media_stalled = false;
                                     }
-                                    if jitter.push(packet) {
-                                        for _ in 0..8 {
-                                            let Some(packet) = jitter.pop_ready() else { break; };
-                                            let pcm = match concealer.decode(packet.as_ref().map(|packet| packet.payload.as_slice())) {
-                                                Ok(pcm) => pcm,
-                                                Err(error) => {
-                                                    tracing::debug!(%error, "rejected PCM audio frame");
-                                                    continue;
-                                                }
-                                            };
-                                            let encoded = match PcmCodec::encode(&pcm) {
-                                                Ok(encoded) => encoded,
-                                                Err(error) => break 'receive format!("Linux PCM playback encoding failed: {error}"),
-                                            };
-                                            match playback_tx.try_send(encoded) {
-                                                Ok(()) => {}
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    playback_queue_drops = playback_queue_drops.saturating_add(1);
-                                                    if last_queue_warning.elapsed() >= Duration::from_secs(1) {
-                                                        tracing::warn!(
-                                                            dropped_frames = playback_queue_drops,
-                                                            "Linux audio playback queue saturated; dropping newest frame"
-                                                        );
-                                                        playback_queue_drops = 0;
-                                                        last_queue_warning = tokio::time::Instant::now();
-                                                    }
-                                                }
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                    break 'receive "Linux audio playback queue closed".to_string();
-                                                }
-                                            }
+                                    task_stats.authenticated_packets.fetch_add(1, Ordering::Relaxed);
+                                    if !jitter.push(packet) {
+                                        task_stats.late_packets.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    for _ in 0..MAX_PLAYOUT_FRAMES_PER_DATAGRAM {
+                                        let Some(packet) = jitter.pop_ready() else { break; };
+                                        if packet.is_none() {
+                                            task_stats.concealed_packets.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        match concealer.decode(packet.as_ref().map(|packet| packet.payload.as_slice())) {
+                                            Ok(pcm) => player.push_48k_stereo(&pcm),
+                                            Err(error) => tracing::debug!(%error, "rejected PCM audio frame"),
                                         }
                                     }
                                 }
                                 Ok(_) => {}
-                                Err(error) => tracing::debug!(%error, "rejected Linux audio datagram"),
+                                Err(error) => {
+                                    task_stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!(%error, "rejected Linux audio datagram");
+                                }
                             },
                             Ok(_) => {}
                             Err(error) => break format!("Linux audio UDP receive failed: {error}"),
@@ -366,7 +350,7 @@ impl LinuxAudioReceiver {
                             && last_media.elapsed() > Duration::from_secs(2)
                         {
                             // UDP can disappear briefly on Wi-Fi while the encrypted
-                            // control session remains healthy. Keep pacat and the
+                            // control session remains healthy. Keep the output and the
                             // negotiated keys alive so playback resumes naturally when
                             // media returns instead of permanently killing the route.
                             media_stalled = true;
@@ -376,20 +360,33 @@ impl LinuxAudioReceiver {
                             break "audio source did not start within 8 seconds".to_string();
                         }
                     }
-                    result = &mut playback_writer => {
-                        break match result {
-                            Ok(Ok(())) => "Linux audio playback stopped unexpectedly".to_string(),
-                            Ok(Err(error)) => error,
-                            Err(error) => format!("Linux audio playback task failed: {error}"),
-                        };
+                    _ = status.tick(), if received_media => {
+                        let current = task_stats.snapshot();
+                        if current != last_status {
+                            tracing::info!(
+                                authenticated = current.authenticated_packets,
+                                rejected = current.rejected_packets,
+                                late = current.late_packets,
+                                concealed = current.concealed_packets,
+                                output_underruns = current.output_underruns,
+                                dropped_output_frames = current.dropped_output_frames,
+                                queued_output_ms = current.queued_output_ms,
+                                "Linux audio playback status"
+                            );
+                            last_status = current;
+                        }
                     }
                 }
-            };
-            playback_writer.abort();
-            let _ = playback.kill().await;
-            reason
+            }
         });
-        Ok(Self { task: Some(task) })
+        Ok(Self {
+            task: Some(task),
+            stats,
+        })
+    }
+
+    pub fn stats(&self) -> PlaybackStatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub fn is_finished(&self) -> bool {
@@ -405,6 +402,13 @@ impl LinuxAudioReceiver {
             Err(error) => format!("Linux audio receiver task failed: {error}"),
         }
     }
+}
+
+/// Plays a short test tone through the same output path used for streaming.
+pub async fn test_audio_playback() -> Result<()> {
+    tokio::task::spawn_blocking(edge_audio_output::play_test_tone)
+        .await
+        .context("audio test tone task failed")?
 }
 
 impl Drop for LinuxAudioSender {
@@ -509,26 +513,6 @@ fn spawn_capture(source: &str) -> Result<Child> {
     command
         .spawn()
         .context("failed to start parec; install PipeWire PulseAudio tools")
-}
-
-fn spawn_playback() -> Result<Child> {
-    let mut command = Command::new("pacat");
-    command
-        .args([
-            "--playback",
-            "--format=s16le",
-            "--rate=48000",
-            "--channels=2",
-            "--latency-msec=20",
-            "--raw",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    command
-        .spawn()
-        .context("failed to start pacat; install PipeWire PulseAudio tools")
 }
 
 #[cfg(test)]
