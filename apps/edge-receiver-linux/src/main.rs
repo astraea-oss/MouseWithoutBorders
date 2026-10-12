@@ -31,10 +31,9 @@ use edge_crypto::{IdentityKey, NoiseSession, PinStatus, PinStore, pairing_code};
 use edge_geometry::local_restore_point;
 use edge_geometry::{Point, Rect, normalized_perpendicular};
 use edge_linux_input::{
-    ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
-    UinputBackend, hyprland_cursor_position, hyprland_screen_info, read_clipboard_item,
-    read_clipboard_text, spawn_clipboard_change_watcher, write_clipboard_image,
-    write_clipboard_text,
+    HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend, UinputBackend,
+    hyprland_cursor_position, hyprland_screen_info, read_clipboard_item, read_clipboard_text,
+    write_clipboard_image, write_clipboard_text,
 };
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
@@ -67,6 +66,7 @@ use tokio::{
 };
 
 use acceptor::{AcceptEvent, Acceptor, IncomingPeer};
+use clipboard_hub::{ClipboardChanges, ClipboardHub};
 
 type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
 type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
@@ -81,6 +81,7 @@ const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod acceptor;
+mod clipboard_hub;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
@@ -471,6 +472,7 @@ async fn run_linux_connector(
     // First-time setup should lead directly to the mutual confirmation dialog.
     // Keep replacement of an existing identity behind the explicit pair action.
     let mut pairing_armed = initial_pairing_armed || config.peer.pinned_fingerprint.is_empty();
+    let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
     let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
     let (tray, mut tray_commands) = if enable_tray {
         let (tray, commands) = ReceiverTrayHandle::spawn(
@@ -597,6 +599,7 @@ async fn run_linux_connector(
             &mut tray_commands,
             &connector_pause,
             &log_path,
+            clipboard_hub.as_ref().map(ClipboardHub::subscribe),
             &mut capture,
         )
         .await
@@ -897,6 +900,7 @@ async fn run_linux_controller_session(
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
     connector_pause: &AtomicBool,
     log_path: &Path,
+    clipboard_changes: Option<ClipboardChanges>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
@@ -1069,10 +1073,7 @@ async fn run_linux_controller_session(
     }
     let mut frame_rx = spawn_controller_reader(reader);
     let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
-    let mut clipboard_watcher = config
-        .clipboard
-        .enabled
-        .then(spawn_clipboard_change_watcher);
+    let mut clipboard_watcher = clipboard_changes;
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let liveness_config = LivenessConfig::default();
@@ -1586,7 +1587,8 @@ async fn run_linux_controller_session(
                             }
                         }
                         ClipboardWatchEvent::Closed => {
-                            clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                            tracing::warn!("clipboard hub stopped; clipboard sync is off for this session");
+                            clipboard_watcher = None;
                         }
                     }
                 }
@@ -2479,6 +2481,7 @@ async fn run_receiver(
     );
 
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
+    let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
@@ -2826,6 +2829,7 @@ async fn run_receiver(
                 &local_fingerprint,
                 &hello.device_name,
                 &replaced,
+                clipboard_hub.as_ref().map(ClipboardHub::subscribe),
                 #[cfg(target_os = "linux")]
                 &mut capture,
             );
@@ -3102,14 +3106,15 @@ enum ClipboardWatchEvent {
     Closed,
 }
 
-async fn recv_clipboard_change(
-    watcher: &mut Option<ClipboardChangeWatcher>,
-) -> ClipboardWatchEvent {
-    match watcher {
-        Some(watcher) => match watcher.recv().await {
-            Some(()) => ClipboardWatchEvent::Changed,
-            None => ClipboardWatchEvent::Closed,
-        },
+async fn recv_clipboard_change(changes: &mut Option<ClipboardChanges>) -> ClipboardWatchEvent {
+    match changes {
+        Some(changes) => {
+            if changes.changed().await {
+                ClipboardWatchEvent::Changed
+            } else {
+                ClipboardWatchEvent::Closed
+            }
+        }
         None => future::pending().await,
     }
 }
@@ -3189,6 +3194,7 @@ async fn handle_controller(
     local_fingerprint: &str,
     controller_name: &str,
     replaced: &Notify,
+    clipboard_changes: Option<ClipboardChanges>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
@@ -3211,10 +3217,7 @@ async fn handle_controller(
         ReceiverClipboardState::new(config, controller_supports_images).await?;
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut clipboard_watcher = config
-        .clipboard
-        .enabled
-        .then(spawn_clipboard_change_watcher);
+    let mut clipboard_watcher = clipboard_changes;
     let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
     let mut audio_receiver: Option<edge_linux_audio::LinuxAudioReceiver> = None;
     let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
@@ -3750,9 +3753,9 @@ async fn handle_controller(
                         }
                     }
                     ClipboardWatchEvent::Closed => {
-                        tracing::warn!("Wayland clipboard watcher stopped; restarting");
-                        append_portable_log(log_path, "Wayland clipboard watcher stopped; restarting");
-                        clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                        tracing::warn!("clipboard hub stopped; clipboard sync is off for this session");
+                        append_portable_log(log_path, "clipboard hub stopped; clipboard sync is off for this session");
+                        clipboard_watcher = None;
                     }
                 }
             }
@@ -4540,6 +4543,7 @@ async fn handle_controller(
     _local_fingerprint: &str,
     _controller_name: &str,
     _replaced: &Notify,
+    _clipboard_changes: Option<ClipboardChanges>,
 ) -> Result<ControllerSessionExit> {
     anyhow::bail!("Linux receiver sessions are available only on Linux")
 }
