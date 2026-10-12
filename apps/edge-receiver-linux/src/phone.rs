@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
-    Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, PROTOCOL_VERSION, PhoneEvent, RemoteError,
+    Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PROTOCOL_VERSION,
+    PhoneEvent, RemoteError,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -41,6 +42,7 @@ use tokio::{
 use crate::{
     AbortOnDropTask, ClipboardWatchEvent, ReceiverClipboardState, append_portable_log,
     clipboard_hub::ClipboardChanges,
+    notifications::{FreedesktopNotifications, NotificationMirror},
     phone_pairing::{PAIRING_WINDOW, PairingRefusal, PairingWindow, lan_addresses, pairing_uri},
     recv_clipboard_change, reject_pairing,
 };
@@ -122,6 +124,7 @@ enum PhoneFrame {
     Heartbeat(u64),
     Error,
     Clipboard,
+    Notification,
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -132,6 +135,7 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Heartbeat(Heartbeat { sequence }) => PhoneFrame::Heartbeat(*sequence),
         Frame::Error(_) => PhoneFrame::Error,
         Frame::Clipboard(_) => PhoneFrame::Clipboard,
+        Frame::Notification(_) => PhoneFrame::Notification,
         Frame::Phone(PhoneEvent::PairRequest { token }) => PhoneFrame::PairRequest(token.clone()),
         Frame::Phone(PhoneEvent::Unpair) => PhoneFrame::Unpair,
         Frame::Phone(PhoneEvent::PairAccepted) => PhoneFrame::NotAllowed("PairAccepted"),
@@ -153,17 +157,30 @@ pub(crate) struct LocalHello {
 }
 
 impl LocalHello {
-    fn frame(&self) -> Frame {
+    /// `notifications` advertises that this receiver shows phone notifications.
+    fn frame(&self, notifications: bool) -> Frame {
+        let mut extensions = vec![HYPR_PHONE_EXTENSION.to_string()];
+        if notifications {
+            extensions.push(NOTIFICATIONS_EXTENSION.to_string());
+        }
         Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             device_name: self.device_name.clone(),
             role: self.role,
             public_key_fingerprint: self.fingerprint.clone(),
             capabilities: Vec::new(),
-            extensions: vec![HYPR_PHONE_EXTENSION.to_string()],
+            extensions,
             node_capabilities: Vec::new(),
         })
     }
+}
+
+/// One phone's notifications on the desktop. The mirror outlives the phone's
+/// connections so a reconnect can reconcile instead of re-showing everything.
+#[derive(Clone)]
+struct SessionNotifications {
+    desktop: Arc<FreedesktopNotifications>,
+    mirror: Arc<tokio::sync::Mutex<NotificationMirror>>,
 }
 
 /// Work for the receiver loop, which owns the pin store, so pin changes
@@ -213,6 +230,7 @@ struct SessionContext {
     ip: IpAddr,
     requests: mpsc::UnboundedSender<PhoneRequest>,
     clipboard: Option<ClipboardSource>,
+    notifications: Option<SessionNotifications>,
 }
 
 /// What a phone session needs to sync the clipboard: the receiver's
@@ -270,6 +288,9 @@ pub(crate) struct PhoneSessions {
     listen: SocketAddr,
     log_path: PathBuf,
     clipboard: Option<ClipboardSource>,
+    desktop: Option<Arc<FreedesktopNotifications>>,
+    /// Per phone key, kept across reconnects.
+    mirrors: HashMap<String, Arc<tokio::sync::Mutex<NotificationMirror>>>,
     timings: PhoneTimings,
     sessions: HashMap<String, RunningPhone>,
     pairing: Option<PairingWindow>,
@@ -291,6 +312,8 @@ impl PhoneSessions {
             listen,
             log_path,
             clipboard,
+            desktop: None,
+            mirrors: HashMap::new(),
             timings: PhoneTimings::DEFAULT,
             sessions: HashMap::new(),
             pairing: None,
@@ -298,6 +321,11 @@ impl PhoneSessions {
             requests_tx,
             requests_rx,
         }
+    }
+
+    /// Enables showing phone notifications on the desktop.
+    pub fn set_desktop_notifications(&mut self, desktop: FreedesktopNotifications) {
+        self.desktop = Some(Arc::new(desktop));
     }
 
     /// For the control socket, which sends requests from its own tasks.
@@ -374,7 +402,11 @@ impl PhoneSessions {
             },
         );
 
-        let hello = self.local.frame();
+        let hello = self.local.frame(self.desktop.is_some());
+        let notifications = self.desktop.clone().map(|desktop| SessionNotifications {
+            desktop,
+            mirror: Arc::clone(self.mirrors.entry(fingerprint.clone()).or_default()),
+        });
         let log_path = self.log_path.clone();
         let timings = self.timings;
         let context = SessionContext {
@@ -383,6 +415,7 @@ impl PhoneSessions {
             ip: addr.ip(),
             requests: self.requests_tx.clone(),
             clipboard: self.clipboard.as_ref().map(ClipboardSource::resubscribe),
+            notifications,
         };
         let task = tokio::spawn(async move {
             let name = context.name.clone();
@@ -553,6 +586,11 @@ impl PhoneSessions {
         }
         // Dropping the session aborts it and closes its socket.
         self.sessions.remove(&removed.fingerprint);
+        if let (Some(desktop), Some(mirror)) =
+            (&self.desktop, self.mirrors.remove(&removed.fingerprint))
+        {
+            mirror.lock().await.close_all(desktop.as_ref()).await;
+        }
         Ok(true)
     }
 
@@ -654,6 +692,11 @@ async fn run_phone_session(
         Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
     };
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
+    let notifications = context.notifications.clone().filter(|_| {
+        phone
+            .allowed_features
+            .contains(&PhoneFeature::Notifications)
+    });
     let mut clipboard = match context.clipboard {
         Some(source) if clipboard_allowed => match PhoneClipboard::start(source).await {
             Ok(clipboard) => Some(clipboard),
@@ -717,6 +760,16 @@ async fn run_phone_session(
                     }
                     PhoneFrame::Heartbeat(_) => {}
                     PhoneFrame::Error => tracing::warn!(?frame, "phone reported an error"),
+                    PhoneFrame::Notification => {
+                        let (Some(notifications), Frame::Notification(event)) = (&notifications, frame) else {
+                            tracing::debug!(phone = %context.name, "ignored notification from a phone without notification access");
+                            continue;
+                        };
+                        let mut mirror = notifications.mirror.lock().await;
+                        if let Err(error) = mirror.apply(event, notifications.desktop.as_ref(), &context.name).await {
+                            tracing::warn!(%error, phone = %context.name, "couldn't show phone notification");
+                        }
+                    }
                     PhoneFrame::Clipboard => {
                         let (Some(sync), Frame::Clipboard(event)) = (clipboard.as_mut(), frame) else {
                             tracing::debug!(phone = %context.name, "ignored clipboard from a phone without clipboard access");
@@ -912,13 +965,14 @@ mod tests {
                 role: Role::Receiver,
                 fingerprint: receiver_identity.fingerprint(),
             }
-            .frame();
+            .frame(false);
             let context = SessionContext {
                 name: "Pixel".to_string(),
                 fingerprint: "phone".to_string(),
                 ip: "127.0.0.1".parse().unwrap(),
                 requests: requests_tx,
                 clipboard: None,
+                notifications: None,
             };
             let result = run_phone_session(session, hello, entry, context, timings).await;
             let summary = match &result {

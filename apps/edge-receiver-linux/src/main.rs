@@ -84,6 +84,7 @@ static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 mod acceptor;
 mod clipboard_hub;
 mod control;
+mod notifications;
 mod phone;
 mod phone_pairing;
 mod tray;
@@ -2162,7 +2163,7 @@ async fn run_linux_controller_session(
                             AudioControl::SetRoute { .. }
                             | AudioControl::State { .. }
                         ) => {}
-                        Frame::Hello(_) | Frame::Pairing(_) | Frame::Phone(_) => {}
+                        Frame::Hello(_) | Frame::Pairing(_) | Frame::Phone(_) | Frame::Notification(_) => {}
                     }
                 }
                 _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {
@@ -2512,6 +2513,22 @@ async fn run_receiver(
         }),
     );
     let _control = control::spawn_server(phones.requests(), &log_path).await;
+    match control::socket_path() {
+        Some(control) => {
+            let icons = control.with_file_name("phone-icons");
+            match notifications::FreedesktopNotifications::connect(icons).await {
+                Ok(desktop) => phones.set_desktop_notifications(desktop),
+                Err(error) => append_portable_log(
+                    &log_path,
+                    format!("phone notifications unavailable: {error:#}"),
+                ),
+            }
+        }
+        None => append_portable_log(
+            &log_path,
+            "no runtime directory; phone notifications unavailable",
+        ),
+    }
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
@@ -4576,7 +4593,7 @@ async fn handle_controller(
                             "controller screen info"
                         );
                     }
-                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) | Frame::Phone(_) => {}
+                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) | Frame::Phone(_) | Frame::Notification(_) => {}
                 }
             },
             _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {

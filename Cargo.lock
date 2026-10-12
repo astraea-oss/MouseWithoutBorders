@@ -999,14 +999,17 @@ dependencies = [
  "edge-runtime",
  "edge-ui",
  "getrandom 0.2.17",
+ "hex",
  "if-addrs",
  "ksni",
  "libc",
  "qrcode",
+ "sha2",
  "socket2",
  "tempfile",
  "tokio",
  "tracing",
+ "zbus",
 ]
 
 [[package]]

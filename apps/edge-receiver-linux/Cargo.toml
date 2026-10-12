@@ -23,13 +23,16 @@ edge-protocol = { path = "../../crates/edge-protocol" }
 edge-runtime = { path = "../../crates/edge-runtime" }
 edge-ui = { path = "../../crates/edge-ui" }
 getrandom = "0.2"
+hex.workspace = true
 if-addrs = "0.15"
 ksni = "0.3.5"
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
+sha2.workspace = true
 socket2 = { version = "0.6.4", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile.workspace = true

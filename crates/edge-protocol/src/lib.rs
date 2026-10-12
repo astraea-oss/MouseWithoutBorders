@@ -13,6 +13,9 @@ pub const AUDIO_ROUTE_EXTENSION: &str = "audio-route-v1";
 /// Sent only by HyprMobile phones. A peer advertising it is handled as a
 /// phone: restricted frames, phone liveness, and phone pins.
 pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
+/// A phone that mirrors its notifications; the receiver echoes it back when it
+/// shows them.
+pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -42,6 +45,8 @@ pub enum Frame {
     Role(RoleEvent),
     /// Only exchanged with peers that advertised `hypr-phone-v1`.
     Phone(PhoneEvent),
+    /// Phone → receiver, only with `notifications-v1`.
+    Notification(NotificationEvent),
 }
 
 impl Frame {
@@ -88,6 +93,44 @@ pub enum PhoneEvent {
     /// Phone → receiver: forget this phone. The receiver removes the pin and
     /// closes the session.
     Unpair,
+}
+
+/// Mirrors the phone's current notifications (view only). After every
+/// (re)connect the phone sends `SnapshotStart`, `Posted` for each current
+/// notification, then `SnapshotEnd`; the receiver closes anything it showed
+/// that wasn't posted again, so missed removals are fixed and unchanged ones
+/// aren't shown twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationEvent {
+    /// New, or an update to the notification with the same `id`.
+    Posted(PhoneNotification),
+    Removed {
+        id: u64,
+    },
+    SnapshotStart,
+    SnapshotEnd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneNotification {
+    /// Stable for one notification on the phone across updates.
+    pub id: u64,
+    pub app_name: String,
+    pub title: String,
+    pub body: String,
+    /// A small PNG (the app's icon or the notification's picture).
+    pub icon_png: Option<Vec<u8>>,
+    /// When the phone posted it, Unix milliseconds.
+    pub posted_ms: u64,
+}
+
+impl PhoneNotification {
+    pub const MAX_APP_NAME_CHARS: usize = 64;
+    pub const MAX_TITLE_CHARS: usize = 256;
+    pub const MAX_BODY_BYTES: usize = 4096;
+    /// MessagePack stores each byte of a `Vec<u8>` as up to two bytes, so
+    /// this keeps a notification well inside one 64 KiB Noise frame.
+    pub const MAX_ICON_BYTES: usize = 24 * 1024;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -832,6 +875,21 @@ mod tests {
                 include_str!("../fixtures/v2-role-ready.hex"),
             ),
         ]
+    }
+
+    #[test]
+    fn the_largest_notification_fits_in_one_noise_frame() {
+        let frame = Frame::Notification(NotificationEvent::Posted(PhoneNotification {
+            id: u64::MAX,
+            app_name: "\u{1F600}".repeat(PhoneNotification::MAX_APP_NAME_CHARS),
+            title: "\u{1F600}".repeat(PhoneNotification::MAX_TITLE_CHARS),
+            body: "a".repeat(PhoneNotification::MAX_BODY_BYTES),
+            icon_png: Some(vec![0xff; PhoneNotification::MAX_ICON_BYTES]),
+            posted_ms: u64::MAX,
+        }));
+        let encoded = encode_frame(&frame).unwrap();
+        assert!(encoded.len() + 16 <= 65_535, "{} bytes", encoded.len());
+        assert_eq!(decode_frame(&encoded).unwrap(), frame);
     }
 
     #[test]
