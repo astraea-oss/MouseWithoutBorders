@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     path::Path,
     sync::{
@@ -99,13 +99,41 @@ impl IdentityFile {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinStore {
+    /// PC peers, keyed by device name.
     #[serde(default)]
     pub peers: BTreeMap<String, PinnedPeer>,
+    /// Phones, keyed by device name. Kept apart from PC peers so a phone can
+    /// never take a PC's place (or the reverse) by choosing its name. Omitted
+    /// when empty, so pin files without phones are unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phones: BTreeMap<String, PinnedPhone>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedPeer {
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedPhone {
+    pub fingerprint: String,
+    #[serde(default = "PhoneFeature::all")]
+    pub allowed_features: BTreeSet<PhoneFeature>,
+}
+
+/// What a paired phone may use. Enforced by the receiver in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhoneFeature {
+    Clipboard,
+    Notifications,
+    Audio,
+}
+
+impl PhoneFeature {
+    pub fn all() -> BTreeSet<Self> {
+        BTreeSet::from([Self::Clipboard, Self::Notifications, Self::Audio])
+    }
 }
 
 impl PinStore {
@@ -138,6 +166,53 @@ impl PinStore {
                 fingerprint: fingerprint.into(),
             },
         );
+    }
+
+    pub fn phone_status(&self, phone: &str, fingerprint: &str) -> PinStatus {
+        match self.phones.get(phone) {
+            Some(pinned) if pinned.fingerprint == fingerprint => PinStatus::Trusted,
+            Some(pinned) => PinStatus::Changed {
+                expected: pinned.fingerprint.clone(),
+            },
+            None => PinStatus::Unknown,
+        }
+    }
+
+    pub fn phone(&self, phone: &str) -> Option<&PinnedPhone> {
+        self.phones.get(phone)
+    }
+
+    pub fn pin_phone(
+        &mut self,
+        phone: impl Into<String>,
+        fingerprint: impl Into<String>,
+        allowed_features: BTreeSet<PhoneFeature>,
+    ) {
+        self.phones.insert(
+            phone.into(),
+            PinnedPhone {
+                fingerprint: fingerprint.into(),
+                allowed_features,
+            },
+        );
+    }
+
+    pub fn remove_phone(&mut self, phone: &str) -> Option<PinnedPhone> {
+        self.phones.remove(phone)
+    }
+
+    /// Whether this key is pinned for a PC peer, under any name.
+    pub fn is_pc_key(&self, fingerprint: &str) -> bool {
+        self.peers
+            .values()
+            .any(|pinned| pinned.fingerprint == fingerprint)
+    }
+
+    /// Whether this key is pinned for a phone, under any name.
+    pub fn is_phone_key(&self, fingerprint: &str) -> bool {
+        self.phones
+            .values()
+            .any(|pinned| pinned.fingerprint == fingerprint)
     }
 }
 
@@ -217,6 +292,10 @@ where
 
     pub fn into_inner(self) -> S {
         self.io
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.io
     }
 
     pub fn split(self) -> (NoiseReader<ReadHalf<S>>, NoiseWriter<WriteHalf<S>>) {
@@ -486,6 +565,64 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[tokio::test]
+    async fn pin_files_without_phones_load_and_save_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let legacy = "[peers.\"Main PC\"]\nfingerprint = \"aa:bb\"\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(store.status("Main PC", "aa:bb"), PinStatus::Trusted);
+        assert!(store.phones.is_empty());
+        store.save(&path).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+
+    #[tokio::test]
+    async fn phone_pins_round_trip_apart_from_pc_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut store = PinStore::default();
+        store.pin("Pixel", "pc-key");
+        store.pin_phone(
+            "Pixel",
+            "phone-key",
+            BTreeSet::from([PhoneFeature::Clipboard]),
+        );
+        store.save(&path).await.unwrap();
+
+        let loaded = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(loaded.status("Pixel", "pc-key"), PinStatus::Trusted);
+        assert_eq!(
+            loaded.phone_status("Pixel", "phone-key"),
+            PinStatus::Trusted
+        );
+        assert_eq!(
+            loaded.phone_status("Pixel", "pc-key"),
+            PinStatus::Changed {
+                expected: "phone-key".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.phone("Pixel").unwrap().allowed_features,
+            BTreeSet::from([PhoneFeature::Clipboard])
+        );
+        assert!(loaded.is_pc_key("pc-key") && !loaded.is_pc_key("phone-key"));
+        assert!(loaded.is_phone_key("phone-key") && !loaded.is_phone_key("pc-key"));
+    }
+
+    #[test]
+    fn phone_pins_without_features_allow_everything() {
+        let store: PinStore =
+            toml::from_str("[phones.Pixel]\nfingerprint = \"phone-key\"\n").unwrap();
+        assert_eq!(
+            store.phone("Pixel").unwrap().allowed_features,
+            PhoneFeature::all()
+        );
     }
 
     #[tokio::test]

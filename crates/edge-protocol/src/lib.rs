@@ -10,6 +10,9 @@ pub const CLIPBOARD_IMAGE_EXTENSION: &str = "clipboard-image-v1";
 pub const INPUT_TOGGLE_EXTENSION: &str = "input-toggle-v1";
 pub const PAIRING_CONFIRMATION_EXTENSION: &str = "pairing-confirmation-v1";
 pub const AUDIO_ROUTE_EXTENSION: &str = "audio-route-v1";
+/// Sent only by HyprMobile phones. A peer advertising it is handled as a
+/// phone: restricted frames, phone liveness, and phone pins.
+pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
