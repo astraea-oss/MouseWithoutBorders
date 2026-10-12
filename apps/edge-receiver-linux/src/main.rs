@@ -67,6 +67,7 @@ use tokio::{
 
 use acceptor::{AcceptEvent, Acceptor, IncomingPeer};
 use clipboard_hub::{ClipboardChanges, ClipboardHub};
+use phone::{LocalHello, PhoneSessions};
 
 type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
 type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
@@ -82,6 +83,7 @@ static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod acceptor;
 mod clipboard_hub;
+mod phone;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
@@ -2482,6 +2484,14 @@ async fn run_receiver(
 
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
     let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
+    let mut phones = PhoneSessions::new(
+        LocalHello {
+            device_name: config.device_name.clone(),
+            role: config.preferred_role,
+            fingerprint: identity.fingerprint(),
+        },
+        log_path.clone(),
+    );
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
@@ -2520,14 +2530,12 @@ async fn run_receiver(
                         }
                         TrayCommandEvent::Command(TrayCommand::Disconnect) => {
                             connection_enabled = false;
-                            acceptor.set_accepting(false);
                             if let Some(tray) = &tray {
                                 tray.disconnected_by_user().await;
                             }
                         }
                         TrayCommandEvent::Command(TrayCommand::Reconnect) => {
                             connection_enabled = true;
-                            acceptor.set_accepting(true);
                             if let Some(tray) = &tray {
                                 tray.listening().await;
                             }
@@ -2555,7 +2563,7 @@ async fn run_receiver(
                     }
                     continue;
                 }
-                event = acceptor.recv(), if connection_enabled => match event {
+                event = acceptor.recv() => match event {
                     Some(AcceptEvent::Peer(peer)) => *peer,
                     Some(AcceptEvent::Failed(message)) => {
                         if let Some(tray) = &tray {
@@ -2567,12 +2575,36 @@ async fn run_receiver(
                 },
             }
         };
+        // Phones are always accepted; the tray's Disconnect is about PC peers.
+        if phone::is_phone_hello(&incoming.hello) {
+            start_phone(&mut phones, incoming, &pins);
+            continue;
+        }
+        if !connection_enabled {
+            reject_peer(
+                incoming,
+                "receiver_disconnected",
+                "the other computer is disconnected from its tray",
+                &log_path,
+            );
+            continue;
+        }
         let IncomingPeer {
             mut session,
             addr,
             fingerprint: peer_fingerprint,
             hello,
         } = incoming;
+        if pins.is_phone_key(&peer_fingerprint) {
+            let message = "this key is paired as a phone; it can't connect as a computer";
+            reject_pairing(&mut session, "key_is_phone", message).await;
+            tracing::warn!(%addr, "rejected a phone key connecting as a computer");
+            append_portable_log(
+                &log_path,
+                format!("rejected {} ({addr}): {message}", hello.device_name),
+            );
+            continue;
+        }
 
         let pin_status = pins.status(&hello.device_name, &peer_fingerprint);
         let controller_trusted = pin_status.is_trusted();
@@ -2839,6 +2871,9 @@ async fn run_receiver(
                 tokio::select! {
                     exit = &mut controller => break exit,
                     event = acceptor.recv(), if acceptor_open => match event {
+                        Some(AcceptEvent::Peer(peer)) if phone::is_phone_hello(&peer.hello) => {
+                            start_phone(&mut phones, *peer, &pins);
+                        }
                         Some(AcceptEvent::Peer(peer)) => {
                             if let Some(peer) = peer_while_connected(
                                 &hello.device_name,
@@ -2872,7 +2907,6 @@ async fn run_receiver(
             }
             Ok(ControllerSessionExit::DisconnectRequested) => {
                 connection_enabled = false;
-                acceptor.set_accepting(false);
                 replacement = None;
                 if let Some(tray) = &tray {
                     tray.disconnected_by_user().await;
@@ -3021,6 +3055,31 @@ enum ControllerSessionExit {
     Replaced,
 }
 
+fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) {
+    phones.start(
+        peer.session,
+        peer.addr,
+        peer.hello.device_name,
+        peer.fingerprint,
+        pins,
+    );
+}
+
+/// Turns a peer away with an error it can show, without blocking the caller.
+fn reject_peer(mut peer: IncomingPeer, code: &'static str, message: &'static str, log_path: &Path) {
+    tracing::warn!(addr = %peer.addr, peer = %peer.hello.device_name, code, "rejected peer");
+    append_portable_log(
+        log_path,
+        format!(
+            "rejected {} ({}): {message}",
+            peer.hello.device_name, peer.addr
+        ),
+    );
+    tokio::spawn(async move {
+        reject_pairing(&mut peer.session, code, message).await;
+    });
+}
+
 /// A peer that goes away while being set up only ends its own connection, not
 /// the receiver.
 fn log_peer_write_failure(log_path: &Path, addr: std::net::SocketAddr, error: &anyhow::Error) {
@@ -3050,7 +3109,7 @@ fn is_connected_peer(
 fn peer_while_connected(
     connected_name: &str,
     connected_fingerprint: &str,
-    mut peer: IncomingPeer,
+    peer: IncomingPeer,
     log_path: &Path,
 ) -> Option<IncomingPeer> {
     if is_connected_peer(
@@ -3069,22 +3128,12 @@ fn peer_while_connected(
         );
         return Some(peer);
     }
-    tracing::warn!(addr = %peer.addr, peer = %peer.hello.device_name, "rejected peer while another is connected");
-    append_portable_log(
+    reject_peer(
+        peer,
+        "receiver_busy",
+        "this receiver is already connected to another computer",
         log_path,
-        format!(
-            "rejected {} ({}) while another peer is connected",
-            peer.hello.device_name, peer.addr
-        ),
     );
-    tokio::spawn(async move {
-        reject_pairing(
-            &mut peer.session,
-            "receiver_busy",
-            "this receiver is already connected to another computer",
-        )
-        .await;
-    });
     None
 }
 

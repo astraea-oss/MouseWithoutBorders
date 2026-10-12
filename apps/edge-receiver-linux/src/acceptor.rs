@@ -15,7 +15,7 @@ use edge_crypto::{IdentityKey, NoiseSession, accept_noise_session};
 use edge_protocol::{Frame, Hello};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, mpsc, watch},
+    sync::{Semaphore, mpsc},
     task::JoinSet,
     time,
 };
@@ -48,40 +48,21 @@ pub(crate) enum AcceptEvent {
 
 pub(crate) struct Acceptor {
     events: mpsc::Receiver<AcceptEvent>,
-    accepting: watch::Sender<bool>,
     _task: AbortOnDropTask,
 }
 
 impl Acceptor {
     pub fn spawn(listener: TcpListener, identity: IdentityKey, log_path: PathBuf) -> Self {
         let (events_tx, events) = mpsc::channel(1);
-        let (accepting, accepting_rx) = watch::channel(true);
-        let task = tokio::spawn(accept_loop(
-            listener,
-            identity,
-            log_path,
-            events_tx,
-            accepting_rx,
-        ));
+        let task = tokio::spawn(accept_loop(listener, identity, log_path, events_tx));
         Self {
             events,
-            accepting,
             _task: AbortOnDropTask(task),
         }
     }
 
     pub async fn recv(&mut self) -> Option<AcceptEvent> {
         self.events.recv().await
-    }
-
-    /// Pauses or resumes accepting. While paused, new connections wait in the
-    /// kernel backlog (as they did before the acceptor existed) and peers
-    /// already handed over are discarded.
-    pub fn set_accepting(&mut self, accepting: bool) {
-        self.accepting.send_replace(accepting);
-        if !accepting {
-            while self.events.try_recv().is_ok() {}
-        }
     }
 }
 
@@ -90,27 +71,20 @@ async fn accept_loop(
     identity: IdentityKey,
     log_path: PathBuf,
     events: mpsc::Sender<AcceptEvent>,
-    mut accepting: watch::Receiver<bool>,
 ) {
     let identity = Arc::new(identity);
     let permits = Arc::new(Semaphore::new(MAX_PENDING_PEERS));
     // Dropping the set (when the receiver stops) aborts unfinished handshakes.
     let mut handshakes = JoinSet::new();
     loop {
-        if accepting.wait_for(|accepting| *accepting).await.is_err() {
-            return;
-        }
-        let (stream, addr) = tokio::select! {
-            incoming = listener.accept() => match incoming {
-                Ok(incoming) => incoming,
-                Err(err) => {
-                    tracing::warn!(%err, "failed to accept connection");
-                    append_portable_log(&log_path, format!("failed to accept connection: {err:#}"));
-                    time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                    continue;
-                }
-            },
-            _ = accepting.changed() => continue,
+        let (stream, addr) = match listener.accept().await {
+            Ok(incoming) => incoming,
+            Err(err) => {
+                tracing::warn!(%err, "failed to accept connection");
+                append_portable_log(&log_path, format!("failed to accept connection: {err:#}"));
+                time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
         while handshakes.try_join_next().is_some() {}
         // The permit is held until the receiver loop takes the peer, so
@@ -322,23 +296,5 @@ mod tests {
             Frame::Error(RemoteError { code, .. }) => assert_eq!(code, "invalid_hello"),
             other => panic!("expected an error frame, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn paused_acceptor_leaves_connections_waiting() {
-        let (mut acceptor, addr, _dir) = start().await;
-        acceptor.set_accepting(false);
-        let connecting = tokio::spawn(connect(addr, "windows", PROTOCOL_VERSION));
-        assert!(
-            time::timeout(Duration::from_millis(300), acceptor.recv())
-                .await
-                .is_err(),
-            "no peer should arrive while paused"
-        );
-
-        acceptor.set_accepting(true);
-        let peer = next_peer(&mut acceptor).await;
-        assert_eq!(peer.hello.device_name, "windows");
-        connecting.await.unwrap();
     }
 }
