@@ -4,13 +4,38 @@
 //! transfers, and the record of what that peer has already seen, which stops
 //! echoes) and subscribe here for change notifications. The watcher outlives
 //! sessions, so peers connecting and disconnecting don't restart it.
+//!
+//! The hub also remembers what a phone last put on the clipboard, so PC
+//! sessions can hold it back when phone content mustn't reach other PCs.
 
+use std::sync::{Arc, Mutex};
+
+use edge_clipboard::ClipboardContentId;
 use tokio::sync::watch;
 
 use crate::AbortOnDropTask;
 
+/// The content a phone most recently wrote to the local clipboard.
+#[derive(Clone, Default)]
+pub(crate) struct PhoneOrigin(Arc<Mutex<Option<ClipboardContentId>>>);
+
+impl PhoneOrigin {
+    pub fn record(&self, id: ClipboardContentId) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+    }
+
+    pub fn is_from_phone(&self, id: &ClipboardContentId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            == Some(id)
+    }
+}
+
 pub(crate) struct ClipboardHub {
     changes: watch::Receiver<u64>,
+    origin: PhoneOrigin,
     _task: AbortOnDropTask,
 }
 
@@ -31,6 +56,7 @@ impl ClipboardHub {
         });
         Self {
             changes,
+            origin: PhoneOrigin::default(),
             _task: AbortOnDropTask(task),
         }
     }
@@ -40,16 +66,36 @@ impl ClipboardHub {
     pub fn subscribe(&self) -> ClipboardChanges {
         let mut changes = self.changes.clone();
         changes.mark_unchanged();
-        ClipboardChanges(changes)
+        ClipboardChanges {
+            changes,
+            origin: self.origin.clone(),
+        }
     }
 }
 
-pub(crate) struct ClipboardChanges(watch::Receiver<u64>);
+pub(crate) struct ClipboardChanges {
+    changes: watch::Receiver<u64>,
+    origin: PhoneOrigin,
+}
 
 impl ClipboardChanges {
     /// Waits for the next clipboard change. `false` means the hub is gone.
     pub async fn changed(&mut self) -> bool {
-        self.0.changed().await.is_ok()
+        self.changes.changed().await.is_ok()
+    }
+
+    /// Another subscription to the same hub, starting from now.
+    pub fn resubscribe(&self) -> Self {
+        let mut changes = self.changes.clone();
+        changes.mark_unchanged();
+        Self {
+            changes,
+            origin: self.origin.clone(),
+        }
+    }
+
+    pub fn phone_origin(&self) -> PhoneOrigin {
+        self.origin.clone()
     }
 }
 
@@ -60,6 +106,7 @@ impl ClipboardHub {
         let (sender, changes) = watch::channel(0_u64);
         let hub = Self {
             changes,
+            origin: PhoneOrigin::default(),
             _task: AbortOnDropTask(tokio::spawn(std::future::pending())),
         };
         (hub, sender)
@@ -121,5 +168,26 @@ mod tests {
         drop(sender);
 
         assert!(!changes.changed().await);
+    }
+
+    #[test]
+    fn subscribers_share_the_phone_origin() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (hub, _sender) = ClipboardHub::manual();
+        let phone = hub.subscribe();
+        let pc = hub.subscribe().resubscribe();
+        let copied = ClipboardContentId::Text([7; 32]);
+
+        phone.phone_origin().record(copied);
+
+        assert!(pc.phone_origin().is_from_phone(&copied));
+        assert!(
+            !pc.phone_origin()
+                .is_from_phone(&ClipboardContentId::Text([8; 32]))
+        );
     }
 }

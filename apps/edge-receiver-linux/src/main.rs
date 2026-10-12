@@ -66,7 +66,7 @@ use tokio::{
 };
 
 use acceptor::{AcceptEvent, Acceptor, IncomingPeer};
-use clipboard_hub::{ClipboardChanges, ClipboardHub};
+use clipboard_hub::{ClipboardChanges, ClipboardHub, PhoneOrigin};
 use phone::{LocalHello, PhoneSessions};
 
 type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
@@ -1082,7 +1082,9 @@ async fn run_linux_controller_session(
         send_linux_audio_offer(&mut writer, &audio_socket).await?;
     }
     let mut frame_rx = spawn_controller_reader(reader);
-    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
+    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images)
+        .await?
+        .withholding_phone_content(config, clipboard_changes.as_ref());
     let mut clipboard_watcher = clipboard_changes;
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -2504,6 +2506,10 @@ async fn run_receiver(
         },
         listen_addr,
         log_path.clone(),
+        clipboard_hub.as_ref().map(|hub| phone::ClipboardSource {
+            config: Arc::new(config.clone()),
+            changes: hub.subscribe(),
+        }),
     );
     let _control = control::spawn_server(phones.requests(), &log_path).await;
     // A newer connection from the connected peer, waiting for its session to end.
@@ -3283,8 +3289,9 @@ async fn handle_controller(
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info.clone());
-    let mut clipboard_sync =
-        ReceiverClipboardState::new(config, controller_supports_images).await?;
+    let mut clipboard_sync = ReceiverClipboardState::new(config, controller_supports_images)
+        .await?
+        .withholding_phone_content(config, clipboard_changes.as_ref());
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut clipboard_watcher = clipboard_changes;
@@ -4625,6 +4632,10 @@ struct ReceiverClipboardState {
     incoming: IncomingImageTransfer,
     next_transfer_id: u64,
     peer_supports_images: bool,
+    /// Set for phone peers: what they write is recorded as phone content.
+    records_phone_writes: Option<PhoneOrigin>,
+    /// Set for PC peers when phone content mustn't be forwarded to them.
+    withholds_phone_content: Option<PhoneOrigin>,
 }
 
 #[cfg(not(unix))]
@@ -4648,7 +4659,28 @@ impl ReceiverClipboardState {
             incoming: IncomingImageTransfer::default(),
             next_transfer_id: 0,
             peer_supports_images,
+            records_phone_writes: None,
+            withholds_phone_content: None,
         })
+    }
+
+    /// For a phone peer: text it sends is recorded as phone content.
+    fn for_phone(mut self, origin: PhoneOrigin) -> Self {
+        self.records_phone_writes = Some(origin);
+        self
+    }
+
+    /// For a PC peer, unless `[phone] forward_clipboard_to_pcs` is on: never
+    /// offer it what a phone put on the clipboard.
+    fn withholding_phone_content(
+        mut self,
+        config: &AppConfig,
+        changes: Option<&ClipboardChanges>,
+    ) -> Self {
+        if !config.phone.forward_clipboard_to_pcs {
+            self.withholds_phone_content = changes.map(ClipboardChanges::phone_origin);
+        }
+        self
     }
 
     async fn handle_event(
@@ -4768,6 +4800,9 @@ impl ReceiverClipboardState {
         }
         write_clipboard_text(&config.clipboard, &remote_text).await?;
         self.tracker.mark_observed(Some(remote_id));
+        if let Some(origin) = &self.records_phone_writes {
+            origin.record(remote_id);
+        }
         tracing::info!("updated Linux clipboard from controller");
         Ok(())
     }
@@ -4818,6 +4853,12 @@ impl ReceiverClipboardState {
         force: bool,
     ) -> Result<bool> {
         let current_id = current.as_ref().map(ClipboardItem::id);
+        if let (Some(origin), Some(id)) = (&self.withholds_phone_content, &current_id)
+            && origin.is_from_phone(id)
+        {
+            self.tracker.mark_observed(current_id);
+            return Ok(false);
+        }
         let sequence = if force {
             self.tracker.offer_current(current_id)
         } else {

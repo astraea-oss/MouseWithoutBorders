@@ -20,11 +20,12 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use edge_common::Role;
+use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, PROTOCOL_VERSION, PhoneEvent, RemoteError,
@@ -38,9 +39,10 @@ use tokio::{
 };
 
 use crate::{
-    AbortOnDropTask, append_portable_log,
+    AbortOnDropTask, ClipboardWatchEvent, ReceiverClipboardState, append_portable_log,
+    clipboard_hub::ClipboardChanges,
     phone_pairing::{PAIRING_WINDOW, PairingRefusal, PairingWindow, lan_addresses, pairing_uri},
-    reject_pairing,
+    recv_clipboard_change, reject_pairing,
 };
 
 /// Unacknowledged data may wait this long before the kernel drops a phone's
@@ -210,6 +212,50 @@ struct SessionContext {
     fingerprint: String,
     ip: IpAddr,
     requests: mpsc::UnboundedSender<PhoneRequest>,
+    clipboard: Option<ClipboardSource>,
+}
+
+/// What a phone session needs to sync the clipboard: the receiver's
+/// clipboard settings and a subscription to the shared clipboard hub.
+pub(crate) struct ClipboardSource {
+    pub config: Arc<AppConfig>,
+    pub changes: ClipboardChanges,
+}
+
+impl ClipboardSource {
+    fn resubscribe(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+            changes: self.changes.resubscribe(),
+        }
+    }
+}
+
+/// A phone session's clipboard sync, when the phone is allowed it.
+struct PhoneClipboard {
+    config: Arc<AppConfig>,
+    state: ReceiverClipboardState,
+    changes: Option<ClipboardChanges>,
+}
+
+impl PhoneClipboard {
+    async fn start(source: ClipboardSource) -> Result<Self> {
+        let state = ReceiverClipboardState::new(&source.config, false)
+            .await?
+            .for_phone(source.changes.phone_origin());
+        Ok(Self {
+            config: source.config,
+            state,
+            changes: Some(source.changes),
+        })
+    }
+}
+
+async fn clipboard_changed(clipboard: &mut Option<PhoneClipboard>) -> ClipboardWatchEvent {
+    match clipboard {
+        Some(clipboard) => recv_clipboard_change(&mut clipboard.changes).await,
+        None => std::future::pending().await,
+    }
 }
 
 struct RunningPhone {
@@ -223,6 +269,7 @@ pub(crate) struct PhoneSessions {
     local: LocalHello,
     listen: SocketAddr,
     log_path: PathBuf,
+    clipboard: Option<ClipboardSource>,
     timings: PhoneTimings,
     sessions: HashMap<String, RunningPhone>,
     pairing: Option<PairingWindow>,
@@ -232,12 +279,18 @@ pub(crate) struct PhoneSessions {
 }
 
 impl PhoneSessions {
-    pub fn new(local: LocalHello, listen: SocketAddr, log_path: PathBuf) -> Self {
+    pub fn new(
+        local: LocalHello,
+        listen: SocketAddr,
+        log_path: PathBuf,
+        clipboard: Option<ClipboardSource>,
+    ) -> Self {
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         Self {
             local,
             listen,
             log_path,
+            clipboard,
             timings: PhoneTimings::DEFAULT,
             sessions: HashMap::new(),
             pairing: None,
@@ -329,6 +382,7 @@ impl PhoneSessions {
             fingerprint: fingerprint.clone(),
             ip: addr.ip(),
             requests: self.requests_tx.clone(),
+            clipboard: self.clipboard.as_ref().map(ClipboardSource::resubscribe),
         };
         let task = tokio::spawn(async move {
             let name = context.name.clone();
@@ -595,9 +649,20 @@ async fn run_phone_session(
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     writer.write(&hello).await.context("failed to send Hello")?;
     let (mut frames, _reader_task) = spawn_phone_reader(reader);
-    let _phone = match entry {
+    let phone = match entry {
         Entry::Pinned(phone) => phone,
         Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
+    };
+    let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
+    let mut clipboard = match context.clipboard {
+        Some(source) if clipboard_allowed => match PhoneClipboard::start(source).await {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                tracing::warn!(%error, phone = %context.name, "phone clipboard sync unavailable");
+                None
+            }
+        },
+        _ => None,
     };
 
     let mut ping = time::interval_at(
@@ -621,6 +686,20 @@ async fn run_phone_session(
             () = &mut dead => {
                 anyhow::bail!("phone silent for {:?}", timings.dead_after);
             }
+            event = clipboard_changed(&mut clipboard) => {
+                let Some(sync) = clipboard.as_mut() else { continue };
+                match event {
+                    ClipboardWatchEvent::Changed => {
+                        match sync.state.send_changed_offer(&sync.config, &mut writer).await {
+                            Ok(true) => tracing::info!(phone = %context.name, "sent clipboard to phone"),
+                            Ok(false) => {}
+                            // Too large for one frame, for example; the session carries on.
+                            Err(error) => tracing::warn!(%error, phone = %context.name, "couldn't send clipboard to phone"),
+                        }
+                    }
+                    ClipboardWatchEvent::Closed => sync.changes = None,
+                }
+            }
             frame = frames.recv() => {
                 let Some(frame) = frame else {
                     anyhow::bail!("phone reader stopped");
@@ -638,8 +717,17 @@ async fn run_phone_session(
                     }
                     PhoneFrame::Heartbeat(_) => {}
                     PhoneFrame::Error => tracing::warn!(?frame, "phone reported an error"),
-                    // Text clipboard arrives in a later step.
-                    PhoneFrame::Clipboard => tracing::debug!("ignored phone clipboard frame"),
+                    PhoneFrame::Clipboard => {
+                        let (Some(sync), Frame::Clipboard(event)) = (clipboard.as_mut(), frame) else {
+                            tracing::debug!(phone = %context.name, "ignored clipboard from a phone without clipboard access");
+                            continue;
+                        };
+                        match sync.state.handle_event(&sync.config, &mut writer, event).await {
+                            Ok(true) => tracing::info!(phone = %context.name, "updated clipboard from phone"),
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(%error, phone = %context.name, "couldn't apply clipboard from phone"),
+                        }
+                    }
                     // Already pinned: the phone missed our earlier reply.
                     PhoneFrame::PairRequest(_) => {
                         send(&mut writer, &Frame::Phone(PhoneEvent::PairAccepted)).await?;
@@ -830,6 +918,7 @@ mod tests {
                 fingerprint: "phone".to_string(),
                 ip: "127.0.0.1".parse().unwrap(),
                 requests: requests_tx,
+                clipboard: None,
             };
             let result = run_phone_session(session, hello, entry, context, timings).await;
             let summary = match &result {
@@ -1101,6 +1190,7 @@ mod tests {
             },
             "192.168.0.11:42420".parse().unwrap(),
             std::env::temp_dir().join("edge-kvm-phone-test.log"),
+            None,
         )
     }
 
