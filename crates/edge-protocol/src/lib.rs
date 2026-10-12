@@ -40,6 +40,8 @@ pub enum Frame {
     Audio(AudioControl),
     Pairing(PairingEvent),
     Role(RoleEvent),
+    /// Only exchanged with peers that advertised `hypr-phone-v1`.
+    Phone(PhoneEvent),
 }
 
 impl Frame {
@@ -70,6 +72,22 @@ impl Frame {
 pub enum PairingEvent {
     Status { trusted: bool, armed: bool },
     Decision { accepted: bool },
+}
+
+/// Phone-only messages. Phones pair with a one-time token from the
+/// receiver's QR code instead of the two-sided PC confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneEvent {
+    /// Phone → receiver, as the first frame after the receiver's `Hello`.
+    /// The phone's name comes from its `Hello`.
+    PairRequest { token: String },
+    /// Receiver → phone: the phone is pinned. Also sent when an already
+    /// pinned phone repeats its request, so a lost reply is recovered by
+    /// asking again.
+    PairAccepted,
+    /// Phone → receiver: forget this phone. The receiver removes the pin and
+    /// closes the session.
+    Unpair,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -814,6 +832,20 @@ mod tests {
                 include_str!("../fixtures/v2-role-ready.hex"),
             ),
         ]
+    }
+
+    #[test]
+    fn phone_events_round_trip() {
+        for event in [
+            PhoneEvent::PairRequest {
+                token: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            PhoneEvent::PairAccepted,
+            PhoneEvent::Unpair,
+        ] {
+            let frame = Frame::Phone(event);
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
     }
 
     #[test]

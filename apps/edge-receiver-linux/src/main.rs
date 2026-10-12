@@ -83,13 +83,17 @@ static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod acceptor;
 mod clipboard_hub;
+mod control;
 mod phone;
+mod phone_pairing;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Linux edge-kvm node")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<control::ControlCommand>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long, help = "Arm two-sided confirmation for the next pairing")]
@@ -145,6 +149,10 @@ impl From<TestCaptureEdge> for Edge {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Control commands talk to the running receiver; they aren't receivers.
+    if let Some(command) = Args::parse().command {
+        return control::run_client(command).await;
+    }
     init_tracing();
     let receiver_log = default_state_dir().join("receiver.log");
     install_receiver_panic_log(receiver_log.clone());
@@ -2152,7 +2160,7 @@ async fn run_linux_controller_session(
                             AudioControl::SetRoute { .. }
                             | AudioControl::State { .. }
                         ) => {}
-                        Frame::Hello(_) | Frame::Pairing(_) => {}
+                        Frame::Hello(_) | Frame::Pairing(_) | Frame::Phone(_) => {}
                     }
                 }
                 _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {
@@ -2442,6 +2450,9 @@ async fn run_receiver(
     let listener = TcpListener::bind(&listen)
         .await
         .with_context(|| format!("failed to bind {listen}"))?;
+    let listen_addr = listener
+        .local_addr()
+        .context("failed to read the listen address")?;
 
     let (tray, mut tray_commands) = if enable_tray {
         match ReceiverTrayHandle::spawn(
@@ -2484,14 +2495,17 @@ async fn run_receiver(
 
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
     let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
+    let pins_path = state_dir.join("pins.toml");
     let mut phones = PhoneSessions::new(
         LocalHello {
             device_name: config.device_name.clone(),
             role: config.preferred_role,
             fingerprint: identity.fingerprint(),
         },
+        listen_addr,
         log_path.clone(),
     );
+    let _control = control::spawn_server(phones.requests(), &log_path).await;
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
@@ -2561,6 +2575,10 @@ async fn run_receiver(
                             );
                         }
                     }
+                    continue;
+                }
+                request = phones.next_request() => {
+                    phones.handle_request(request, &mut pins, &pins_path).await;
                     continue;
                 }
                 event = acceptor.recv() => match event {
@@ -2739,7 +2757,7 @@ async fn run_receiver(
                 }
 
                 pins.pin(hello.device_name.clone(), peer_fingerprint.clone());
-                pins.save(state_dir.join("pins.toml")).await?;
+                pins.save(&pins_path).await?;
                 tracing::info!(fingerprint = %peer_fingerprint, "paired peer after two-sided confirmation");
                 append_portable_log(
                     &log_path,
@@ -2870,6 +2888,9 @@ async fn run_receiver(
             loop {
                 tokio::select! {
                     exit = &mut controller => break exit,
+                    request = phones.next_request() => {
+                        phones.handle_request(request, &mut pins, &pins_path).await;
+                    }
                     event = acceptor.recv(), if acceptor_open => match event {
                         Some(AcceptEvent::Peer(peer)) if phone::is_phone_hello(&peer.hello) => {
                             start_phone(&mut phones, *peer, &pins);
@@ -4548,7 +4569,7 @@ async fn handle_controller(
                             "controller screen info"
                         );
                     }
-                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) => {}
+                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) | Frame::Phone(_) => {}
                 }
             },
             _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {

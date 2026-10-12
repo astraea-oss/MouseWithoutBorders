@@ -16,21 +16,32 @@
 //! are receiver pings, the rest are phone pings, and each side echoes the
 //! other's pings unchanged.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use edge_common::Role;
-use edge_crypto::{NoiseSession, PinStatus, PinStore, PinnedPhone};
-use edge_protocol::{Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, PROTOCOL_VERSION};
+use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
+use edge_protocol::{
+    Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, PROTOCOL_VERSION, PhoneEvent, RemoteError,
+};
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{self, Instant},
 };
 
-use crate::{AbortOnDropTask, append_portable_log, reject_pairing};
+use crate::{
+    AbortOnDropTask, append_portable_log,
+    phone_pairing::{PAIRING_WINDOW, PairingRefusal, PairingWindow, lan_addresses, pairing_uri},
+    reject_pairing,
+};
 
 /// Unacknowledged data may wait this long before the kernel drops a phone's
 /// connection. PC sessions use 5 s; a phone needs a moment to wake and ACK.
@@ -63,14 +74,22 @@ pub(crate) fn is_phone_hello(hello: &Hello) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PhoneAdmission {
     Accept(PinnedPhone),
+    /// Not pinned (or re-pairing under a pinned name) while pairing is open:
+    /// the phone may present the token from the QR code.
+    Pair,
     Reject {
         code: &'static str,
         message: &'static str,
     },
 }
 
-/// Decides whether an authenticated phone may start a session.
-pub(crate) fn admit_phone(pins: &PinStore, name: &str, fingerprint: &str) -> PhoneAdmission {
+/// Decides what an authenticated phone may do.
+pub(crate) fn admit_phone(
+    pins: &PinStore,
+    name: &str,
+    fingerprint: &str,
+    pairing_open: bool,
+) -> PhoneAdmission {
     if pins.is_pc_key(fingerprint) {
         return PhoneAdmission::Reject {
             code: "key_is_pc",
@@ -83,13 +102,14 @@ pub(crate) fn admit_phone(pins: &PinStore, name: &str, fingerprint: &str) -> Pho
                 .cloned()
                 .expect("trusted phones are pinned"),
         ),
+        PinStatus::Unknown | PinStatus::Changed { .. } if pairing_open => PhoneAdmission::Pair,
         PinStatus::Unknown => PhoneAdmission::Reject {
             code: "phone_not_paired",
-            message: "this phone isn't paired with the computer",
+            message: "this phone isn't paired; run `edge-receiver-linux pair-phone` on the computer and scan the code",
         },
         PinStatus::Changed { .. } => PhoneAdmission::Reject {
             code: "phone_key_changed",
-            message: "a different phone is paired under this name; forget it on the computer first",
+            message: "a different phone is paired under this name; pair again with `edge-receiver-linux pair-phone`",
         },
     }
 }
@@ -100,6 +120,8 @@ enum PhoneFrame {
     Heartbeat(u64),
     Error,
     Clipboard,
+    PairRequest(String),
+    Unpair,
     NotAllowed(&'static str),
 }
 
@@ -108,6 +130,9 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Heartbeat(Heartbeat { sequence }) => PhoneFrame::Heartbeat(*sequence),
         Frame::Error(_) => PhoneFrame::Error,
         Frame::Clipboard(_) => PhoneFrame::Clipboard,
+        Frame::Phone(PhoneEvent::PairRequest { token }) => PhoneFrame::PairRequest(token.clone()),
+        Frame::Phone(PhoneEvent::Unpair) => PhoneFrame::Unpair,
+        Frame::Phone(PhoneEvent::PairAccepted) => PhoneFrame::NotAllowed("PairAccepted"),
         Frame::Hello(_) => PhoneFrame::NotAllowed("Hello"),
         Frame::ScreenInfo(_) => PhoneFrame::NotAllowed("ScreenInfo"),
         Frame::Input(_) => PhoneFrame::NotAllowed("Input"),
@@ -139,27 +164,106 @@ impl LocalHello {
     }
 }
 
+/// Work for the receiver loop, which owns the pin store, so pin changes
+/// happen one at a time.
+pub(crate) enum PhoneRequest {
+    /// A pairing session presented a token.
+    Pair {
+        name: String,
+        fingerprint: String,
+        ip: IpAddr,
+        token: String,
+        reply: oneshot::Sender<Result<PinnedPhone, PairingRefusal>>,
+    },
+    /// A paired phone asked to be forgotten.
+    Forget { name: String, fingerprint: String },
+    /// `pair-phone`: open a pairing window. `paired` receives the phone's
+    /// name once one pairs.
+    OpenPairing {
+        reply: oneshot::Sender<PairingOffer>,
+        paired: oneshot::Sender<String>,
+    },
+    /// `unpair-phone`: replies whether the phone was paired.
+    Unpair {
+        name: String,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// `list-phones`: paired phones and whether each is connected.
+    List {
+        reply: oneshot::Sender<Vec<(String, bool)>>,
+    },
+}
+
+pub(crate) struct PairingOffer {
+    pub uri: String,
+    pub expires_in: Duration,
+}
+
+enum Entry {
+    Pinned(PinnedPhone),
+    Pairing,
+}
+
+/// Everything a session task needs to know about its phone.
+struct SessionContext {
+    name: String,
+    fingerprint: String,
+    ip: IpAddr,
+    requests: mpsc::UnboundedSender<PhoneRequest>,
+}
+
 struct RunningPhone {
     name: String,
+    pairing: bool,
     task: AbortOnDropTask,
 }
 
 /// Live phone sessions, keyed by key fingerprint. Dropping it ends them all.
 pub(crate) struct PhoneSessions {
     local: LocalHello,
+    listen: SocketAddr,
     log_path: PathBuf,
     timings: PhoneTimings,
     sessions: HashMap<String, RunningPhone>,
+    pairing: Option<PairingWindow>,
+    paired_watcher: Option<oneshot::Sender<String>>,
+    requests_tx: mpsc::UnboundedSender<PhoneRequest>,
+    requests_rx: mpsc::UnboundedReceiver<PhoneRequest>,
 }
 
 impl PhoneSessions {
-    pub fn new(local: LocalHello, log_path: PathBuf) -> Self {
+    pub fn new(local: LocalHello, listen: SocketAddr, log_path: PathBuf) -> Self {
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         Self {
             local,
+            listen,
             log_path,
             timings: PhoneTimings::DEFAULT,
             sessions: HashMap::new(),
+            pairing: None,
+            paired_watcher: None,
+            requests_tx,
+            requests_rx,
         }
+    }
+
+    /// For the control socket, which sends requests from its own tasks.
+    pub fn requests(&self) -> mpsc::UnboundedSender<PhoneRequest> {
+        self.requests_tx.clone()
+    }
+
+    pub async fn next_request(&mut self) -> PhoneRequest {
+        // `self` holds a sender, so the channel never closes.
+        self.requests_rx
+            .recv()
+            .await
+            .expect("phone request channel stays open")
+    }
+
+    fn pairing_open(&self) -> bool {
+        self.pairing
+            .as_ref()
+            .is_some_and(|window| window.is_open(Instant::now().into_std()))
     }
 
     /// Admits an authenticated phone and starts its session. A newer
@@ -167,7 +271,7 @@ impl PhoneSessions {
     /// socket may linger for a while after the phone drops it.
     pub fn start(
         &mut self,
-        mut session: NoiseSession<TcpStream>,
+        session: NoiseSession<TcpStream>,
         addr: SocketAddr,
         name: String,
         fingerprint: String,
@@ -175,63 +279,242 @@ impl PhoneSessions {
     ) {
         self.sessions
             .retain(|_, running| !running.task.0.is_finished());
-        let phone = match admit_phone(pins, &name, &fingerprint) {
-            PhoneAdmission::Accept(phone) => phone,
-            PhoneAdmission::Reject { code, message } => {
-                tracing::warn!(%addr, phone = %name, code, "rejected phone");
-                append_portable_log(
-                    &self.log_path,
-                    format!("rejected phone {name} ({addr}): {message}"),
+        let entry = match admit_phone(pins, &name, &fingerprint, self.pairing_open()) {
+            PhoneAdmission::Accept(phone) => Entry::Pinned(phone),
+            PhoneAdmission::Pair
+                if self
+                    .sessions
+                    .values()
+                    .filter(|running| running.pairing)
+                    .count()
+                    >= MAX_PAIRING_SESSIONS =>
+            {
+                self.reject(
+                    session,
+                    addr,
+                    &name,
+                    "pairing_busy",
+                    "too many phones are pairing at once",
                 );
-                tokio::spawn(async move {
-                    reject_pairing(&mut session, code, message).await;
-                });
+                return;
+            }
+            PhoneAdmission::Pair => Entry::Pairing,
+            PhoneAdmission::Reject { code, message } => {
+                self.reject(session, addr, &name, code, message);
                 return;
             }
         };
+        let pairing = matches!(entry, Entry::Pairing);
         if self.sessions.remove(&fingerprint).is_some() {
             append_portable_log(
                 &self.log_path,
                 format!("newer connection from phone {name} ({addr}); replacing its session"),
             );
         }
-        tracing::info!(%addr, phone = %name, "phone connected");
+        tracing::info!(%addr, phone = %name, pairing, "phone connected");
         append_portable_log(
             &self.log_path,
-            format!("phone {name} connected from {addr}"),
+            if pairing {
+                format!("unpaired phone {name} connected from {addr} while pairing is open")
+            } else {
+                format!("phone {name} connected from {addr}")
+            },
         );
 
         let hello = self.local.frame();
         let log_path = self.log_path.clone();
         let timings = self.timings;
-        let task_name = name.clone();
+        let context = SessionContext {
+            name: name.clone(),
+            fingerprint: fingerprint.clone(),
+            ip: addr.ip(),
+            requests: self.requests_tx.clone(),
+        };
         let task = tokio::spawn(async move {
-            let result = run_phone_session(session, hello, phone, timings).await;
+            let name = context.name.clone();
+            let result = run_phone_session(session, hello, entry, context, timings).await;
             let message = match result {
-                Ok(()) => format!("phone {task_name} disconnected"),
-                Err(error) => format!("phone {task_name} session ended: {error:#}"),
+                Ok(()) => format!("phone {name} disconnected"),
+                Err(error) => format!("phone {name} session ended: {error:#}"),
             };
-            tracing::info!(phone = %task_name, "{message}");
+            tracing::info!(phone = %name, "{message}");
             append_portable_log(&log_path, message);
         });
         self.sessions.insert(
             fingerprint,
             RunningPhone {
                 name,
+                pairing,
                 task: AbortOnDropTask(task),
             },
         );
     }
 
+    fn reject(
+        &self,
+        mut session: NoiseSession<TcpStream>,
+        addr: SocketAddr,
+        name: &str,
+        code: &'static str,
+        message: &'static str,
+    ) {
+        tracing::warn!(%addr, phone = %name, code, "rejected phone");
+        append_portable_log(
+            &self.log_path,
+            format!("rejected phone {name} ({addr}): {message}"),
+        );
+        tokio::spawn(async move {
+            reject_pairing(&mut session, code, message).await;
+        });
+    }
+
+    /// Handles one request. Pin changes are saved before they're reported.
+    pub async fn handle_request(
+        &mut self,
+        request: PhoneRequest,
+        pins: &mut PinStore,
+        pins_path: &Path,
+    ) {
+        match request {
+            PhoneRequest::Pair {
+                name,
+                fingerprint,
+                ip,
+                token,
+                reply,
+            } => {
+                let result = self
+                    .pair(&name, &fingerprint, ip, &token, pins, pins_path)
+                    .await;
+                if let Err(refusal) = &result {
+                    append_portable_log(
+                        &self.log_path,
+                        format!("refused pairing phone {name} ({ip}): {}", refusal.message()),
+                    );
+                }
+                reply.send(result).ok();
+            }
+            PhoneRequest::Forget { name, fingerprint } => {
+                if pins.phone_status(&name, &fingerprint).is_trusted() {
+                    match self.unpair(&name, pins, pins_path).await {
+                        Ok(_) => append_portable_log(
+                            &self.log_path,
+                            format!("phone {name} asked to be forgotten; unpaired"),
+                        ),
+                        Err(error) => append_portable_log(
+                            &self.log_path,
+                            format!("failed to forget phone {name}: {error:#}"),
+                        ),
+                    }
+                }
+            }
+            PhoneRequest::OpenPairing { reply, paired } => {
+                let window = PairingWindow::open(Instant::now().into_std());
+                let offer = PairingOffer {
+                    uri: pairing_uri(
+                        &lan_addresses(self.listen),
+                        self.listen.port(),
+                        &self.local.fingerprint,
+                        window.token(),
+                    ),
+                    expires_in: PAIRING_WINDOW,
+                };
+                // A new window replaces any earlier one and its token.
+                self.pairing = Some(window);
+                self.paired_watcher = Some(paired);
+                append_portable_log(&self.log_path, "phone pairing opened for 5 minutes");
+                reply.send(offer).ok();
+            }
+            PhoneRequest::Unpair { name, reply } => {
+                let result = self
+                    .unpair(&name, pins, pins_path)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                if let Ok(true) = result {
+                    append_portable_log(&self.log_path, format!("unpaired phone {name}"));
+                }
+                reply.send(result).ok();
+            }
+            PhoneRequest::List { reply } => {
+                let connected: Vec<&str> = self.connected().collect();
+                let phones = pins
+                    .phones
+                    .keys()
+                    .map(|name| (name.clone(), connected.contains(&name.as_str())))
+                    .collect();
+                reply.send(phones).ok();
+            }
+        }
+    }
+
+    async fn pair(
+        &mut self,
+        name: &str,
+        fingerprint: &str,
+        ip: IpAddr,
+        token: &str,
+        pins: &mut PinStore,
+        pins_path: &Path,
+    ) -> Result<PinnedPhone, PairingRefusal> {
+        let window = self.pairing.as_mut().ok_or(PairingRefusal::Closed)?;
+        window.check(token, ip, Instant::now().into_std())?;
+        if pins.is_pc_key(fingerprint) {
+            return Err(PairingRefusal::Failed);
+        }
+        let previous = pins.phones.clone();
+        // One pin per phone key: drop any older entry under another name.
+        pins.phones
+            .retain(|_, pinned| pinned.fingerprint != fingerprint);
+        pins.pin_phone(name, fingerprint, PhoneFeature::all());
+        if let Err(error) = pins.save(pins_path).await {
+            pins.phones = previous;
+            append_portable_log(
+                &self.log_path,
+                format!("failed to save phone pairing: {error:#}"),
+            );
+            return Err(PairingRefusal::Failed);
+        }
+        // Saved: only now is the token used up.
+        self.pairing = None;
+        if let Some(watcher) = self.paired_watcher.take() {
+            watcher.send(name.to_string()).ok();
+        }
+        tracing::info!(phone = %name, %fingerprint, "paired phone");
+        append_portable_log(
+            &self.log_path,
+            format!("paired phone {name} ({fingerprint})"),
+        );
+        Ok(pins.phone(name).cloned().expect("just pinned"))
+    }
+
+    /// Removes the pin, saves, then closes the phone's session. Returns
+    /// whether the phone was paired.
+    async fn unpair(&mut self, name: &str, pins: &mut PinStore, pins_path: &Path) -> Result<bool> {
+        let Some(removed) = pins.remove_phone(name) else {
+            return Ok(false);
+        };
+        if let Err(error) = pins.save(pins_path).await {
+            pins.phones.insert(name.to_string(), removed);
+            return Err(error).context("failed to save pins");
+        }
+        // Dropping the session aborts it and closes its socket.
+        self.sessions.remove(&removed.fingerprint);
+        Ok(true)
+    }
+
     /// Names of the phones with a live session.
-    #[allow(dead_code)] // Used by the tray once it lists phones.
     pub fn connected(&self) -> impl Iterator<Item = &str> {
         self.sessions
             .values()
-            .filter(|running| !running.task.0.is_finished())
+            .filter(|running| !running.pairing && !running.task.0.is_finished())
             .map(|running| running.name.as_str())
     }
 }
+
+/// Unpinned phones allowed to be mid-pairing at once.
+const MAX_PAIRING_SESSIONS: usize = 4;
+/// An unpinned phone must present its token this quickly.
+const PAIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 type PhoneReader = SecureFrameReader<ReadHalf<TcpStream>>;
 type PhoneWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
@@ -252,10 +535,56 @@ fn spawn_phone_reader(mut reader: PhoneReader) -> (mpsc::Receiver<Result<Frame>>
     (receiver, AbortOnDropTask(task))
 }
 
+/// Waits for an unpinned phone's token and asks the receiver loop to pin it.
+async fn pair_phone(
+    frames: &mut mpsc::Receiver<Result<Frame>>,
+    writer: &mut PhoneWriter,
+    context: &SessionContext,
+) -> Result<PinnedPhone> {
+    let frame = match time::timeout(PAIR_REQUEST_TIMEOUT, frames.recv()).await {
+        Ok(Some(frame)) => frame?,
+        Ok(None) => anyhow::bail!("phone reader stopped"),
+        Err(_) => anyhow::bail!("unpaired phone sent no pairing request"),
+    };
+    let PhoneFrame::PairRequest(token) = classify_phone_frame(&frame) else {
+        anyhow::bail!("unpaired phone sent {frame:?} instead of a pairing request");
+    };
+    let (reply, outcome) = oneshot::channel();
+    context
+        .requests
+        .send(PhoneRequest::Pair {
+            name: context.name.clone(),
+            fingerprint: context.fingerprint.clone(),
+            ip: context.ip,
+            token,
+            reply,
+        })
+        .context("receiver loop stopped")?;
+    match outcome.await.context("receiver loop stopped")? {
+        Ok(phone) => {
+            send(writer, &Frame::Phone(PhoneEvent::PairAccepted)).await?;
+            Ok(phone)
+        }
+        Err(refusal) => {
+            send(
+                writer,
+                &Frame::Error(RemoteError {
+                    code: refusal.code().to_string(),
+                    message: refusal.message().to_string(),
+                }),
+            )
+            .await
+            .ok();
+            anyhow::bail!("pairing refused: {}", refusal.message());
+        }
+    }
+}
+
 async fn run_phone_session(
     session: NoiseSession<TcpStream>,
     hello: Frame,
-    _phone: PinnedPhone,
+    entry: Entry,
+    context: SessionContext,
     timings: PhoneTimings,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -266,6 +595,10 @@ async fn run_phone_session(
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     writer.write(&hello).await.context("failed to send Hello")?;
     let (mut frames, _reader_task) = spawn_phone_reader(reader);
+    let _phone = match entry {
+        Entry::Pinned(phone) => phone,
+        Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
+    };
 
     let mut ping = time::interval_at(
         Instant::now() + timings.ping_interval,
@@ -307,6 +640,20 @@ async fn run_phone_session(
                     PhoneFrame::Error => tracing::warn!(?frame, "phone reported an error"),
                     // Text clipboard arrives in a later step.
                     PhoneFrame::Clipboard => tracing::debug!("ignored phone clipboard frame"),
+                    // Already pinned: the phone missed our earlier reply.
+                    PhoneFrame::PairRequest(_) => {
+                        send(&mut writer, &Frame::Phone(PhoneEvent::PairAccepted)).await?;
+                    }
+                    PhoneFrame::Unpair => {
+                        context
+                            .requests
+                            .send(PhoneRequest::Forget {
+                                name: context.name.clone(),
+                                fingerprint: context.fingerprint.clone(),
+                            })
+                            .ok();
+                        return Ok(());
+                    }
                     PhoneFrame::NotAllowed(kind) => {
                         anyhow::bail!("phone sent a {kind} frame, which phones may not send");
                     }
@@ -369,25 +716,40 @@ mod tests {
         let mut pins = pins_with_phone("Pixel", "phone-key");
         pins.pin("Main PC", "pc-key");
 
-        assert!(matches!(
-            admit_phone(&pins, "Pixel", "phone-key"),
-            PhoneAdmission::Accept(_)
-        ));
         let code = |admission| match admission {
             PhoneAdmission::Reject { code, .. } => code,
             PhoneAdmission::Accept(_) => "accepted",
+            PhoneAdmission::Pair => "pair",
         };
+        for pairing_open in [false, true] {
+            assert_eq!(
+                code(admit_phone(&pins, "Pixel", "phone-key", pairing_open)),
+                "accepted"
+            );
+            // A PC's key can't come back as a phone, whatever name it uses.
+            assert_eq!(
+                code(admit_phone(&pins, "Pixel", "pc-key", pairing_open)),
+                "key_is_pc"
+            );
+            assert_eq!(
+                code(admit_phone(&pins, "Main PC", "pc-key", pairing_open)),
+                "key_is_pc"
+            );
+        }
         assert_eq!(
-            code(admit_phone(&pins, "Tablet", "other-key")),
+            code(admit_phone(&pins, "Tablet", "other-key", false)),
             "phone_not_paired"
         );
         assert_eq!(
-            code(admit_phone(&pins, "Pixel", "other-key")),
+            code(admit_phone(&pins, "Pixel", "other-key", false)),
             "phone_key_changed"
         );
-        // A PC's key can't come back as a phone, whatever name it uses.
-        assert_eq!(code(admit_phone(&pins, "Pixel", "pc-key")), "key_is_pc");
-        assert_eq!(code(admit_phone(&pins, "Main PC", "pc-key")), "key_is_pc");
+        // While pairing is open, the token decides.
+        assert_eq!(
+            code(admit_phone(&pins, "Tablet", "other-key", true)),
+            "pair"
+        );
+        assert_eq!(code(admit_phone(&pins, "Pixel", "other-key", true)), "pair");
     }
 
     #[test]
@@ -429,11 +791,24 @@ mod tests {
     /// A connected phone session on localhost, driven from the phone's side.
     struct Harness {
         phone: NoiseSession<TcpStream>,
+        requests: mpsc::UnboundedReceiver<PhoneRequest>,
         _session: tokio::task::JoinHandle<Result<()>>,
         ended: tokio::sync::oneshot::Receiver<Result<()>>,
     }
 
+    fn pinned() -> Entry {
+        Entry::Pinned(PinnedPhone {
+            fingerprint: "phone".to_string(),
+            allowed_features: BTreeSet::new(),
+        })
+    }
+
     async fn start_session(timings: PhoneTimings) -> Harness {
+        start_session_as(timings, pinned()).await
+    }
+
+    async fn start_session_as(timings: PhoneTimings, entry: Entry) -> Harness {
+        let (requests_tx, requests) = mpsc::unbounded_channel();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let receiver_identity = IdentityKey::generate().unwrap();
@@ -450,11 +825,13 @@ mod tests {
                 fingerprint: receiver_identity.fingerprint(),
             }
             .frame();
-            let phone = PinnedPhone {
+            let context = SessionContext {
+                name: "Pixel".to_string(),
                 fingerprint: "phone".to_string(),
-                allowed_features: BTreeSet::new(),
+                ip: "127.0.0.1".parse().unwrap(),
+                requests: requests_tx,
             };
-            let result = run_phone_session(session, hello, phone, timings).await;
+            let result = run_phone_session(session, hello, entry, context, timings).await;
             let summary = match &result {
                 Ok(()) => Ok(()),
                 Err(error) => Err(anyhow::anyhow!("{error:#}")),
@@ -472,6 +849,7 @@ mod tests {
         }
         Harness {
             phone,
+            requests,
             _session: session,
             ended,
         }
@@ -594,5 +972,309 @@ mod tests {
             .expect("session should end")
             .unwrap();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    async fn next_frame(phone: &mut NoiseSession<TcpStream>) -> Frame {
+        loop {
+            match time::timeout(Duration::from_secs(5), read_secure_frame(phone))
+                .await
+                .expect("frame should arrive")
+                .unwrap()
+            {
+                // Skip the receiver's pings.
+                Frame::Heartbeat(Heartbeat { sequence }) if sequence & RECEIVER_PING_BIT != 0 => {}
+                frame => return frame,
+            }
+        }
+    }
+
+    async fn send_pair_request(phone: &mut NoiseSession<TcpStream>, token: &str) {
+        write_secure_frame(
+            phone,
+            &Frame::Phone(PhoneEvent::PairRequest {
+                token: token.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_session_pins_then_carries_on_as_a_normal_session() {
+        let mut harness = start_session_as(FAST, Entry::Pairing).await;
+        send_pair_request(&mut harness.phone, "token").await;
+
+        let Some(PhoneRequest::Pair {
+            name, token, reply, ..
+        }) = harness.requests.recv().await
+        else {
+            panic!("expected a pair request");
+        };
+        assert_eq!((name.as_str(), token.as_str()), ("Pixel", "token"));
+        reply
+            .send(Ok(PinnedPhone {
+                fingerprint: "phone".to_string(),
+                allowed_features: PhoneFeature::all(),
+            }))
+            .ok();
+        assert_eq!(
+            next_frame(&mut harness.phone).await,
+            Frame::Phone(PhoneEvent::PairAccepted)
+        );
+
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Heartbeat(Heartbeat { sequence: 3 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_frame(&mut harness.phone).await,
+            Frame::Heartbeat(Heartbeat { sequence: 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_pairing_reports_why_and_closes() {
+        let mut harness = start_session_as(FAST, Entry::Pairing).await;
+        send_pair_request(&mut harness.phone, "wrong").await;
+        let Some(PhoneRequest::Pair { reply, .. }) = harness.requests.recv().await else {
+            panic!("expected a pair request");
+        };
+        reply.send(Err(PairingRefusal::WrongToken)).ok();
+
+        match next_frame(&mut harness.phone).await {
+            Frame::Error(RemoteError { code, .. }) => assert_eq!(code, "pairing_wrong_token"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(ended(harness).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unpaired_phone_must_start_with_a_pair_request() {
+        let mut harness = start_session_as(FAST, Entry::Pairing).await;
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Heartbeat(Heartbeat { sequence: 1 }),
+        )
+        .await
+        .unwrap();
+        let error = ended(harness).await.unwrap_err();
+        assert!(
+            error.to_string().contains("instead of a pairing request"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_phone_repeating_its_request_is_accepted_again() {
+        let mut harness = start_session(FAST).await;
+        send_pair_request(&mut harness.phone, "stale-token").await;
+        assert_eq!(
+            next_frame(&mut harness.phone).await,
+            Frame::Phone(PhoneEvent::PairAccepted)
+        );
+        assert!(harness.requests.try_recv().is_err(), "no pin change needed");
+    }
+
+    #[tokio::test]
+    async fn unpair_from_the_phone_asks_to_forget_it() {
+        let mut harness = start_session(FAST).await;
+        write_secure_frame(&mut harness.phone, &Frame::Phone(PhoneEvent::Unpair))
+            .await
+            .unwrap();
+        match harness.requests.recv().await {
+            Some(PhoneRequest::Forget { name, fingerprint }) => {
+                assert_eq!((name.as_str(), fingerprint.as_str()), ("Pixel", "phone"));
+            }
+            _ => panic!("expected a forget request"),
+        }
+        assert!(ended(harness).await.is_ok());
+    }
+
+    fn sessions() -> PhoneSessions {
+        PhoneSessions::new(
+            LocalHello {
+                device_name: "laptop".to_string(),
+                role: Role::Receiver,
+                fingerprint: "receiver-fp".to_string(),
+            },
+            "192.168.0.11:42420".parse().unwrap(),
+            std::env::temp_dir().join("edge-kvm-phone-test.log"),
+        )
+    }
+
+    async fn open_pairing(
+        phones: &mut PhoneSessions,
+        pins: &mut PinStore,
+        path: &Path,
+    ) -> (String, oneshot::Receiver<String>) {
+        let (reply, offer) = oneshot::channel();
+        let (paired_tx, paired) = oneshot::channel();
+        phones
+            .handle_request(
+                PhoneRequest::OpenPairing {
+                    reply,
+                    paired: paired_tx,
+                },
+                pins,
+                path,
+            )
+            .await;
+        let uri = offer.await.unwrap().uri;
+        let token = uri
+            .split('&')
+            .find_map(|part| part.strip_prefix("token="))
+            .unwrap()
+            .to_string();
+        assert!(
+            uri.contains("fp=receiver-fp") && uri.contains("port=42420"),
+            "{uri}"
+        );
+        (token, paired)
+    }
+
+    async fn request_pair(
+        phones: &mut PhoneSessions,
+        pins: &mut PinStore,
+        path: &Path,
+        name: &str,
+        fingerprint: &str,
+        token: &str,
+    ) -> Result<PinnedPhone, PairingRefusal> {
+        let (reply, outcome) = oneshot::channel();
+        phones
+            .handle_request(
+                PhoneRequest::Pair {
+                    name: name.to_string(),
+                    fingerprint: fingerprint.to_string(),
+                    ip: "192.168.0.21".parse().unwrap(),
+                    token: token.to_string(),
+                    reply,
+                },
+                pins,
+                path,
+            )
+            .await;
+        outcome.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_token_pins_exactly_one_phone_and_is_then_used_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut pins = PinStore::default();
+        pins.pin("Main PC", "pc-key");
+        let mut phones = sessions();
+        let (token, paired) = open_pairing(&mut phones, &mut pins, &path).await;
+
+        assert_eq!(
+            request_pair(&mut phones, &mut pins, &path, "Pixel", "key-a", "wrong").await,
+            Err(PairingRefusal::WrongToken)
+        );
+        assert!(
+            request_pair(&mut phones, &mut pins, &path, "Pixel", "key-a", &token)
+                .await
+                .is_ok()
+        );
+        assert_eq!(paired.await.unwrap(), "Pixel");
+        // A second phone racing with the same token loses.
+        assert_eq!(
+            request_pair(&mut phones, &mut pins, &path, "Tablet", "key-b", &token).await,
+            Err(PairingRefusal::Closed)
+        );
+
+        let saved = PinStore::load_or_default(&path).await.unwrap();
+        assert!(saved.phone_status("Pixel", "key-a").is_trusted());
+        assert!(saved.phone("Tablet").is_none());
+        assert!(saved.status("Main PC", "pc-key").is_trusted());
+    }
+
+    #[tokio::test]
+    async fn a_pc_key_cannot_pair_as_a_phone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut pins = PinStore::default();
+        pins.pin("Main PC", "pc-key");
+        let mut phones = sessions();
+        let (token, _paired) = open_pairing(&mut phones, &mut pins, &path).await;
+
+        assert_eq!(
+            request_pair(&mut phones, &mut pins, &path, "Pixel", "pc-key", &token).await,
+            Err(PairingRefusal::Failed)
+        );
+        assert!(pins.phones.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_keeps_the_token_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the pin file should be makes the save fail.
+        let blocked = dir.path().join("pins.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut pins = PinStore::default();
+        let mut phones = sessions();
+        let (token, _paired) = open_pairing(&mut phones, &mut pins, &blocked).await;
+
+        assert_eq!(
+            request_pair(&mut phones, &mut pins, &blocked, "Pixel", "key-a", &token).await,
+            Err(PairingRefusal::Failed)
+        );
+        assert!(pins.phones.is_empty(), "the in-memory pin is rolled back");
+
+        let path = dir.path().join("pins-ok.toml");
+        assert!(
+            request_pair(&mut phones, &mut pins, &path, "Pixel", "key-a", &token)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn re_pairing_a_phone_replaces_its_old_key_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut pins = pins_with_phone("Old name", "key-a");
+        pins.pin_phone("Pixel", "old-key", PhoneFeature::all());
+        let mut phones = sessions();
+        let (token, _paired) = open_pairing(&mut phones, &mut pins, &path).await;
+
+        assert!(
+            request_pair(&mut phones, &mut pins, &path, "Pixel", "key-a", &token)
+                .await
+                .is_ok()
+        );
+        assert!(pins.phone_status("Pixel", "key-a").is_trusted());
+        assert!(pins.phone("Old name").is_none(), "one pin per phone key");
+    }
+
+    #[tokio::test]
+    async fn unpair_removes_and_saves_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut pins = pins_with_phone("Pixel", "key-a");
+        let mut phones = sessions();
+
+        for expected in [Ok(true), Ok(false)] {
+            let (reply, result) = oneshot::channel();
+            phones
+                .handle_request(
+                    PhoneRequest::Unpair {
+                        name: "Pixel".to_string(),
+                        reply,
+                    },
+                    &mut pins,
+                    &path,
+                )
+                .await;
+            assert_eq!(result.await.unwrap(), expected);
+        }
+        assert!(
+            PinStore::load_or_default(&path)
+                .await
+                .unwrap()
+                .phones
+                .is_empty()
+        );
     }
 }
