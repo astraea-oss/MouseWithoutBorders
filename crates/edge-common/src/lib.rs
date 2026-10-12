@@ -86,12 +86,21 @@ pub struct AppConfig {
 }
 
 /// HyprMobile phones paired with this receiver.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhoneConfig {
-    /// Pass text copied on a phone on to connected PC peers. Off by default:
-    /// the phone's clipboard only reaches this machine.
-    #[serde(default)]
+    /// Pass text sent from a phone on to connected PC peers, so the phone
+    /// and every PC share one clipboard. On by default; turn off to keep the
+    /// phone's clipboard on this machine only.
+    #[serde(default = "default_true")]
     pub forward_clipboard_to_pcs: bool,
+}
+
+impl Default for PhoneConfig {
+    fn default() -> Self {
+        Self {
+            forward_clipboard_to_pcs: true,
+        }
+    }
 }
 
 impl PhoneConfig {
@@ -925,15 +934,17 @@ backend = "auto"
     }
 
     #[test]
-    fn phone_settings_are_optional_and_off_by_default() {
+    fn phone_settings_are_optional_and_share_the_clipboard_by_default() {
         let config = AppConfig::receiver_default();
-        assert!(!config.phone.forward_clipboard_to_pcs);
+        assert!(config.phone.forward_clipboard_to_pcs);
         let saved = toml::to_string_pretty(&config).unwrap();
         assert!(!saved.contains("[phone]"), "{saved}");
+        let reloaded: AppConfig = toml::from_str(&saved).unwrap();
+        assert!(reloaded.phone.forward_clipboard_to_pcs);
 
         let mut text = saved;
-        text.push_str("\n[phone]\nforward_clipboard_to_pcs = true\n");
+        text.push_str("\n[phone]\nforward_clipboard_to_pcs = false\n");
         let loaded: AppConfig = toml::from_str(&text).unwrap();
-        assert!(loaded.phone.forward_clipboard_to_pcs);
+        assert!(!loaded.phone.forward_clipboard_to_pcs);
     }
 }
