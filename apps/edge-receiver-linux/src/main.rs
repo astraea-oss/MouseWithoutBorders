@@ -3106,6 +3106,10 @@ fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) 
         peer.addr,
         peer.hello.device_name,
         peer.fingerprint,
+        peer.hello
+            .extensions
+            .iter()
+            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
         pins,
     );
 }

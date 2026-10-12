@@ -28,8 +28,9 @@ use anyhow::{Context, Result};
 use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
-    AudioDirection, Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION,
-    PROTOCOL_VERSION, PhoneEvent, RemoteError,
+    AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
+    HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
+    RemoteError,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -166,11 +167,15 @@ pub(crate) struct LocalHello {
 }
 
 impl LocalHello {
-    /// `notifications` advertises that this receiver shows phone notifications.
-    fn frame(&self, notifications: bool) -> Frame {
+    /// Advertises showing phone notifications and taking clipboard images
+    /// when this receiver does.
+    fn frame(&self, notifications: bool, images: bool) -> Frame {
         let mut extensions = vec![HYPR_PHONE_EXTENSION.to_string()];
         if notifications {
             extensions.push(NOTIFICATIONS_EXTENSION.to_string());
+        }
+        if images {
+            extensions.push(CLIPBOARD_IMAGE_EXTENSION.to_string());
         }
         Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -239,6 +244,8 @@ struct SessionContext {
     ip: IpAddr,
     requests: mpsc::UnboundedSender<PhoneRequest>,
     clipboard: Option<ClipboardSource>,
+    /// Both sides take clipboard images.
+    clipboard_images: bool,
     notifications: Option<SessionNotifications>,
     /// Where audio routing journals live.
     state_dir: PathBuf,
@@ -268,8 +275,8 @@ struct PhoneClipboard {
 }
 
 impl PhoneClipboard {
-    async fn start(source: ClipboardSource) -> Result<Self> {
-        let state = ReceiverClipboardState::new(&source.config, false)
+    async fn start(source: ClipboardSource, images: bool) -> Result<Self> {
+        let state = ReceiverClipboardState::new(&source.config, images)
             .await?
             .for_phone(source.changes.phone_origin());
         Ok(Self {
@@ -367,6 +374,7 @@ impl PhoneSessions {
         addr: SocketAddr,
         name: String,
         fingerprint: String,
+        phone_takes_images: bool,
         pins: &PinStore,
     ) {
         self.sessions
@@ -413,7 +421,11 @@ impl PhoneSessions {
             },
         );
 
-        let hello = self.local.frame(self.desktop.is_some());
+        let images = self
+            .clipboard
+            .as_ref()
+            .is_some_and(|source| source.config.clipboard.images_enabled);
+        let hello = self.local.frame(self.desktop.is_some(), images);
         let notifications = self.desktop.clone().map(|desktop| SessionNotifications {
             desktop,
             mirror: Arc::clone(self.mirrors.entry(fingerprint.clone()).or_default()),
@@ -426,6 +438,7 @@ impl PhoneSessions {
             ip: addr.ip(),
             requests: self.requests_tx.clone(),
             clipboard: self.clipboard.as_ref().map(ClipboardSource::resubscribe),
+            clipboard_images: images && phone_takes_images,
             notifications,
             state_dir: edge_common::default_state_dir(),
         };
@@ -704,6 +717,9 @@ async fn run_phone_session(
         Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
     };
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
+    let mut image_pace = time::interval(Duration::from_millis(2));
+    image_pace.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut image_expiry = time::interval(Duration::from_secs(1));
     let audio_allowed = phone.allowed_features.contains(&PhoneFeature::Audio);
     let (audio_stopped_tx, mut audio_stopped) = mpsc::unbounded_channel::<(u64, String)>();
     let mut audio: Option<PhoneAudio> = None;
@@ -714,13 +730,15 @@ async fn run_phone_session(
             .contains(&PhoneFeature::Notifications)
     });
     let mut clipboard = match context.clipboard {
-        Some(source) if clipboard_allowed => match PhoneClipboard::start(source).await {
-            Ok(clipboard) => Some(clipboard),
-            Err(error) => {
-                tracing::warn!(%error, phone = %context.name, "phone clipboard sync unavailable");
-                None
+        Some(source) if clipboard_allowed => {
+            match PhoneClipboard::start(source, context.clipboard_images).await {
+                Ok(clipboard) => Some(clipboard),
+                Err(error) => {
+                    tracing::warn!(%error, phone = %context.name, "phone clipboard sync unavailable");
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
 
@@ -751,6 +769,24 @@ async fn run_phone_session(
             }
             () = &mut dead => {
                 anyhow::bail!("phone silent for {:?}", timings.dead_after);
+            }
+            // Image chunks go out between other frames.
+            _ = image_pace.tick(), if clipboard.as_ref().is_some_and(|sync| sync.state.outgoing.is_some()) => {
+                let Some(sync) = clipboard.as_mut() else { continue };
+                if let Err(error) = sync.state.send_next_image_frame(&mut writer).await {
+                    tracing::warn!(%error, phone = %context.name, "couldn't send clipboard image to phone");
+                    sync.state.outgoing = None;
+                }
+            }
+            _ = image_expiry.tick(), if clipboard.is_some() => {
+                let Some(sync) = clipboard.as_mut() else { continue };
+                if let Some(transfer_id) = sync.state.incoming.expire_transfer_id() {
+                    send(&mut writer, &Frame::Clipboard(ClipboardEvent::ImageCancel {
+                        transfer_id,
+                        reason: ClipboardCancelReason::TimedOut,
+                    }))
+                    .await?;
+                }
             }
             event = clipboard_changed(&mut clipboard) => {
                 let Some(sync) = clipboard.as_mut() else { continue };
@@ -1012,13 +1048,14 @@ mod tests {
                 role: Role::Receiver,
                 fingerprint: receiver_identity.fingerprint(),
             }
-            .frame(false);
+            .frame(false, false);
             let context = SessionContext {
                 name: "Pixel".to_string(),
                 fingerprint: "phone".to_string(),
                 ip: "127.0.0.1".parse().unwrap(),
                 requests: requests_tx,
                 clipboard: None,
+                clipboard_images: false,
                 notifications: None,
                 state_dir: std::env::temp_dir(),
             };
