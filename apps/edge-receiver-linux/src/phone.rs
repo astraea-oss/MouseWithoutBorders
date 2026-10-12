@@ -28,8 +28,8 @@ use anyhow::{Context, Result};
 use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
-    Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PROTOCOL_VERSION,
-    PhoneEvent, RemoteError,
+    AudioDirection, Frame, HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION,
+    PROTOCOL_VERSION, PhoneEvent, RemoteError,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -43,6 +43,7 @@ use crate::{
     AbortOnDropTask, ClipboardWatchEvent, ReceiverClipboardState, append_portable_log,
     clipboard_hub::ClipboardChanges,
     notifications::{FreedesktopNotifications, NotificationMirror},
+    phone_audio::{self, PhoneAudio},
     phone_pairing::{PAIRING_WINDOW, PairingRefusal, PairingWindow, lan_addresses, pairing_uri},
     recv_clipboard_change, reject_pairing,
 };
@@ -125,6 +126,8 @@ enum PhoneFrame {
     Error,
     Clipboard,
     Notification,
+    AudioRequest(Option<AudioDirection>, u16),
+    AudioStopped,
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -139,6 +142,12 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Phone(PhoneEvent::PairRequest { token }) => PhoneFrame::PairRequest(token.clone()),
         Frame::Phone(PhoneEvent::Unpair) => PhoneFrame::Unpair,
         Frame::Phone(PhoneEvent::PairAccepted) => PhoneFrame::NotAllowed("PairAccepted"),
+        Frame::Phone(PhoneEvent::AudioRequest {
+            direction,
+            udp_port,
+        }) => PhoneFrame::AudioRequest(*direction, *udp_port),
+        Frame::Phone(PhoneEvent::AudioStopped { .. }) => PhoneFrame::AudioStopped,
+        Frame::Phone(PhoneEvent::AudioStart { .. }) => PhoneFrame::NotAllowed("AudioStart"),
         Frame::Hello(_) => PhoneFrame::NotAllowed("Hello"),
         Frame::ScreenInfo(_) => PhoneFrame::NotAllowed("ScreenInfo"),
         Frame::Input(_) => PhoneFrame::NotAllowed("Input"),
@@ -231,6 +240,8 @@ struct SessionContext {
     requests: mpsc::UnboundedSender<PhoneRequest>,
     clipboard: Option<ClipboardSource>,
     notifications: Option<SessionNotifications>,
+    /// Where audio routing journals live.
+    state_dir: PathBuf,
 }
 
 /// What a phone session needs to sync the clipboard: the receiver's
@@ -416,6 +427,7 @@ impl PhoneSessions {
             requests: self.requests_tx.clone(),
             clipboard: self.clipboard.as_ref().map(ClipboardSource::resubscribe),
             notifications,
+            state_dir: edge_common::default_state_dir(),
         };
         let task = tokio::spawn(async move {
             let name = context.name.clone();
@@ -692,6 +704,10 @@ async fn run_phone_session(
         Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
     };
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
+    let audio_allowed = phone.allowed_features.contains(&PhoneFeature::Audio);
+    let (audio_stopped_tx, mut audio_stopped) = mpsc::unbounded_channel::<(u64, String)>();
+    let mut audio: Option<PhoneAudio> = None;
+    let mut audio_generation = 0_u64;
     let notifications = context.notifications.clone().filter(|_| {
         phone
             .allowed_features
@@ -725,6 +741,13 @@ async fn run_phone_session(
                     sequence: RECEIVER_PING_BIT | ping_sequence,
                 }))
                 .await?;
+            }
+            Some((generation, reason)) = audio_stopped.recv() => {
+                if audio.as_ref().is_some_and(|running| running.generation == generation) {
+                    audio = None;
+                    tracing::info!(phone = %context.name, %reason, "phone audio ended");
+                    send(&mut writer, &Frame::Phone(PhoneEvent::AudioStopped { reason })).await?;
+                }
             }
             () = &mut dead => {
                 anyhow::bail!("phone silent for {:?}", timings.dead_after);
@@ -785,6 +808,30 @@ async fn run_phone_session(
                     PhoneFrame::PairRequest(_) => {
                         send(&mut writer, &Frame::Phone(PhoneEvent::PairAccepted)).await?;
                     }
+                    PhoneFrame::AudioRequest(direction, udp_port) => {
+                        // One direction at a time: whatever ran stops first.
+                        audio = None;
+                        let Some(direction) = direction else { continue };
+                        if !audio_allowed {
+                            send(&mut writer, &Frame::Phone(PhoneEvent::AudioStopped {
+                                reason: "audio isn't allowed for this phone".into(),
+                            }))
+                            .await?;
+                            continue;
+                        }
+                        audio_generation += 1;
+                        let (start, running) = phone_audio::start(
+                            direction,
+                            SocketAddr::new(context.ip, udp_port),
+                            context.state_dir.clone(),
+                            audio_generation,
+                            audio_stopped_tx.clone(),
+                        );
+                        send(&mut writer, &start).await?;
+                        tracing::info!(phone = %context.name, ?direction, "phone audio starting");
+                        audio = Some(running);
+                    }
+                    PhoneFrame::AudioStopped => audio = None,
                     PhoneFrame::Unpair => {
                         context
                             .requests
@@ -973,6 +1020,7 @@ mod tests {
                 requests: requests_tx,
                 clipboard: None,
                 notifications: None,
+                state_dir: std::env::temp_dir(),
             };
             let result = run_phone_session(session, hello, entry, context, timings).await;
             let summary = match &result {
@@ -1420,5 +1468,26 @@ mod tests {
                 .phones
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn audio_is_refused_when_the_pin_does_not_allow_it() {
+        // The test harness pins the phone with no features.
+        let mut harness = start_session(FAST).await;
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Phone(PhoneEvent::AudioRequest {
+                direction: Some(AudioDirection::ToPhone),
+                udp_port: 9,
+            }),
+        )
+        .await
+        .unwrap();
+        match next_frame(&mut harness.phone).await {
+            Frame::Phone(PhoneEvent::AudioStopped { reason }) => {
+                assert!(reason.contains("isn't allowed"), "{reason}");
+            }
+            other => panic!("expected AudioStopped, got {other:?}"),
+        }
     }
 }

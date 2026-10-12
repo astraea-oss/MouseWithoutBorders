@@ -86,6 +86,7 @@ mod clipboard_hub;
 mod control;
 mod notifications;
 mod phone;
+mod phone_audio;
 mod phone_pairing;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};

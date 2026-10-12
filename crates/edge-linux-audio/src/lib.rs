@@ -20,7 +20,32 @@ use tokio::{
     task::JoinHandle,
 };
 
-const VIRTUAL_SINK: &str = "edge_kvm_remote";
+/// A null sink that local audio is redirected into while it streams to a
+/// peer, with its own journal so redirects for different peers nest: each
+/// restores the sink that was the default before it.
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualSink {
+    pub name: &'static str,
+    pub description: &'static str,
+    journal_file: &'static str,
+}
+
+/// Audio streamed to a PC peer.
+pub const REMOTE_SINK: VirtualSink = VirtualSink {
+    name: "edge_kvm_remote",
+    description: "edge-kvm-remote",
+    journal_file: "audio-routing.toml",
+};
+
+/// Audio streamed to a paired phone.
+pub const PHONE_SINK: VirtualSink = VirtualSink {
+    name: "edge_kvm_phone",
+    description: "edge-kvm-phone",
+    journal_file: "audio-routing-phone.toml",
+};
+
+/// Most recent redirect first, so recovery unwinds them in order.
+const SINKS: [VirtualSink; 2] = [PHONE_SINK, REMOTE_SINK];
 const PLAYBACK_QUEUE_TARGET_MS: usize = 40;
 const PLAYBACK_QUEUE_FRAMES: usize = PLAYBACK_QUEUE_TARGET_MS / FRAME_MS as usize;
 
@@ -38,7 +63,15 @@ pub struct AudioRoutingGuard {
 
 impl AudioRoutingGuard {
     pub async fn activate(state_dir: &Path, redirect: bool) -> Result<Self> {
-        let journal_path = state_dir.join("audio-routing.toml");
+        Self::activate_sink(state_dir, redirect, REMOTE_SINK).await
+    }
+
+    pub async fn activate_sink(
+        state_dir: &Path,
+        redirect: bool,
+        sink: VirtualSink,
+    ) -> Result<Self> {
+        let journal_path = state_dir.join(sink.journal_file);
         recover_routing(&journal_path).await?;
         let previous_sink = pactl(&["get-default-sink"]).await?.trim().to_string();
         anyhow::ensure!(
@@ -56,12 +89,12 @@ impl AudioRoutingGuard {
         let module = pactl(&[
             "load-module",
             "module-null-sink",
-            &format!("sink_name={VIRTUAL_SINK}"),
+            &format!("sink_name={}", sink.name),
             "format=float32le",
             "rate=48000",
             "channels=2",
             "channel_map=front-left,front-right",
-            "sink_properties=device.description=edge-kvm-remote",
+            &format!("sink_properties=device.description={}", sink.description),
         ])
         .await?;
         let module_id = module
@@ -77,7 +110,7 @@ impl AudioRoutingGuard {
         }
         tokio::fs::write(&journal_path, toml::to_string_pretty(&journal)?).await?;
 
-        if let Err(error) = route_to_virtual_sink().await {
+        if let Err(error) = route_to_virtual_sink(sink.name).await {
             let _ = restore(&journal).await;
             let _ = tokio::fs::remove_file(&journal_path).await;
             return Err(error);
@@ -85,7 +118,7 @@ impl AudioRoutingGuard {
         Ok(Self {
             journal_path,
             journal: Some(journal),
-            capture_source: format!("{VIRTUAL_SINK}.monitor"),
+            capture_source: format!("{}.monitor", sink.name),
         })
     }
 
@@ -116,14 +149,14 @@ impl Drop for AudioRoutingGuard {
     }
 }
 
-async fn route_to_virtual_sink() -> Result<()> {
-    pactl(&["set-default-sink", VIRTUAL_SINK]).await?;
+async fn route_to_virtual_sink(sink: &str) -> Result<()> {
+    pactl(&["set-default-sink", sink]).await?;
     let inputs = pactl(&["list", "short", "sink-inputs"]).await?;
     for input in inputs
         .lines()
         .filter_map(|line| line.split_whitespace().next())
     {
-        pactl(&["move-sink-input", input, VIRTUAL_SINK]).await?;
+        pactl(&["move-sink-input", input, sink]).await?;
     }
     Ok(())
 }
@@ -143,7 +176,48 @@ async fn restore(journal: &RoutingJournal) -> Result<()> {
 }
 
 pub async fn recover_portable_routing(state_dir: &Path) -> Result<()> {
-    recover_routing(&state_dir.join("audio-routing.toml")).await
+    for sink in SINKS {
+        recover_routing(&state_dir.join(sink.journal_file)).await?;
+    }
+    Ok(())
+}
+
+/// The device local playback should use: the default sink, unless that's one
+/// of our redirect sinks, in which case the device it replaced. Audio from a
+/// peer must reach the speakers, never loop back into a stream to a peer.
+pub async fn real_output_sink(state_dir: &Path) -> Result<String> {
+    let default = pactl(&["get-default-sink"]).await?.trim().to_string();
+    let mut journals = Vec::new();
+    for sink in SINKS {
+        if let Ok(text) = tokio::fs::read_to_string(state_dir.join(sink.journal_file)).await
+            && let Ok(journal) = toml::from_str::<RoutingJournal>(&text)
+        {
+            journals.push(journal.previous_sink);
+        }
+    }
+    let sinks = pactl(&["list", "short", "sinks"]).await?;
+    let available: Vec<&str> = sinks
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+    Ok(choose_real_sink(&default, &journals, &available))
+}
+
+fn is_redirect_sink(name: &str) -> bool {
+    SINKS.iter().any(|sink| sink.name == name)
+}
+
+fn choose_real_sink(default: &str, journal_previous: &[String], available: &[&str]) -> String {
+    if !is_redirect_sink(default) {
+        return default.to_string();
+    }
+    journal_previous
+        .iter()
+        .map(String::as_str)
+        .chain(available.iter().copied())
+        .find(|sink| !is_redirect_sink(sink) && available.contains(sink))
+        .unwrap_or(default)
+        .to_string()
 }
 
 pub async fn test_audio_route(state_dir: &Path) -> Result<()> {
@@ -260,7 +334,18 @@ impl LinuxAudioReceiver {
         secrets: SessionSecrets,
         jitter_target_ms: u32,
     ) -> Result<Self> {
-        let mut playback = spawn_playback()?;
+        Self::start_on(socket, source_endpoint, secrets, jitter_target_ms, None).await
+    }
+
+    /// Like [`Self::start`], playing on `device` instead of the default sink.
+    pub async fn start_on(
+        socket: Arc<UdpSocket>,
+        source_endpoint: SocketAddr,
+        secrets: SessionSecrets,
+        jitter_target_ms: u32,
+        device: Option<String>,
+    ) -> Result<Self> {
+        let mut playback = spawn_playback(device.as_deref())?;
         let mut stdin = playback.stdin.take().context("pacat stdin was not piped")?;
         let cipher = PacketCipher::new(&secrets);
         let probe = cipher.seal(&AudioPacket {
@@ -421,7 +506,27 @@ impl LinuxAudioSender {
         state_dir: &Path,
         redirect: bool,
     ) -> Result<Self> {
-        let mut routing = AudioRoutingGuard::activate(state_dir, redirect).await?;
+        Self::start_to_sink(
+            socket,
+            destination,
+            secrets,
+            state_dir,
+            redirect,
+            REMOTE_SINK,
+        )
+        .await
+    }
+
+    /// Like [`Self::start`], redirecting local audio into `sink`.
+    pub async fn start_to_sink(
+        socket: Arc<UdpSocket>,
+        destination: std::net::SocketAddr,
+        secrets: SessionSecrets,
+        state_dir: &Path,
+        redirect: bool,
+        sink: VirtualSink,
+    ) -> Result<Self> {
+        let mut routing = AudioRoutingGuard::activate_sink(state_dir, redirect, sink).await?;
         let mut capture = spawn_capture(routing.capture_source())?;
         let mut stdout = capture
             .stdout
@@ -511,17 +616,20 @@ fn spawn_capture(source: &str) -> Result<Child> {
         .context("failed to start parec; install PipeWire PulseAudio tools")
 }
 
-fn spawn_playback() -> Result<Child> {
+fn spawn_playback(device: Option<&str>) -> Result<Child> {
     let mut command = Command::new("pacat");
+    command.args([
+        "--playback",
+        "--format=s16le",
+        "--rate=48000",
+        "--channels=2",
+        "--latency-msec=20",
+        "--raw",
+    ]);
+    if let Some(device) = device {
+        command.arg(format!("--device={device}"));
+    }
     command
-        .args([
-            "--playback",
-            "--format=s16le",
-            "--rate=48000",
-            "--channels=2",
-            "--latency-msec=20",
-            "--raw",
-        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -534,6 +642,31 @@ fn spawn_playback() -> Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_never_goes_into_a_redirect_sink() {
+        let available = ["speakers", "hdmi", "edge_kvm_remote", "edge_kvm_phone"];
+        assert_eq!(choose_real_sink("hdmi", &[], &available), "hdmi");
+        // Laptop audio is redirected to the PC: play where it used to go.
+        assert_eq!(
+            choose_real_sink("edge_kvm_remote", &["speakers".into()], &available),
+            "speakers"
+        );
+        // Nested redirects: skip journal entries that are redirect sinks too.
+        assert_eq!(
+            choose_real_sink(
+                "edge_kvm_phone",
+                &["edge_kvm_remote".into(), "hdmi".into()],
+                &available
+            ),
+            "hdmi"
+        );
+        // No journal: any real sink beats a redirect sink.
+        assert_eq!(
+            choose_real_sink("edge_kvm_remote", &[], &available),
+            "speakers"
+        );
+    }
 
     #[tokio::test]
     async fn authenticated_probe_uses_observed_peer_endpoint() {

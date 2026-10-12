@@ -93,6 +93,33 @@ pub enum PhoneEvent {
     /// Phone → receiver: forget this phone. The receiver removes the pin and
     /// closes the session.
     Unpair,
+    /// Phone → receiver: stream audio this way (stopping the other direction),
+    /// or stop with `None`. `udp_port` is the phone's audio socket; the
+    /// receiver sends to it first so the path works through its firewall.
+    AudioRequest {
+        direction: Option<AudioDirection>,
+        udp_port: u16,
+    },
+    /// Receiver → phone: keys for the requested stream. Encrypted UDP packets
+    /// use the same format as PC audio (`edge-audio`): 5 ms of 48 kHz stereo
+    /// 16-bit PCM each.
+    AudioStart {
+        direction: AudioDirection,
+        session_id: [u8; 16],
+        session_salt: [u8; 4],
+        session_key: [u8; 32],
+        jitter_target_ms: u16,
+    },
+    /// Either way: the stream ended, and why.
+    AudioStopped { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioDirection {
+    /// The computer's audio plays on the phone.
+    ToPhone,
+    /// The phone's media audio plays on the computer.
+    FromPhone,
 }
 
 /// Mirrors the phone's current notifications (view only). After every
@@ -900,6 +927,20 @@ mod tests {
             },
             PhoneEvent::PairAccepted,
             PhoneEvent::Unpair,
+            PhoneEvent::AudioRequest {
+                direction: Some(AudioDirection::FromPhone),
+                udp_port: 40_000,
+            },
+            PhoneEvent::AudioStart {
+                direction: AudioDirection::ToPhone,
+                session_id: [1; 16],
+                session_salt: [2; 4],
+                session_key: [3; 32],
+                jitter_target_ms: 80,
+            },
+            PhoneEvent::AudioStopped {
+                reason: "user".into(),
+            },
         ] {
             let frame = Frame::Phone(event);
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
