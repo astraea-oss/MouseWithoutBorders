@@ -26,9 +26,9 @@ static SETTINGS_CONTEXT: OnceLock<Mutex<Option<eframe::egui::Context>>> = OnceLo
 
 pub struct SettingsUiInput {
     pub role: Role,
-    /// The Linux node supports both connection directions. The Windows entry
-    /// point is currently connector-only, so it displays the mode read-only.
-    pub can_choose_transport: bool,
+    /// The Windows app can only dial, so it needs the other computer's
+    /// address. A Linux node also accepts computers that dial it.
+    pub connector_only: bool,
     /// Close the settings window after a successful save so the caller can
     /// restart the node with the new connection configuration.
     pub restart_on_save: bool,
