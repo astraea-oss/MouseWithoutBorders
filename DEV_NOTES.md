@@ -59,6 +59,16 @@ cargo run -p edge-receiver-linux -- --test-input key
 
 All three initialize the Hyprland Wayland virtual input backend and exit 0.
 
+## Connections
+
+Every Linux node runs the same code. It always listens (computers and phones,
+`listen`, default `0.0.0.0:42420`) and, when `peer.host` is set, also dials that
+computer. `transport` is kept for older builds and the Windows app; the Linux
+node ignores it. When both computers dial at once, each keeps the connection
+dialled by the lower key fingerprint, and the higher one waits a few seconds
+before dialling so that rarely happens. Paired computers live in
+`state/pins.toml` on both sides.
+
 ## Linux Tray
 
 The Linux receiver publishes a KDE/freedesktop StatusNotifierItem by default,

@@ -38,7 +38,8 @@ enum Clipboard {
 #[derive(Debug, Clone, PartialEq)]
 struct Editor {
     device_name: String,
-    transport: TransportMode,
+    /// Optional for a node: with an address it dials that computer, and
+    /// either way it accepts computers and phones that dial it.
     peer_host: String,
     port: String,
     position: PeerPosition,
@@ -52,6 +53,8 @@ struct Editor {
 
 impl Editor {
     fn from_config(config: &AppConfig) -> Self {
+        // Both computers use one port: the one this node listens on and the
+        // one it dials.
         let port = match config.transport {
             TransportMode::Connect => config.peer.port,
             TransportMode::Listen => config
@@ -62,7 +65,6 @@ impl Editor {
         };
         Self {
             device_name: config.device_name.clone(),
-            transport: config.transport,
             peer_host: config.peer.host.clone(),
             port: port.to_string(),
             position: config.layout.listener_position,
@@ -83,7 +85,9 @@ impl Editor {
         }
     }
 
-    fn apply(&self, original: &AppConfig) -> Result<AppConfig> {
+    /// `connector_only` is for the Windows app, which can only dial, so it
+    /// needs an address and always connects.
+    fn apply(&self, original: &AppConfig, connector_only: bool) -> Result<AppConfig> {
         validate_device_name(&self.device_name)?;
         let port = self
             .port
@@ -94,7 +98,6 @@ impl Editor {
 
         let mut config = original.clone();
         config.device_name = self.device_name.trim().to_string();
-        config.transport = self.transport;
         config.input.capture.game_compatibility = self.game_compatibility;
         config.clipboard.enabled = self.clipboard != Clipboard::Off;
         config.clipboard.images_enabled = self.clipboard == Clipboard::TextAndImages;
@@ -107,17 +110,23 @@ impl Editor {
             AudioLocalPlayback::Redirect
         };
         config.audio.jitter_target_ms = self.jitter_target_ms;
-        match self.transport {
-            TransportMode::Connect => {
-                validate_host(&self.peer_host)?;
-                config.peer.host = self.peer_host.trim().to_string();
-                config.peer.port = port;
-                config.layout.listener_position = self.position;
-            }
-            TransportMode::Listen => {
-                config.listen = Some(update_listen_port(config.listen.as_deref(), port));
-            }
+        let host = self.peer_host.trim();
+        if connector_only || !host.is_empty() {
+            validate_host(host)?;
         }
+        config.peer.host = host.to_string();
+        config.peer.port = port;
+        config.layout.listener_position = self.position;
+        if !connector_only {
+            config.listen = Some(update_listen_port(config.listen.as_deref(), port));
+        }
+        // Kept for older builds and the Windows app; a Linux node listens
+        // either way and dials whenever it has an address.
+        config.transport = if connector_only || !host.is_empty() {
+            TransportMode::Connect
+        } else {
+            TransportMode::Listen
+        };
         Ok(config)
     }
 }
@@ -139,7 +148,7 @@ pub(crate) struct SettingsApp {
     editor: Editor,
     local_ip: String,
     pairing: PairingUiState,
-    can_choose_transport: bool,
+    connector_only: bool,
     restart_on_save: bool,
     link: Option<Arc<dyn NodeLink>>,
     live: Live,
@@ -162,7 +171,7 @@ impl SettingsApp {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown address".to_string()),
             pairing: input.pairing,
-            can_choose_transport: input.can_choose_transport,
+            connector_only: input.connector_only,
             restart_on_save: input.restart_on_save,
             link: input.link,
             live: Live::default(),
@@ -200,12 +209,15 @@ impl SettingsApp {
     }
 
     fn save(&mut self) -> bool {
-        match self.editor.apply(&self.original).and_then(|config| {
-            config
-                .save_blocking(&self.config_path)
-                .map(|()| config)
-                .map_err(Into::into)
-        }) {
+        match self
+            .editor
+            .apply(&self.original, self.connector_only)
+            .and_then(|config| {
+                config
+                    .save_blocking(&self.config_path)
+                    .map(|()| config)
+                    .map_err(Into::into)
+            }) {
             Ok(config) => {
                 self.original = config.clone();
                 self.saved = self.editor.clone();
@@ -290,41 +302,30 @@ impl SettingsApp {
             );
             ui.end_row();
 
-            row_label(ui, "Connection");
-            ui.add_enabled_ui(self.can_choose_transport, |ui| {
-                segmented(
-                    ui,
-                    &mut self.editor.transport,
-                    &[
-                        (TransportMode::Connect, "Connect to…"),
-                        (TransportMode::Listen, "Wait for others"),
-                    ],
-                );
-            });
+            row_label(ui, "Other computer");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.editor.peer_host)
+                    .hint_text(if self.connector_only {
+                        "192.168.0.10"
+                    } else {
+                        "Address, or empty to let it find this one"
+                    })
+                    .desired_width(f32::INFINITY),
+            );
             ui.end_row();
 
-            if self.editor.transport == TransportMode::Connect {
-                row_label(ui, "Computer address");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.editor.peer_host)
-                        .hint_text("192.168.0.10")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.end_row();
-
-                row_label(ui, "It sits to the");
-                segmented(
-                    ui,
-                    &mut self.editor.position,
-                    &[
-                        (PeerPosition::Left, "Left"),
-                        (PeerPosition::Right, "Right"),
-                        (PeerPosition::Top, "Top"),
-                        (PeerPosition::Bottom, "Bottom"),
-                    ],
-                );
-                ui.end_row();
-            }
+            row_label(ui, "It sits to the");
+            segmented(
+                ui,
+                &mut self.editor.position,
+                &[
+                    (PeerPosition::Left, "Left"),
+                    (PeerPosition::Right, "Right"),
+                    (PeerPosition::Top, "Top"),
+                    (PeerPosition::Bottom, "Bottom"),
+                ],
+            );
+            ui.end_row();
 
             row_label(ui, "Port");
             ui.add(egui::TextEdit::singleline(&mut self.editor.port).desired_width(64.0));
@@ -701,7 +702,7 @@ mod tests {
     fn editor_round_trips_the_config() {
         let config = AppConfig::receiver_default();
         let editor = Editor::from_config(&config);
-        let saved = editor.apply(&config).unwrap();
+        let saved = editor.apply(&config, false).unwrap();
         assert_eq!(Editor::from_config(&saved), editor);
     }
 
@@ -710,11 +711,38 @@ mod tests {
         let config = AppConfig::receiver_default();
         let mut editor = Editor::from_config(&config);
         editor.clipboard = Clipboard::Text;
-        let saved = editor.apply(&config).unwrap();
+        let saved = editor.apply(&config, false).unwrap();
         assert!(saved.clipboard.enabled);
         assert!(!saved.clipboard.images_enabled);
         editor.clipboard = Clipboard::Off;
-        assert!(!editor.apply(&config).unwrap().clipboard.enabled);
+        assert!(!editor.apply(&config, false).unwrap().clipboard.enabled);
+    }
+
+    #[test]
+    fn an_address_is_optional_and_decides_who_dials() {
+        let config = AppConfig::receiver_default();
+        let mut editor = Editor::from_config(&config);
+        editor.peer_host.clear();
+        editor.port = "42500".to_string();
+        let waiting = editor.apply(&config, false).unwrap();
+        assert_eq!(waiting.transport, TransportMode::Listen);
+        assert_eq!(waiting.listen.as_deref(), Some("0.0.0.0:42500"));
+
+        editor.peer_host = "192.168.0.9".to_string();
+        let dialing = editor.apply(&config, false).unwrap();
+        assert_eq!(dialing.transport, TransportMode::Connect);
+        assert_eq!(dialing.peer.host, "192.168.0.9");
+        assert_eq!(dialing.peer.port, 42_500);
+        // Still listens, for phones and computers that dial it.
+        assert_eq!(dialing.listen.as_deref(), Some("0.0.0.0:42500"));
+    }
+
+    #[test]
+    fn the_windows_app_needs_an_address() {
+        let config = AppConfig::receiver_default();
+        let mut editor = Editor::from_config(&config);
+        editor.peer_host.clear();
+        assert!(editor.apply(&config, true).is_err());
     }
 
     #[test]

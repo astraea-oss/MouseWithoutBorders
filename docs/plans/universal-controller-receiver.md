@@ -15,6 +15,14 @@ Windows/Linux control directions. Phase 6 keeps the old executable names as
 compatibility entry points because their deprecation window has not happened
 yet; UI, help, and examples are now role-neutral.
 
+> **Update (issue #21):** the fixed connector/listener pair below is being
+> retired. Every Linux node now listens for computers and phones, and also
+> dials the computer it has an address for. When both computers dial at once,
+> each keeps the connection dialled by the lower key fingerprint. The
+> computer that dials a session still serializes role epochs for it, and the
+> accepting computer saves the layout from its own side so either direction
+> lines up the same. Several computers per node (a fleet) is the next step.
+
 ## Goal
 
 Keep the existing Windows-controller to Linux-receiver path working while adding:
