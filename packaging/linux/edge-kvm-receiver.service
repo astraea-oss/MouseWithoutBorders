@@ -1,0 +1,16 @@
+# Installed by scripts/install-linux-receiver.sh.
+[Unit]
+Description=edge-kvm receiver
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=EDGE_KVM_CONFIG=%h/.config/edge-kvm/receiver.toml
+Environment=EDGE_KVM_STATE_DIR=%h/.local/state/edge-kvm
+ExecStart=%h/.local/bin/edge-receiver-linux
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
