@@ -37,7 +37,7 @@ use edge_linux_input::{
 };
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
-    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, Heartbeat, Hello,
+    ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge, Frame, HeartbeatPing, Hello,
     INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent, NodeCapability, OutputInfo,
     PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, ReleaseReason, RemoteError,
     RoleEvent, ScreenInfo, decode_frame, encode_frame,
@@ -51,7 +51,7 @@ use edge_runtime::{
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use edge_ui::{
     PairingConfirmationInput, PairingUiState, SettingsUiInput, SettingsUiResult,
-    run_settings_window,
+    run_phone_pairing_window, run_settings_window,
 };
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
@@ -80,10 +80,12 @@ const RETURN_EDGE_MARGIN: i32 = 12;
 const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
 const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
+static PHONE_PAIRING_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod acceptor;
 mod clipboard_hub;
 mod control;
+mod control_link;
 mod notifications;
 mod phone;
 mod phone_audio;
@@ -120,6 +122,9 @@ struct Args {
     settings: bool,
     #[arg(long, hide = true)]
     settings_parent_pid: Option<u32>,
+    /// Show the phone pairing QR code for the running receiver.
+    #[arg(long, hide = true)]
+    add_phone: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -151,10 +156,12 @@ impl From<TestCaptureEdge> for Edge {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     // Control commands talk to the running receiver; they aren't receivers.
-    if let Some(command) = Args::parse().command {
+    if let Some(command) = args.command {
         return control::run_client(command).await;
     }
+    let window_process = args.settings || args.add_phone;
     init_tracing();
     let receiver_log = default_state_dir().join("receiver.log");
     install_receiver_panic_log(receiver_log.clone());
@@ -188,6 +195,11 @@ async fn main() -> Result<()> {
             format!("receiver process exited with error: {err:#}"),
         ),
     }
+    // A window runs on a blocking thread, which the runtime would wait for
+    // on shutdown, so a signal alone wouldn't close it.
+    if window_process {
+        std::process::exit(i32::from(result.is_err()));
+    }
     result
 }
 
@@ -217,8 +229,21 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         );
     }
 
+    if args.add_phone {
+        let link = Arc::new(control_link::ControlLink::new(receiver_log.clone()));
+        tokio::task::spawn_blocking(move || run_phone_pairing_window(link))
+            .await
+            .context("phone pairing window task failed")??;
+        return Ok(());
+    }
+
     if args.settings {
         let restart_config_path = config_path.clone();
+        // Only a waiting receiver serves the control socket.
+        let link = (config.transport == TransportMode::Listen).then(|| {
+            Arc::new(control_link::ControlLink::new(receiver_log.clone()))
+                as Arc<dyn edge_ui::NodeLink>
+        });
         let settings_input = SettingsUiInput {
             role: config.preferred_role,
             can_choose_transport: true,
@@ -227,6 +252,7 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
             config,
             local_ip: detect_primary_local_ip(),
             pairing: PairingUiState::Idle,
+            link,
         };
         let result = tokio::task::spawn_blocking(move || run_settings_window(settings_input))
             .await
@@ -524,6 +550,9 @@ async fn run_linux_connector(
                 TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                     open_receiver_settings(&config_path, &log_path);
                 }
+                TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                    open_phone_pairing(&log_path);
+                }
                 TrayCommandEvent::Command(TrayCommand::Quit) => break,
                 TrayCommandEvent::Command(
                     TrayCommand::Disconnect
@@ -554,11 +583,7 @@ async fn run_linux_connector(
                 config.peer.pinned_fingerprint = connection.peer_fingerprint.clone();
                 if let Some(tray) = &tray {
                     tray.pairing_armed(false).await;
-                    tray.connected(format!(
-                        "{} ({})",
-                        connection.peer_name, connection.peer_fingerprint
-                    ))
-                    .await;
+                    tray.connected(connection.peer_name.clone()).await;
                 }
                 connection
             }
@@ -588,6 +613,9 @@ async fn run_linux_connector(
                             }
                             TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                                 open_receiver_settings(&config_path, &log_path);
+                            }
+                            TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                                open_phone_pairing(&log_path);
                             }
                             TrayCommandEvent::Command(
                                 TrayCommand::Reconnect
@@ -1097,6 +1125,7 @@ async fn run_linux_controller_session(
     let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
     tokio::pin!(heartbeat);
     let mut heartbeat_sequence = 0_u64;
+    let mut heartbeat_ping = HeartbeatPing::default();
     let mut input_active = false;
     let mut capture_released_for_liveness = false;
 
@@ -1200,7 +1229,9 @@ async fn run_linux_controller_session(
                     heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
                     write_secure_frame_writer(
                         &mut writer,
-                        &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                        &Frame::Heartbeat(
+                            heartbeat_ping.outgoing(heartbeat_sequence, std::time::Instant::now()),
+                        ),
                     )
                     .await?;
                     heartbeat.as_mut().reset(
@@ -1384,6 +1415,9 @@ async fn run_linux_controller_session(
                     match command {
                         TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                             open_receiver_settings(config_path, log_path);
+                        }
+                        TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                            open_phone_pairing(log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
                             if !session_paused
@@ -1625,7 +1659,14 @@ async fn run_linux_controller_session(
                     }
                     writer.record_received(&frame);
                     match frame {
-                        Frame::Heartbeat(_) => {}
+                        Frame::Heartbeat(heartbeat) => {
+                            if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
+                                write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
+                            }
+                            if let Some(tray) = tray {
+                                tray.peer_round_trip(heartbeat_ping.round_trip());
+                            }
+                        }
                         Frame::Clipboard(event) => {
                             if !session_paused
                                 && clipboard_sync.handle_event(config, &mut writer, event).await?
@@ -2513,7 +2554,10 @@ async fn run_receiver(
             changes: hub.subscribe(),
         }),
     );
-    let _control = control::spawn_server(phones.requests(), &log_path).await;
+    if let Some(tray) = &tray {
+        phones.set_tray(tray.clone()).await;
+    }
+    let _control = control::spawn_server(phones.requests(), tray.clone(), &log_path).await;
     match control::socket_path() {
         Some(control) => {
             let icons = control.with_file_name("phone-icons");
@@ -2548,6 +2592,9 @@ async fn run_receiver(
                     match command {
                         TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                             open_receiver_settings(&config_path, &log_path);
+                        }
+                        TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                            open_phone_pairing(&log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                             pairing_armed = true;
@@ -2809,8 +2856,7 @@ async fn run_receiver(
         }
 
         if let Some(tray) = &tray {
-            tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
-                .await;
+            tray.connected(hello.device_name.clone()).await;
         }
         let controller_supports_audio_playback = hello
             .node_capabilities
@@ -3060,42 +3106,67 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn open_receiver_settings(config_path: &Path, log_path: &Path) {
-    if SETTINGS_PROCESS_OPEN.swap(true, Ordering::AcqRel) {
+    let parent = std::process::id().to_string();
+    spawn_window_process(
+        &SETTINGS_PROCESS_OPEN,
+        "settings",
+        &[
+            "--settings".as_ref(),
+            "--settings-parent-pid".as_ref(),
+            parent.as_ref(),
+            "--config".as_ref(),
+            config_path.as_os_str(),
+        ],
+        log_path,
+    );
+}
+
+/// The phone pairing QR code, in a window of its own.
+fn open_phone_pairing(log_path: &Path) {
+    spawn_window_process(
+        &PHONE_PAIRING_PROCESS_OPEN,
+        "phone pairing",
+        &["--add-phone".as_ref()],
+        log_path,
+    );
+}
+
+/// Runs a window as a child process, at most one of each at a time.
+fn spawn_window_process(
+    open: &'static AtomicBool,
+    what: &str,
+    args: &[&std::ffi::OsStr],
+    log_path: &Path,
+) {
+    if open.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    append_portable_log(log_path, "opening settings window");
+    append_portable_log(log_path, format!("opening {what} window"));
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(err) => {
-            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
-            tracing::warn!(%err, "failed to locate receiver executable for settings window");
+            open.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to locate receiver executable for {what} window");
             append_portable_log(
                 log_path,
-                format!("failed to locate receiver executable for settings window: {err}"),
+                format!("failed to locate receiver executable for {what} window: {err}"),
             );
             return;
         }
     };
 
-    match Command::new(executable)
-        .arg("--settings")
-        .arg("--settings-parent-pid")
-        .arg(std::process::id().to_string())
-        .arg("--config")
-        .arg(config_path)
-        .spawn()
-    {
+    match Command::new(executable).args(args).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
                 let _ = child.wait();
-                SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+                open.store(false, Ordering::Release);
             });
         }
         Err(err) => {
-            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
-            tracing::warn!(%err, "failed to start settings process");
-            append_portable_log(log_path, format!("failed to start settings process: {err}"));
+            open.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to start {what} process");
+            append_portable_log(log_path, format!("failed to start {what} process: {err}"));
         }
     }
 }
@@ -3154,10 +3225,7 @@ fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) 
         peer.addr,
         peer.hello.device_name,
         peer.fingerprint,
-        peer.hello
-            .extensions
-            .iter()
-            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+        &peer.hello.extensions,
         pins,
     );
 }
@@ -3346,6 +3414,7 @@ async fn handle_controller(
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
 
     let mut heartbeat_sequence = 0_u64;
+    let mut heartbeat_ping = HeartbeatPing::default();
     let liveness_config = LivenessConfig::default();
     let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
     tokio::pin!(heartbeat);
@@ -3592,7 +3661,11 @@ async fn handle_controller(
                     .await?;
                 }
                 heartbeat_sequence += 1;
-                write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::Heartbeat(heartbeat_ping.outgoing(heartbeat_sequence, std::time::Instant::now())),
+                )
+                .await?;
                 stats.heartbeats = stats.heartbeats.saturating_add(1);
                 let input_active = if local_is_controller {
                     capture_input_active
@@ -3692,6 +3765,9 @@ async fn handle_controller(
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                         open_receiver_settings(config_path, log_path);
+                    }
+                    TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                        open_phone_pairing(log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                         tracing::debug!("ignored pairing request while connected");
@@ -3989,7 +4065,14 @@ async fn handle_controller(
                             }
                         }
                     }
-                    Frame::Heartbeat(_) => {}
+                    Frame::Heartbeat(heartbeat) => {
+                        if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
+                            write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
+                        }
+                        if let Some(tray) = tray {
+                            tray.peer_round_trip(heartbeat_ping.round_trip());
+                        }
+                    }
                     Frame::Control(control) => {
                         if control.role_epoch != role_epoch {
                             tracing::debug!(

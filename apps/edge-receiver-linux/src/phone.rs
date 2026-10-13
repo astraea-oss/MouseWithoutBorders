@@ -29,8 +29,8 @@ use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
-    HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
-    RemoteError,
+    HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
+    PROTOCOL_VERSION, PhoneEvent, RemoteError,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -47,6 +47,7 @@ use crate::{
     phone_audio::{self, PhoneAudio},
     phone_pairing::{PAIRING_WINDOW, PairingRefusal, PairingWindow, lan_addresses, pairing_uri},
     recv_clipboard_change, reject_pairing,
+    tray::ReceiverTrayHandle,
 };
 
 /// Unacknowledged data may wait this long before the kernel drops a phone's
@@ -56,6 +57,8 @@ const PHONE_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Set on the sequence of every heartbeat the receiver originates.
 const RECEIVER_PING_BIT: u64 = 1 << 63;
+/// The first ping after connecting, before the regular interval takes over.
+const FIRST_PING_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PhoneTimings {
@@ -149,6 +152,7 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         }) => PhoneFrame::AudioRequest(*direction, *udp_port),
         Frame::Phone(PhoneEvent::AudioStopped { .. }) => PhoneFrame::AudioStopped,
         Frame::Phone(PhoneEvent::AudioStart { .. }) => PhoneFrame::NotAllowed("AudioStart"),
+        Frame::Phone(PhoneEvent::AudioInvite { .. }) => PhoneFrame::NotAllowed("AudioInvite"),
         Frame::Hello(_) => PhoneFrame::NotAllowed("Hello"),
         Frame::ScreenInfo(_) => PhoneFrame::NotAllowed("ScreenInfo"),
         Frame::Input(_) => PhoneFrame::NotAllowed("Input"),
@@ -225,6 +229,18 @@ pub(crate) enum PhoneRequest {
     List {
         reply: oneshot::Sender<Vec<(String, bool)>>,
     },
+    /// From the tray: start a stream this way with a connected phone, or
+    /// stop its stream with `None`.
+    Audio {
+        fingerprint: String,
+        direction: Option<AudioDirection>,
+    },
+}
+
+/// Work for one phone's session.
+#[derive(Debug)]
+enum PhoneCommand {
+    Audio(Option<AudioDirection>),
 }
 
 pub(crate) struct PairingOffer {
@@ -249,6 +265,9 @@ struct SessionContext {
     notifications: Option<SessionNotifications>,
     /// Where audio routing journals live.
     state_dir: PathBuf,
+    /// The phone takes `AudioInvite`, so the tray can start streams.
+    accepts_audio_invite: bool,
+    tray: Option<ReceiverTrayHandle>,
 }
 
 /// What a phone session needs to sync the clipboard: the receiver's
@@ -297,6 +316,7 @@ async fn clipboard_changed(clipboard: &mut Option<PhoneClipboard>) -> ClipboardW
 struct RunningPhone {
     name: String,
     pairing: bool,
+    commands: mpsc::UnboundedSender<PhoneCommand>,
     task: AbortOnDropTask,
 }
 
@@ -315,6 +335,7 @@ pub(crate) struct PhoneSessions {
     paired_watcher: Option<oneshot::Sender<String>>,
     requests_tx: mpsc::UnboundedSender<PhoneRequest>,
     requests_rx: mpsc::UnboundedReceiver<PhoneRequest>,
+    tray: Option<ReceiverTrayHandle>,
 }
 
 impl PhoneSessions {
@@ -338,7 +359,14 @@ impl PhoneSessions {
             paired_watcher: None,
             requests_tx,
             requests_rx,
+            tray: None,
         }
+    }
+
+    /// Shows connected phones in the tray and takes audio requests from it.
+    pub async fn set_tray(&mut self, tray: ReceiverTrayHandle) {
+        tray.set_phone_requests(self.requests()).await;
+        self.tray = Some(tray);
     }
 
     /// Enables showing phone notifications on the desktop.
@@ -374,9 +402,11 @@ impl PhoneSessions {
         addr: SocketAddr,
         name: String,
         fingerprint: String,
-        phone_takes_images: bool,
+        extensions: &[String],
         pins: &PinStore,
     ) {
+        let advertises = |name: &str| extensions.iter().any(|extension| extension == name);
+        let phone_takes_images = advertises(CLIPBOARD_IMAGE_EXTENSION);
         self.sessions
             .retain(|_, running| !running.task.0.is_finished());
         let entry = match admit_phone(pins, &name, &fingerprint, self.pairing_open()) {
@@ -441,10 +471,19 @@ impl PhoneSessions {
             clipboard_images: images && phone_takes_images,
             notifications,
             state_dir: edge_common::default_state_dir(),
+            accepts_audio_invite: advertises(PHONE_AUDIO_INVITE_EXTENSION),
+            tray: self.tray.clone(),
         };
+        let (commands, commands_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let name = context.name.clone();
-            let result = run_phone_session(session, hello, entry, context, timings).await;
+            let tray = context.tray.clone();
+            let fingerprint = context.fingerprint.clone();
+            let result =
+                run_phone_session(session, hello, entry, context, timings, commands_rx).await;
+            if let Some(tray) = tray {
+                tray.phone_disconnected(fingerprint).await;
+            }
             let message = match result {
                 Ok(()) => format!("phone {name} disconnected"),
                 Err(error) => format!("phone {name} session ended: {error:#}"),
@@ -457,6 +496,7 @@ impl PhoneSessions {
             RunningPhone {
                 name,
                 pairing,
+                commands,
                 task: AbortOnDropTask(task),
             },
         );
@@ -556,6 +596,14 @@ impl PhoneSessions {
                     .collect();
                 reply.send(phones).ok();
             }
+            PhoneRequest::Audio {
+                fingerprint,
+                direction,
+            } => {
+                if let Some(running) = self.sessions.get(&fingerprint) {
+                    running.commands.send(PhoneCommand::Audio(direction)).ok();
+                }
+            }
         }
     }
 
@@ -611,6 +659,9 @@ impl PhoneSessions {
         }
         // Dropping the session aborts it and closes its socket.
         self.sessions.remove(&removed.fingerprint);
+        if let Some(tray) = &self.tray {
+            tray.phone_disconnected(removed.fingerprint.clone()).await;
+        }
         if let (Some(desktop), Some(mirror)) =
             (&self.desktop, self.mirrors.remove(&removed.fingerprint))
         {
@@ -703,6 +754,7 @@ async fn run_phone_session(
     entry: Entry,
     context: SessionContext,
     timings: PhoneTimings,
+    mut commands: mpsc::UnboundedReceiver<PhoneCommand>,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     socket2::SockRef::from(session.get_ref())
@@ -716,6 +768,14 @@ async fn run_phone_session(
         Entry::Pinned(phone) => phone,
         Entry::Pairing => pair_phone(&mut frames, &mut writer, &context).await?,
     };
+    if let Some(tray) = &context.tray {
+        tray.phone_connected(
+            context.fingerprint.clone(),
+            context.name.clone(),
+            context.accepts_audio_invite,
+        )
+        .await;
+    }
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
     let mut image_pace = time::interval(Duration::from_millis(2));
     image_pace.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -742,24 +802,50 @@ async fn run_phone_session(
         _ => None,
     };
 
+    // The first ping goes out soon, so the tray shows a round trip early.
     let mut ping = time::interval_at(
-        Instant::now() + timings.ping_interval,
+        Instant::now() + timings.ping_interval.min(FIRST_PING_AFTER),
         timings.ping_interval,
     );
     ping.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let mut ping_sequence = 0_u64;
+    let mut ping_sent: Option<(u64, Instant)> = None;
+    let mut reported_audio: Option<AudioDirection> = None;
     let dead = time::sleep(timings.dead_after);
     tokio::pin!(dead);
 
     loop {
+        let audio_now = audio.as_ref().map(|running| running.direction);
+        if audio_now != reported_audio {
+            reported_audio = audio_now;
+            if let Some(tray) = &context.tray {
+                tray.phone_audio(context.fingerprint.clone(), audio_now)
+                    .await;
+            }
+        }
         tokio::select! {
             _ = ping.tick() => {
                 ping_sequence = ping_sequence.wrapping_add(1) & !RECEIVER_PING_BIT;
-                send(&mut writer, &Frame::Heartbeat(Heartbeat {
-                    sequence: RECEIVER_PING_BIT | ping_sequence,
-                }))
-                .await?;
+                let sequence = RECEIVER_PING_BIT | ping_sequence;
+                send(&mut writer, &Frame::Heartbeat(Heartbeat { sequence })).await?;
+                ping_sent = Some((sequence, Instant::now()));
             }
+            Some(command) = commands.recv() => match command {
+                PhoneCommand::Audio(Some(direction)) if context.accepts_audio_invite => {
+                    send(&mut writer, &Frame::Phone(PhoneEvent::AudioInvite { direction })).await?;
+                }
+                PhoneCommand::Audio(Some(_)) => {
+                    tracing::debug!(phone = %context.name, "phone can't be asked to start audio");
+                }
+                PhoneCommand::Audio(None) => {
+                    if audio.take().is_some() {
+                        send(&mut writer, &Frame::Phone(PhoneEvent::AudioStopped {
+                            reason: "stopped on the computer".into(),
+                        }))
+                        .await?;
+                    }
+                }
+            },
             Some((generation, reason)) = audio_stopped.recv() => {
                 if audio.as_ref().is_some_and(|running| running.generation == generation) {
                     audio = None;
@@ -817,7 +903,17 @@ async fn run_phone_session(
                     PhoneFrame::Heartbeat(sequence) if sequence & RECEIVER_PING_BIT == 0 => {
                         send(&mut writer, &frame).await?;
                     }
-                    PhoneFrame::Heartbeat(_) => {}
+                    PhoneFrame::Heartbeat(sequence) => {
+                        if let Some((sent_sequence, sent)) = ping_sent
+                            && sent_sequence == sequence
+                        {
+                            ping_sent = None;
+                            if let Some(tray) = &context.tray {
+                                tray.phone_round_trip(context.fingerprint.clone(), sent.elapsed())
+                                    .await;
+                            }
+                        }
+                    }
                     PhoneFrame::Error => tracing::warn!(?frame, "phone reported an error"),
                     PhoneFrame::Notification => {
                         let (Some(notifications), Frame::Notification(event)) = (&notifications, frame) else {
@@ -1078,8 +1174,11 @@ mod tests {
                 clipboard_images: false,
                 notifications: None,
                 state_dir: std::env::temp_dir(),
+                accepts_audio_invite: false,
+                tray: None,
             };
-            let result = run_phone_session(session, hello, entry, context, timings).await;
+            let (_commands, commands) = mpsc::unbounded_channel();
+            let result = run_phone_session(session, hello, entry, context, timings, commands).await;
             let summary = match &result {
                 Ok(()) => Ok(()),
                 Err(error) => Err(anyhow::anyhow!("{error:#}")),

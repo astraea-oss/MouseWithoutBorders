@@ -13,7 +13,11 @@
 //! pair-phone          → uri <link>, expires <seconds>, then paired <name> | closed
 //! unpair-phone <name> → unpaired <name> | not-paired | error <message>
 //! list-phones         → phone <name> connected|disconnected …, then end
+//! status              → summary <text>, [peer <name>], [ping <ms>], diag <key>=<value> …, then end
+//! arm-pairing         → ok | error <message>
 //! ```
+//!
+//! The settings window uses the same commands.
 
 use std::{
     os::unix::fs::PermissionsExt,
@@ -33,6 +37,7 @@ use tokio::{
 use crate::{
     AbortOnDropTask, append_portable_log,
     phone::{PairingOffer, PhoneRequest},
+    tray::{ReceiverTrayHandle, TrayCommand, TrayStatus},
 };
 
 #[derive(Debug, Clone, Subcommand)]
@@ -54,6 +59,7 @@ pub(crate) fn socket_path() -> Option<PathBuf> {
 /// there's no runtime directory or another receiver already serves it.
 pub(crate) async fn spawn_server(
     requests: mpsc::UnboundedSender<PhoneRequest>,
+    tray: Option<ReceiverTrayHandle>,
     log_path: &Path,
 ) -> Option<AbortOnDropTask> {
     let Some(path) = socket_path() else {
@@ -67,7 +73,7 @@ pub(crate) async fn spawn_server(
         Ok(listener) => {
             let log_path = log_path.to_path_buf();
             Some(AbortOnDropTask(tokio::spawn(serve(
-                listener, requests, log_path,
+                listener, requests, tray, log_path,
             ))))
         }
         Err(error) => {
@@ -98,6 +104,7 @@ async fn bind(path: &Path) -> Result<UnixListener> {
 async fn serve(
     listener: UnixListener,
     requests: mpsc::UnboundedSender<PhoneRequest>,
+    tray: Option<ReceiverTrayHandle>,
     log_path: PathBuf,
 ) {
     loop {
@@ -113,8 +120,9 @@ async fn serve(
             }
         };
         let requests = requests.clone();
+        let tray = tray.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, requests).await {
+            if let Err(error) = handle_client(stream, requests, tray).await {
                 tracing::debug!(%error, "control client ended");
             }
         });
@@ -124,6 +132,7 @@ async fn serve(
 async fn handle_client(
     stream: UnixStream,
     requests: mpsc::UnboundedSender<PhoneRequest>,
+    tray: Option<ReceiverTrayHandle>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
@@ -173,10 +182,35 @@ async fn handle_client(
             }
             response + "end\n"
         }
+        (Some("status"), _) => match &tray {
+            Some(tray) => status_reply(&tray.status().borrow()),
+            None => "summary Running\nend\n".to_string(),
+        },
+        (Some("arm-pairing"), _) => match &tray {
+            Some(tray) => {
+                tray.command(TrayCommand::ArmPairing);
+                "ok\n".to_string()
+            }
+            None => "error pairing needs the tray; restart without --no-tray\n".to_string(),
+        },
         _ => "error unknown command\n".to_string(),
     };
     writer.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+fn status_reply(status: &TrayStatus) -> String {
+    let mut reply = format!("summary {}\n", status.summary);
+    if let Some(peer) = &status.peer {
+        reply.push_str(&format!("peer {peer}\n"));
+    }
+    if let Some(ping) = status.round_trip_ms {
+        reply.push_str(&format!("ping {ping}\n"));
+    }
+    for (key, value) in &status.diagnostics {
+        reply.push_str(&format!("diag {key}={}\n", value.replace('\n', " ")));
+    }
+    reply + "end\n"
 }
 
 /// Runs a control command against the running receiver and prints the result.
@@ -258,7 +292,7 @@ mod tests {
     async fn pair_phone_reports_the_link_and_the_paired_phone() {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx));
+        tokio::spawn(handle_client(server, requests_tx, None));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"pair-phone\n").await.unwrap();
 
@@ -282,11 +316,26 @@ mod tests {
         assert_eq!(lines.next_line().await.unwrap().unwrap(), "paired Pixel");
     }
 
+    #[test]
+    fn status_reply_lists_the_status_then_diagnostics() {
+        let status = TrayStatus {
+            summary: "Main PC is controlling this computer · 4 ms".to_string(),
+            connected: true,
+            peer: Some("Main PC".to_string()),
+            round_trip_ms: Some(4),
+            diagnostics: vec![("last error", "none".to_string())],
+        };
+        assert_eq!(
+            status_reply(&status),
+            "summary Main PC is controlling this computer · 4 ms\npeer Main PC\nping 4\ndiag last error=none\nend\n"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_commands_are_refused() {
         let (requests_tx, _requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx));
+        tokio::spawn(handle_client(server, requests_tx, None));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"format-disk\n").await.unwrap();
         let mut lines = BufReader::new(reader).lines();
