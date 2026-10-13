@@ -8,8 +8,8 @@
 //! - **To the phone:** local audio is redirected into the `edge_kvm_phone`
 //!   null sink and its monitor is streamed, so it plays on the phone instead of
 //!   here. Stopping restores the previous default sink.
-//! - **From the phone:** the stream plays on this machine's real output device,
-//!   never into a redirect sink, so it can't loop back to a peer.
+//! - **From the phone:** the stream plays wherever this machine's audio goes,
+//!   including on to a PC peer, but never back into the phone sink.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -108,7 +108,7 @@ async fn run(
             "audio capture on the computer stopped".to_string()
         }
         AudioDirection::FromPhone => {
-            let device = edge_linux_audio::real_output_sink(&state_dir).await.ok();
+            let device = edge_linux_audio::phone_playback_sink(&state_dir).await.ok();
             let receiver = match LinuxAudioReceiver::start_on(
                 socket,
                 endpoint,

@@ -181,40 +181,32 @@ pub async fn recover_portable_routing(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The device local playback should use: the default sink, unless that's one
-/// of our redirect sinks, in which case the device it replaced. Audio from a
-/// peer must reach the speakers, never loop back into a stream to a peer.
-pub async fn real_output_sink(state_dir: &Path) -> Result<String> {
+/// Where a phone's audio should play: wherever this computer's audio goes,
+/// including to a PC peer through the remote sink. Only the phone sink is
+/// avoided, since that would send the phone its own audio.
+pub async fn phone_playback_sink(state_dir: &Path) -> Result<String> {
     let default = pactl(&["get-default-sink"]).await?.trim().to_string();
-    let mut journals = Vec::new();
-    for sink in SINKS {
-        if let Ok(text) = tokio::fs::read_to_string(state_dir.join(sink.journal_file)).await
-            && let Ok(journal) = toml::from_str::<RoutingJournal>(&text)
-        {
-            journals.push(journal.previous_sink);
-        }
-    }
+    let previous = tokio::fs::read_to_string(state_dir.join(PHONE_SINK.journal_file))
+        .await
+        .ok()
+        .and_then(|text| toml::from_str::<RoutingJournal>(&text).ok())
+        .map(|journal| journal.previous_sink);
     let sinks = pactl(&["list", "short", "sinks"]).await?;
     let available: Vec<&str> = sinks
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .collect();
-    Ok(choose_real_sink(&default, &journals, &available))
+    Ok(choose_phone_sink(&default, previous.as_deref(), &available))
 }
 
-fn is_redirect_sink(name: &str) -> bool {
-    SINKS.iter().any(|sink| sink.name == name)
-}
-
-fn choose_real_sink(default: &str, journal_previous: &[String], available: &[&str]) -> String {
-    if !is_redirect_sink(default) {
+fn choose_phone_sink(default: &str, phone_previous: Option<&str>, available: &[&str]) -> String {
+    if default != PHONE_SINK.name {
         return default.to_string();
     }
-    journal_previous
-        .iter()
-        .map(String::as_str)
+    phone_previous
+        .into_iter()
         .chain(available.iter().copied())
-        .find(|sink| !is_redirect_sink(sink) && available.contains(sink))
+        .find(|sink| *sink != PHONE_SINK.name && available.contains(sink))
         .unwrap_or(default)
         .to_string()
 }
@@ -655,26 +647,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playback_never_goes_into_a_redirect_sink() {
+    fn phone_audio_follows_local_audio_but_never_returns_to_the_phone() {
         let available = ["speakers", "hdmi", "edge_kvm_remote", "edge_kvm_phone"];
-        assert_eq!(choose_real_sink("hdmi", &[], &available), "hdmi");
-        // Laptop audio is redirected to the PC: play where it used to go.
+        assert_eq!(choose_phone_sink("hdmi", None, &available), "hdmi");
+        // Local audio goes to a PC peer: so does the phone's.
         assert_eq!(
-            choose_real_sink("edge_kvm_remote", &["speakers".into()], &available),
-            "speakers"
+            choose_phone_sink("edge_kvm_remote", None, &available),
+            "edge_kvm_remote"
         );
-        // Nested redirects: skip journal entries that are redirect sinks too.
+        // Local audio is going to the phone: play where it went before.
         assert_eq!(
-            choose_real_sink(
-                "edge_kvm_phone",
-                &["edge_kvm_remote".into(), "hdmi".into()],
-                &available
-            ),
-            "hdmi"
+            choose_phone_sink("edge_kvm_phone", Some("edge_kvm_remote"), &available),
+            "edge_kvm_remote"
         );
-        // No journal: any real sink beats a redirect sink.
         assert_eq!(
-            choose_real_sink("edge_kvm_remote", &[], &available),
+            choose_phone_sink("edge_kvm_phone", Some("gone"), &available),
             "speakers"
         );
     }
