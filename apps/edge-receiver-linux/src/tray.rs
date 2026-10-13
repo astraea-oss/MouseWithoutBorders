@@ -21,6 +21,8 @@ const LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const TRAY_UPDATE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Stored in place of a round trip that hasn't been measured.
 const NO_ROUND_TRIP: u64 = u64::MAX;
+/// The ping shown in the menu changes at most this often.
+const ROUND_TRIP_REFRESH: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum TrayCommand {
@@ -87,6 +89,7 @@ struct LiveCounters {
     input_events: AtomicU64,
     clipboard_events: AtomicU64,
     round_trip_micros: AtomicU64,
+    round_trip_shown_at: std::sync::Mutex<Option<std::time::Instant>>,
     dirty: AtomicBool,
 }
 
@@ -96,6 +99,7 @@ impl LiveCounters {
             input_events: AtomicU64::new(0),
             clipboard_events: AtomicU64::new(0),
             round_trip_micros: AtomicU64::new(NO_ROUND_TRIP),
+            round_trip_shown_at: std::sync::Mutex::new(None),
             dirty: AtomicBool::new(false),
         }
     }
@@ -242,9 +246,22 @@ impl ReceiverTrayHandle {
         self.live.dirty.store(true, Ordering::Release);
     }
 
-    /// The latest heartbeat round trip to the PC peer.
+    /// The heartbeat round trip to the PC peer. The first one shows at once;
+    /// after that the menu changes at most every [`ROUND_TRIP_REFRESH`], and
+    /// only when the shown milliseconds would change.
     pub fn peer_round_trip(&self, round_trip: Option<Duration>) {
-        if self.live.round_trip() != round_trip {
+        let shown = self.live.round_trip();
+        if shown.map(|rtt| rtt.as_millis()) == round_trip.map(|rtt| rtt.as_millis()) {
+            return;
+        }
+        let mut shown_at = self
+            .live
+            .round_trip_shown_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let due = shown.is_none() || shown_at.is_none_or(|at| at.elapsed() >= ROUND_TRIP_REFRESH);
+        if due {
+            *shown_at = Some(std::time::Instant::now());
             self.set_round_trip(round_trip);
             self.live.dirty.store(true, Ordering::Release);
         }
@@ -535,7 +552,7 @@ impl ksni::Tray for ReceiverTray {
         items.extend(self.phones.iter().map(|phone| {
             StandardItem {
                 label: phone_line(phone),
-                icon_name: "smartphone".to_string(),
+                icon_data: menu_icon_png(MenuIcon::Phone).to_vec(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::OpenSettings);
                 }),
@@ -564,7 +581,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Add phone…".to_string(),
-                icon_name: "list-add".to_string(),
+                icon_data: menu_icon_png(MenuIcon::Add).to_vec(),
                 visible: self.phone_requests.is_some(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::AddPhone);
@@ -576,7 +593,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Pair a computer…".to_string(),
-                icon_name: "network-connect".to_string(),
+                icon_data: menu_icon_png(MenuIcon::Pair).to_vec(),
                 visible: !connected,
                 enabled: !self.pairing_armed,
                 activate: Box::new(|tray: &mut Self| {
@@ -590,7 +607,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Settings…".to_string(),
-                icon_name: "configure".to_string(),
+                icon_data: menu_icon_png(MenuIcon::Settings).to_vec(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::OpenSettings);
                 }),
@@ -601,7 +618,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Quit".to_string(),
-                icon_name: "application-exit".to_string(),
+                icon_data: menu_icon_png(MenuIcon::Quit).to_vec(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Quit);
                 }),
@@ -727,7 +744,7 @@ impl ReceiverTray {
             (format!("Control {peer} from here"), ControllerChoice::Local)
         };
         ksni::menu::StandardItem {
-            icon_name: "exchange-positions".to_string(),
+            icon_data: menu_icon_png(MenuIcon::Swap).to_vec(),
             label,
             visible: self.state == TrayState::Connected && self.role_switch_available,
             enabled: !self.role_switching,
@@ -883,18 +900,18 @@ impl ReceiverTray {
     fn connection_item(&self) -> ksni::MenuItem<Self> {
         use ksni::menu::StandardItem;
 
-        let (label, icon, command): (&str, &str, fn() -> TrayCommand) = match self.state {
-            TrayState::Paused => ("Reconnect", "network-connect", || TrayCommand::Reconnect),
+        let (label, icon, command): (&str, MenuIcon, fn() -> TrayCommand) = match self.state {
+            TrayState::Paused => ("Reconnect", MenuIcon::Pair, || TrayCommand::Reconnect),
             TrayState::Starting
             | TrayState::Listening
             | TrayState::Connected
-            | TrayState::Error => ("Disconnect", "network-disconnect", || {
+            | TrayState::Error => ("Disconnect", MenuIcon::Disconnect, || {
                 TrayCommand::Disconnect
             }),
         };
         StandardItem {
             label: label.to_string(),
-            icon_name: icon.to_string(),
+            icon_data: menu_icon_png(icon).to_vec(),
             activate: Box::new(move |tray: &mut Self| {
                 let _ = tray.command_tx.send(command());
             }),
@@ -940,6 +957,156 @@ fn status_dot_png(color: IconColor) -> &'static [u8] {
         });
         let mut png = std::io::Cursor::new(Vec::new());
         dot.write_to(&mut png, image::ImageFormat::Png)
+            .expect("a 16×16 PNG always encodes");
+        png.into_inner()
+    })
+}
+
+/// Menu icons are drawn here rather than named from the icon theme, so they
+/// look the same everywhere instead of falling back to the theme's
+/// missing-icon square.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuIcon {
+    Phone,
+    Add,
+    Swap,
+    Pair,
+    Disconnect,
+    Settings,
+    Quit,
+}
+
+const MENU_ICON_COUNT: usize = 7;
+
+#[derive(Clone, Copy)]
+enum Stroke {
+    Line([f32; 2], [f32; 2]),
+    /// A circle, open by `gap` radians either side of twelve o'clock.
+    Ring {
+        center: [f32; 2],
+        radius: f32,
+        gap: f32,
+    },
+}
+
+impl Stroke {
+    fn distance(&self, p: [f32; 2]) -> f32 {
+        match *self {
+            Stroke::Line(a, b) => {
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let ap = [p[0] - a[0], p[1] - a[1]];
+                let length = ab[0] * ab[0] + ab[1] * ab[1];
+                let t = ((ap[0] * ab[0] + ap[1] * ab[1]) / length).clamp(0.0, 1.0);
+                (ap[0] - t * ab[0]).hypot(ap[1] - t * ab[1])
+            }
+            Stroke::Ring {
+                center,
+                radius,
+                gap,
+            } => {
+                let (dx, dy) = (p[0] - center[0], p[1] - center[1]);
+                let angle = dx.atan2(-dy);
+                if angle.abs() >= gap {
+                    return (dx.hypot(dy) - radius).abs();
+                }
+                let end = |angle: f32| {
+                    let (x, y) = (radius * angle.sin(), -radius * angle.cos());
+                    (dx - x).hypot(dy - y)
+                };
+                end(gap).min(end(-gap))
+            }
+        }
+    }
+}
+
+impl MenuIcon {
+    /// Strokes on a 16×16 grid.
+    fn strokes(self) -> Vec<Stroke> {
+        use Stroke::Line;
+        let rect = |x0: f32, y0: f32, x1: f32, y1: f32| {
+            [
+                Line([x0, y0], [x1, y0]),
+                Line([x1, y0], [x1, y1]),
+                Line([x1, y1], [x0, y1]),
+                Line([x0, y1], [x0, y0]),
+            ]
+        };
+        match self {
+            MenuIcon::Phone => {
+                let mut strokes = rect(5.0, 1.0, 11.0, 14.0).to_vec();
+                strokes.push(Line([7.0, 12.0], [9.0, 12.0]));
+                strokes
+            }
+            MenuIcon::Add => vec![Line([8.0, 3.0], [8.0, 13.0]), Line([3.0, 8.0], [13.0, 8.0])],
+            MenuIcon::Swap => vec![
+                Line([2.0, 5.0], [13.0, 5.0]),
+                Line([10.0, 2.0], [13.0, 5.0]),
+                Line([10.0, 8.0], [13.0, 5.0]),
+                Line([14.0, 11.0], [3.0, 11.0]),
+                Line([6.0, 8.0], [3.0, 11.0]),
+                Line([6.0, 14.0], [3.0, 11.0]),
+            ],
+            MenuIcon::Pair => {
+                let mut strokes = rect(1.0, 2.0, 14.0, 10.0).to_vec();
+                strokes.push(Line([8.0, 10.0], [8.0, 13.0]));
+                strokes.push(Line([5.0, 13.0], [11.0, 13.0]));
+                strokes
+            }
+            MenuIcon::Disconnect => {
+                vec![
+                    Line([4.0, 4.0], [12.0, 12.0]),
+                    Line([12.0, 4.0], [4.0, 12.0]),
+                ]
+            }
+            MenuIcon::Settings => {
+                let mut strokes = vec![Stroke::Ring {
+                    center: [8.0, 8.0],
+                    radius: 3.8,
+                    gap: 0.0,
+                }];
+                strokes.extend((0..8).map(|tooth| {
+                    let angle = tooth as f32 * std::f32::consts::FRAC_PI_4;
+                    let (sin, cos) = angle.sin_cos();
+                    Line(
+                        [8.0 + 4.5 * cos, 8.0 + 4.5 * sin],
+                        [8.0 + 6.3 * cos, 8.0 + 6.3 * sin],
+                    )
+                }));
+                strokes
+            }
+            MenuIcon::Quit => vec![
+                Stroke::Ring {
+                    center: [8.0, 8.0],
+                    radius: 5.5,
+                    gap: 0.6,
+                },
+                Line([8.0, 1.0], [8.0, 7.0]),
+            ],
+        }
+    }
+}
+
+/// A light-grey line icon, as PNG, drawn once per icon.
+fn menu_icon_png(icon: MenuIcon) -> &'static [u8] {
+    static ICONS: [std::sync::OnceLock<Vec<u8>>; MENU_ICON_COUNT] =
+        [const { std::sync::OnceLock::new() }; MENU_ICON_COUNT];
+    ICONS[icon as usize].get_or_init(|| {
+        const SIZE: u32 = 16;
+        const HALF_WIDTH: f32 = 0.75;
+        let strokes = icon.strokes();
+        let image = image::RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+            // Pixel centres sit on whole coordinates, so whole-number strokes are crisp.
+            let p = [x as f32, y as f32];
+            let distance = strokes
+                .iter()
+                .map(|stroke| stroke.distance(p))
+                .fold(f32::INFINITY, f32::min);
+            let alpha = (HALF_WIDTH + 0.5 - distance).clamp(0.0, 1.0);
+            image::Rgba([0xc8, 0xcc, 0xd4, (alpha * 255.0) as u8])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut png, image::ImageFormat::Png)
             .expect("a 16×16 PNG always encodes");
         png.into_inner()
     })
@@ -1169,6 +1336,37 @@ mod tests {
         assert_eq!(dot.get_pixel(0, 0).0[3], 0);
         (status.activate)(&mut tray);
         assert!(matches!(commands.try_recv(), Ok(TrayCommand::OpenSettings)));
+    }
+
+    #[test]
+    fn menu_icons_are_drawn_not_named_from_the_theme() {
+        let (tray, _) = test_tray(TrayState::Connected);
+        for item in tray.menu() {
+            if let ksni::MenuItem::Standard(item) = item {
+                assert!(
+                    item.icon_name.is_empty(),
+                    "{} names a theme icon",
+                    item.label
+                );
+            }
+        }
+        for icon in [
+            MenuIcon::Phone,
+            MenuIcon::Add,
+            MenuIcon::Swap,
+            MenuIcon::Pair,
+            MenuIcon::Disconnect,
+            MenuIcon::Settings,
+            MenuIcon::Quit,
+        ] {
+            let image = image::load_from_memory(menu_icon_png(icon))
+                .unwrap()
+                .to_rgba8();
+            assert!(
+                image.pixels().any(|pixel| pixel.0[3] == 0xff),
+                "{icon:?} draws nothing"
+            );
+        }
     }
 
     #[test]

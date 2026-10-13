@@ -439,17 +439,24 @@ pub struct Heartbeat {
 /// A heartbeat with [`Self::ECHO_REQUEST`] set asks the peer to send it back
 /// with [`Self::ECHO_REPLY`] instead. Builds without this ignore both bits,
 /// as heartbeat sequences are only ever used for liveness, so against them
-/// the round trip just stays unknown.
+/// the round trip just stays unknown. Only one heartbeat every
+/// [`Self::INTERVAL`] asks, and the round trip is the average of the last
+/// few, so a single slow packet doesn't jump the number around.
 #[derive(Debug, Default)]
 pub struct HeartbeatPing {
     pending: Option<(u64, std::time::Instant)>,
-    round_trip: Option<std::time::Duration>,
+    last_asked: Option<std::time::Instant>,
+    samples: std::collections::VecDeque<std::time::Duration>,
 }
 
 impl HeartbeatPing {
     pub const ECHO_REQUEST: u64 = 1 << 62;
     pub const ECHO_REPLY: u64 = 1 << 61;
     const SEQUENCE: u64 = !(Self::ECHO_REQUEST | Self::ECHO_REPLY);
+    /// How often a heartbeat asks for an echo.
+    pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Samples averaged, so about ten seconds' worth.
+    const SAMPLES: usize = 5;
     /// An echo this late is treated as lost and the next heartbeat asks again.
     const ECHO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -460,10 +467,14 @@ impl HeartbeatPing {
         let waiting = self
             .pending
             .is_some_and(|(_, sent)| now.duration_since(sent) < Self::ECHO_TIMEOUT);
-        if waiting {
+        let too_soon = self
+            .last_asked
+            .is_some_and(|asked| now.duration_since(asked) < Self::INTERVAL);
+        if waiting || too_soon {
             return Heartbeat { sequence };
         }
         self.pending = Some((sequence, now));
+        self.last_asked = Some(now);
         Heartbeat {
             sequence: sequence | Self::ECHO_REQUEST,
         }
@@ -482,7 +493,10 @@ impl HeartbeatPing {
             if let Some((pending, sent)) = self.pending
                 && pending == sequence
             {
-                self.round_trip = Some(now.duration_since(sent));
+                if self.samples.len() == Self::SAMPLES {
+                    self.samples.pop_front();
+                }
+                self.samples.push_back(now.duration_since(sent));
                 self.pending = None;
             }
             return None;
@@ -492,9 +506,12 @@ impl HeartbeatPing {
         })
     }
 
-    /// The latest measured round trip, if the peer echoes heartbeats.
+    /// The average of the latest round trips, if the peer echoes heartbeats.
     pub fn round_trip(&self) -> Option<std::time::Duration> {
-        self.round_trip
+        let count = u32::try_from(self.samples.len())
+            .ok()
+            .filter(|count| *count > 0)?;
+        Some(self.samples.iter().sum::<std::time::Duration>() / count)
     }
 }
 
@@ -1029,8 +1046,8 @@ mod tests {
 
         let ping = local.outgoing(7, start);
         assert_eq!(ping.sequence, 7 | HeartbeatPing::ECHO_REQUEST);
-        // Another heartbeat before the echo arrives doesn't ask again.
-        let next = local.outgoing(8, start + std::time::Duration::from_millis(1));
+        // Heartbeats in between don't ask.
+        let next = local.outgoing(8, start + std::time::Duration::from_millis(250));
         assert_eq!(next.sequence, 8);
         assert_eq!(peer.incoming(&next, start), None);
 
@@ -1043,6 +1060,23 @@ mod tests {
         assert_eq!(
             local.round_trip(),
             Some(std::time::Duration::from_millis(4))
+        );
+    }
+
+    #[test]
+    fn heartbeat_ping_averages_recent_round_trips() {
+        let mut now = std::time::Instant::now();
+        let mut local = HeartbeatPing::default();
+        let mut peer = HeartbeatPing::default();
+        for (sequence, millis) in [(1, 2), (2, 4), (3, 12)] {
+            let ping = local.outgoing(sequence, now);
+            let echo = peer.incoming(&ping, now).unwrap();
+            local.incoming(&echo, now + std::time::Duration::from_millis(millis));
+            now += HeartbeatPing::INTERVAL;
+        }
+        assert_eq!(
+            local.round_trip(),
+            Some(std::time::Duration::from_millis(6))
         );
     }
 
