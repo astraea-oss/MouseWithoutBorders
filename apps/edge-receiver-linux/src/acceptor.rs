@@ -122,8 +122,8 @@ async fn handshake(
             format!("failed to configure controller socket timeout for {addr}: {err:#}"),
         );
     }
-    tracing::info!(%addr, "controller connected");
-    append_portable_log(log_path, format!("controller connected: {addr}"));
+    tracing::info!(%addr, "incoming connection");
+    append_portable_log(log_path, format!("incoming connection from {addr}"));
 
     let (mut session, fingerprint) =
         match time::timeout(HANDSHAKE_TIMEOUT, accept_noise_session(stream, identity)).await {

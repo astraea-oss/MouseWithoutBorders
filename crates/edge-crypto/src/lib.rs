@@ -26,7 +26,7 @@ pub enum CryptoError {
     InvalidKeyLength(usize),
     #[error("hex decode error: {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("toml decode error: {0}")]
     TomlDecode(#[from] toml::de::Error),

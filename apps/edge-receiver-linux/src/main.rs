@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -3001,14 +3001,62 @@ fn install_receiver_panic_log(log_path: PathBuf) {
     }));
 }
 
+/// Past this size the log moves to `<name>.1`, replacing the previous one.
+const PORTABLE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > PORTABLE_LOG_MAX_BYTES) {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, rotated);
+    }
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
+        let _ = writeln!(
+            file,
+            "{} {}",
+            utc_timestamp(SystemTime::now()),
+            message.as_ref()
+        );
     }
+}
+
+/// `2026-10-13T12:34:56.789Z`.
+fn utc_timestamp(time: SystemTime) -> String {
+    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = since_epoch.as_secs();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let of_day = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
+/// algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn open_receiver_settings(config_path: &Path, log_path: &Path) {
@@ -3308,6 +3356,7 @@ async fn handle_controller(
     let mut input_epoch = InputEpochGate::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut stats = ReceiverInputStats::default();
+    let mut logged_stats = None;
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info.clone());
@@ -3558,7 +3607,7 @@ async fn handle_controller(
                 );
             }
             _ = status_log.tick() => {
-                stats.log(log_path, "receiver");
+                stats.log_if_changed(log_path, "receiver", &mut logged_stats);
                 if audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
                     if let Some(sender) = audio_sender.take() {
                         sender.stop().await.ok();
@@ -4944,7 +4993,7 @@ impl ReceiverClipboardState {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Eq)]
 struct ReceiverInputStats {
     motion: u64,
     buttons: u64,
@@ -4978,7 +5027,13 @@ impl ReceiverInputStats {
         }
     }
 
-    fn log(&self, path: &Path, side: &str) {
+    /// Logs the counters if they changed since the last line, so an idle
+    /// session doesn't fill the log.
+    fn log_if_changed(&self, path: &Path, side: &str, logged: &mut Option<Self>) {
+        if logged.as_ref() == Some(self) {
+            return;
+        }
+        *logged = Some(self.clone());
         append_portable_log(
             path,
             format!(
@@ -5343,6 +5398,42 @@ fn desktop_names_include_niri(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_timestamps_are_readable_utc() {
+        let at =
+            |seconds: u64, millis: u64| UNIX_EPOCH + Duration::from_millis(seconds * 1000 + millis);
+        assert_eq!(utc_timestamp(at(0, 0)), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            utc_timestamp(at(951_782_400, 5)),
+            "2000-02-29T00:00:00.005Z"
+        );
+        assert_eq!(
+            utc_timestamp(at(1_791_895_167, 237)),
+            "2026-10-13T12:39:27.237Z"
+        );
+    }
+
+    #[test]
+    fn the_portable_log_rotates_when_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receiver.log");
+        std::fs::write(&path, vec![b'x'; PORTABLE_LOG_MAX_BYTES as usize + 1]).unwrap();
+
+        append_portable_log(&path, "fresh");
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .ends_with(" fresh\n")
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("receiver.log.1"))
+                .unwrap()
+                .len(),
+            PORTABLE_LOG_MAX_BYTES + 1
+        );
+    }
 
     #[test]
     fn only_the_connected_peer_may_replace_a_live_session() {

@@ -21,7 +21,7 @@ pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
 pub enum ProtocolError {
     #[error("frame too large: {0} bytes")]
     FrameTooLarge(u32),
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("encode error: {0}")]
     Encode(#[from] rmp_serde::encode::Error),

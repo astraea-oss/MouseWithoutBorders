@@ -895,11 +895,31 @@ async fn send(writer: &mut PhoneWriter, frame: &Frame) -> Result<()> {
 }
 
 fn is_closed(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
-    })
+    error
+        .chain()
+        .filter_map(io_error)
+        .any(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+/// The io error behind `cause`. The crates' io variants are transparent, so
+/// it's the variant's payload rather than a separate cause in the chain.
+fn io_error<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    use edge_crypto::CryptoError;
+    use edge_protocol::ProtocolError;
+    use edge_runtime::RuntimeError;
+    match (
+        cause.downcast_ref::<std::io::Error>(),
+        cause.downcast_ref::<RuntimeError>(),
+        cause.downcast_ref::<CryptoError>(),
+        cause.downcast_ref::<ProtocolError>(),
+    ) {
+        (Some(io), ..)
+        | (_, Some(RuntimeError::Crypto(CryptoError::Io(io))), ..)
+        | (_, Some(RuntimeError::Protocol(ProtocolError::Io(io))), ..)
+        | (_, _, Some(CryptoError::Io(io)), _)
+        | (_, _, _, Some(ProtocolError::Io(io))) => Some(io),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
