@@ -47,7 +47,6 @@ pub const PHONE_SINK: VirtualSink = VirtualSink {
 /// Most recent redirect first, so recovery unwinds them in order.
 const SINKS: [VirtualSink; 2] = [PHONE_SINK, REMOTE_SINK];
 const PLAYBACK_QUEUE_TARGET_MS: usize = 40;
-const PLAYBACK_QUEUE_FRAMES: usize = PLAYBACK_QUEUE_TARGET_MS / FRAME_MS as usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RoutingJournal {
@@ -334,17 +333,29 @@ impl LinuxAudioReceiver {
         secrets: SessionSecrets,
         jitter_target_ms: u32,
     ) -> Result<Self> {
-        Self::start_on(socket, source_endpoint, secrets, jitter_target_ms, None).await
+        Self::start_on(
+            socket,
+            source_endpoint,
+            secrets,
+            jitter_target_ms,
+            None,
+            PLAYBACK_QUEUE_TARGET_MS,
+        )
+        .await
     }
 
-    /// Like [`Self::start`], playing on `device` instead of the default sink.
+    /// Like [`Self::start`], playing on `device` instead of the default sink
+    /// and queueing up to `playback_queue_ms` for pacat. Senders on Wi-Fi
+    /// deliver in bursts that a short queue would drop.
     pub async fn start_on(
         socket: Arc<UdpSocket>,
         source_endpoint: SocketAddr,
         secrets: SessionSecrets,
         jitter_target_ms: u32,
         device: Option<String>,
+        playback_queue_ms: usize,
     ) -> Result<Self> {
+        let playback_queue_frames = (playback_queue_ms / FRAME_MS as usize).max(1);
         let mut playback = spawn_playback(device.as_deref())?;
         let mut stdin = playback.stdin.take().context("pacat stdin was not piped")?;
         let cipher = PacketCipher::new(&secrets);
@@ -369,7 +380,7 @@ impl LinuxAudioReceiver {
             // socket queue and turning into audible packet loss.
             // The jitter buffer already absorbs network variation. Keep this
             // queue small so pacat backpressure cannot turn into audible lag.
-            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(PLAYBACK_QUEUE_FRAMES);
+            let (playback_tx, mut playback_rx) = mpsc::channel::<Vec<u8>>(playback_queue_frames);
             let mut playback_writer = tokio::spawn(async move {
                 while let Some(encoded) = playback_rx.recv().await {
                     stdin
