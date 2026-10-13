@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -26,17 +26,14 @@ use edge_common::{
 };
 #[cfg(target_os = "linux")]
 use edge_crypto::initiate_noise_session;
-use edge_crypto::{
-    IdentityKey, NoiseSession, PinStatus, PinStore, accept_noise_session, pairing_code,
-};
+use edge_crypto::{IdentityKey, NoiseSession, PinStatus, PinStore, pairing_code};
 #[cfg(any(target_os = "linux", test))]
 use edge_geometry::local_restore_point;
 use edge_geometry::{Point, Rect, normalized_perpendicular};
 use edge_linux_input::{
-    ClipboardChangeWatcher, HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend,
-    UinputBackend, hyprland_cursor_position, hyprland_screen_info, read_clipboard_item,
-    read_clipboard_text, spawn_clipboard_change_watcher, write_clipboard_image,
-    write_clipboard_text,
+    HyprCursorPosition, HyprlandVirtualInputBackend, LibeiBackend, UinputBackend,
+    hyprland_cursor_position, hyprland_screen_info, read_clipboard_item, read_clipboard_text,
+    write_clipboard_image, write_clipboard_text,
 };
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
@@ -63,10 +60,14 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
+    sync::{Notify, mpsc},
     task::JoinHandle,
     time,
 };
+
+use acceptor::{AcceptEvent, Acceptor, IncomingPeer};
+use clipboard_hub::{ClipboardChanges, ClipboardHub, PhoneOrigin};
+use phone::{LocalHello, PhoneSessions};
 
 type TcpFrameReader = SecureFrameReader<ReadHalf<TcpStream>>;
 type ScheduledNoiseWriter = SecureFrameWriter<WriteHalf<TcpStream>>;
@@ -80,12 +81,21 @@ const RETURN_EDGE_ENTRY_GRACE: Duration = Duration::from_millis(350);
 const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
+mod acceptor;
+mod clipboard_hub;
+mod control;
+mod notifications;
+mod phone;
+mod phone_audio;
+mod phone_pairing;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Linux edge-kvm node")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<control::ControlCommand>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long, help = "Arm two-sided confirmation for the next pairing")]
@@ -141,6 +151,10 @@ impl From<TestCaptureEdge> for Edge {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Control commands talk to the running receiver; they aren't receivers.
+    if let Some(command) = Args::parse().command {
+        return control::run_client(command).await;
+    }
     init_tracing();
     let receiver_log = default_state_dir().join("receiver.log");
     install_receiver_panic_log(receiver_log.clone());
@@ -470,6 +484,7 @@ async fn run_linux_connector(
     // First-time setup should lead directly to the mutual confirmation dialog.
     // Keep replacement of an existing identity behind the explicit pair action.
     let mut pairing_armed = initial_pairing_armed || config.peer.pinned_fingerprint.is_empty();
+    let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
     let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
     let (tray, mut tray_commands) = if enable_tray {
         let (tray, commands) = ReceiverTrayHandle::spawn(
@@ -596,11 +611,14 @@ async fn run_linux_connector(
             &mut tray_commands,
             &connector_pause,
             &log_path,
+            clipboard_hub.as_ref().map(ClipboardHub::subscribe),
             &mut capture,
         )
         .await
         {
             Ok(ControllerSessionExit::QuitRequested) => break,
+            // Only accepted sessions are replaced; an outgoing one just reconnects.
+            Ok(ControllerSessionExit::Replaced) => {}
             Ok(ControllerSessionExit::DisconnectRequested) => {
                 connection_enabled = false;
                 if let Some(tray) = &tray {
@@ -894,6 +912,7 @@ async fn run_linux_controller_session(
     tray_commands: &mut Option<mpsc::UnboundedReceiver<TrayCommand>>,
     connector_pause: &AtomicBool,
     log_path: &Path,
+    clipboard_changes: Option<ClipboardChanges>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
@@ -1065,11 +1084,10 @@ async fn run_linux_controller_session(
         send_linux_audio_offer(&mut writer, &audio_socket).await?;
     }
     let mut frame_rx = spawn_controller_reader(reader);
-    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images).await?;
-    let mut clipboard_watcher = config
-        .clipboard
-        .enabled
-        .then(spawn_clipboard_change_watcher);
+    let mut clipboard_sync = ReceiverClipboardState::new(config, peer_supports_images)
+        .await?
+        .withholding_phone_content(config, clipboard_changes.as_ref());
+    let mut clipboard_watcher = clipboard_changes;
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let liveness_config = LivenessConfig::default();
@@ -1583,7 +1601,8 @@ async fn run_linux_controller_session(
                             }
                         }
                         ClipboardWatchEvent::Closed => {
-                            clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                            tracing::warn!("clipboard hub stopped; clipboard sync is off for this session");
+                            clipboard_watcher = None;
                         }
                     }
                 }
@@ -2145,7 +2164,7 @@ async fn run_linux_controller_session(
                             AudioControl::SetRoute { .. }
                             | AudioControl::State { .. }
                         ) => {}
-                        Frame::Hello(_) | Frame::Pairing(_) => {}
+                        Frame::Hello(_) | Frame::Pairing(_) | Frame::Phone(_) | Frame::Notification(_) => {}
                     }
                 }
                 _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {
@@ -2435,6 +2454,9 @@ async fn run_receiver(
     let listener = TcpListener::bind(&listen)
         .await
         .with_context(|| format!("failed to bind {listen}"))?;
+    let listen_addr = listener
+        .local_addr()
+        .context("failed to read the listen address")?;
 
     let (tray, mut tray_commands) = if enable_tray {
         match ReceiverTrayHandle::spawn(
@@ -2475,6 +2497,41 @@ async fn run_receiver(
         ),
     );
 
+    let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
+    let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
+    let pins_path = state_dir.join("pins.toml");
+    let mut phones = PhoneSessions::new(
+        LocalHello {
+            device_name: config.device_name.clone(),
+            role: config.preferred_role,
+            fingerprint: identity.fingerprint(),
+        },
+        listen_addr,
+        log_path.clone(),
+        clipboard_hub.as_ref().map(|hub| phone::ClipboardSource {
+            config: Arc::new(config.clone()),
+            changes: hub.subscribe(),
+        }),
+    );
+    let _control = control::spawn_server(phones.requests(), &log_path).await;
+    match control::socket_path() {
+        Some(control) => {
+            let icons = control.with_file_name("phone-icons");
+            match notifications::FreedesktopNotifications::connect(icons).await {
+                Ok(desktop) => phones.set_desktop_notifications(desktop),
+                Err(error) => append_portable_log(
+                    &log_path,
+                    format!("phone notifications unavailable: {error:#}"),
+                ),
+            }
+        }
+        None => append_portable_log(
+            &log_path,
+            "no runtime directory; phone notifications unavailable",
+        ),
+    }
+    // A newer connection from the connected peer, waiting for its session to end.
+    let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
     let mut pairing_armed = initial_pairing_armed;
     // Keep one compositor capture session across transport reconnects. Creating a
@@ -2483,134 +2540,111 @@ async fn run_receiver(
     #[cfg(target_os = "linux")]
     let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
     loop {
-        let (stream, addr) = tokio::select! {
-            command = recv_tray_command(&mut tray_commands) => {
-                match command {
-                    TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
-                        open_receiver_settings(&config_path, &log_path);
-                    }
-                    TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
-                        pairing_armed = true;
-                        if let Some(tray) = &tray {
-                            tray.pairing_armed(true).await;
-                            tray.listening().await;
+        let incoming = if let Some(peer) = replacement.take() {
+            peer
+        } else {
+            tokio::select! {
+                command = recv_tray_command(&mut tray_commands) => {
+                    match command {
+                        TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
+                            open_receiver_settings(&config_path, &log_path);
                         }
-                        tracing::info!("pairing armed from tray");
-                        append_portable_log(
-                            &log_path,
-                            "pairing armed; waiting for confirmation on both computers",
-                        );
-                    }
-                    TrayCommandEvent::Command(TrayCommand::Quit) => {
-                        tracing::info!("quit requested from tray");
-                        append_portable_log(&log_path, "quit requested from tray");
-                        break;
-                    }
-                    TrayCommandEvent::Command(TrayCommand::Disconnect) => {
-                        connection_enabled = false;
-                        if let Some(tray) = &tray {
-                            tray.disconnected_by_user().await;
+                        TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
+                            pairing_armed = true;
+                            if let Some(tray) = &tray {
+                                tray.pairing_armed(true).await;
+                                tray.listening().await;
+                            }
+                            tracing::info!("pairing armed from tray");
+                            append_portable_log(
+                                &log_path,
+                                "pairing armed; waiting for confirmation on both computers",
+                            );
+                        }
+                        TrayCommandEvent::Command(TrayCommand::Quit) => {
+                            tracing::info!("quit requested from tray");
+                            append_portable_log(&log_path, "quit requested from tray");
+                            break;
+                        }
+                        TrayCommandEvent::Command(TrayCommand::Disconnect) => {
+                            connection_enabled = false;
+                            if let Some(tray) = &tray {
+                                tray.disconnected_by_user().await;
+                            }
+                        }
+                        TrayCommandEvent::Command(TrayCommand::Reconnect) => {
+                            connection_enabled = true;
+                            if let Some(tray) = &tray {
+                                tray.listening().await;
+                            }
+                            tracing::info!("reconnect requested from tray");
+                            append_portable_log(&log_path, "reconnect requested from tray");
+                        }
+                        TrayCommandEvent::Command(TrayCommand::SetAudio(_)) => {
+                            tracing::info!("audio route ignored while no peer is connected");
+                        }
+                        TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
+                            tracing::info!(
+                                "input forwarding toggle ignored while no controller is connected"
+                            );
+                        }
+                        TrayCommandEvent::Command(TrayCommand::SetController(_)) => {
+                            tracing::info!("role selection ignored while no peer is connected");
+                        }
+                        TrayCommandEvent::Closed => {
+                            tracing::warn!("tray command channel closed; continuing without tray commands");
+                            append_portable_log(
+                                &log_path,
+                                "tray command channel closed; continuing without tray commands",
+                            );
                         }
                     }
-                    TrayCommandEvent::Command(TrayCommand::Reconnect) => {
-                        connection_enabled = true;
-                        if let Some(tray) = &tray {
-                            tray.listening().await;
-                        }
-                        tracing::info!("reconnect requested from tray");
-                        append_portable_log(&log_path, "reconnect requested from tray");
-                    }
-                    TrayCommandEvent::Command(TrayCommand::SetAudio(_)) => {
-                        tracing::info!("audio route ignored while no peer is connected");
-                    }
-                    TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
-                        tracing::info!(
-                            "input forwarding toggle ignored while no controller is connected"
-                        );
-                    }
-                    TrayCommandEvent::Command(TrayCommand::SetController(_)) => {
-                        tracing::info!("role selection ignored while no peer is connected");
-                    }
-                    TrayCommandEvent::Closed => {
-                        tracing::warn!("tray command channel closed; continuing without tray commands");
-                        append_portable_log(
-                            &log_path,
-                            "tray command channel closed; continuing without tray commands",
-                        );
-                    }
+                    continue;
                 }
-                continue;
+                request = phones.next_request() => {
+                    phones.handle_request(request, &mut pins, &pins_path).await;
+                    continue;
+                }
+                event = acceptor.recv() => match event {
+                    Some(AcceptEvent::Peer(peer)) => *peer,
+                    Some(AcceptEvent::Failed(message)) => {
+                        if let Some(tray) = &tray {
+                            tray.error(message).await;
+                        }
+                        continue;
+                    }
+                    None => anyhow::bail!("connection acceptor stopped"),
+                },
             }
-            incoming = listener.accept(), if connection_enabled => incoming?,
         };
-        if let Err(err) = configure_controller_socket(&stream) {
-            tracing::warn!(%err, %addr, "failed to configure controller socket timeout");
+        // Phones are always accepted; the tray's Disconnect is about PC peers.
+        if phone::is_phone_hello(&incoming.hello) {
+            start_phone(&mut phones, incoming, &pins);
+            continue;
+        }
+        if !connection_enabled {
+            reject_peer(
+                incoming,
+                "receiver_disconnected",
+                "the other computer is disconnected from its tray",
+                &log_path,
+            );
+            continue;
+        }
+        let IncomingPeer {
+            mut session,
+            addr,
+            fingerprint: peer_fingerprint,
+            hello,
+        } = incoming;
+        if pins.is_phone_key(&peer_fingerprint) {
+            let message = "this key is paired as a phone; it can't connect as a computer";
+            reject_pairing(&mut session, "key_is_phone", message).await;
+            tracing::warn!(%addr, "rejected a phone key connecting as a computer");
             append_portable_log(
                 &log_path,
-                format!("failed to configure controller socket timeout for {addr}: {err:#}"),
+                format!("rejected {} ({addr}): {message}", hello.device_name),
             );
-        }
-        tracing::info!(%addr, "controller connected");
-        append_portable_log(&log_path, format!("controller connected: {addr}"));
-
-        let (mut session, peer_fingerprint) = match time::timeout(
-            Duration::from_secs(15),
-            accept_noise_session(stream, &identity),
-        )
-        .await
-        {
-            Ok(Ok(session)) => session,
-            Ok(Err(err)) => {
-                if let Some(tray) = &tray {
-                    tray.error(format!("Noise handshake failed: {err}")).await;
-                }
-                tracing::warn!(%err, "Noise handshake failed");
-                append_portable_log(&log_path, format!("Noise handshake failed: {err:#}"));
-                continue;
-            }
-            Err(_) => {
-                let message = "Noise handshake timed out";
-                if let Some(tray) = &tray {
-                    tray.error(message.to_string()).await;
-                }
-                tracing::warn!(message);
-                append_portable_log(&log_path, message);
-                continue;
-            }
-        };
-
-        let hello =
-            match time::timeout(Duration::from_secs(15), read_secure_frame(&mut session)).await {
-                Ok(Ok(Frame::Hello(hello))) => hello,
-                Ok(Ok(other)) => {
-                    tracing::warn!(?other, "first frame was not Hello");
-                    continue;
-                }
-                Ok(Err(err)) => {
-                    if let Some(tray) = &tray {
-                        tray.error(format!("failed to read Hello: {err}")).await;
-                    }
-                    tracing::warn!(%err, "failed to read Hello");
-                    append_portable_log(&log_path, format!("failed to read Hello: {err:#}"));
-                    continue;
-                }
-                Err(_) => {
-                    let message = "timed out waiting for controller hello";
-                    if let Some(tray) = &tray {
-                        tray.error(message.to_string()).await;
-                    }
-                    tracing::warn!(message);
-                    append_portable_log(&log_path, message);
-                    continue;
-                }
-            };
-
-        if let Err(error) = validate_controller_hello(&hello, &peer_fingerprint) {
-            reject_pairing(&mut session, "invalid_hello", &error.to_string()).await;
-            if let Some(tray) = &tray {
-                tray.error(error.to_string()).await;
-            }
-            append_portable_log(&log_path, format!("rejected controller hello: {error:#}"));
             continue;
         }
 
@@ -2622,7 +2656,7 @@ async fn run_receiver(
             .iter()
             .any(|extension| extension == PAIRING_CONFIRMATION_EXTENSION);
 
-        write_secure_frame(
+        if let Err(error) = write_secure_frame(
             &mut session,
             &Frame::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
@@ -2646,17 +2680,25 @@ async fn run_receiver(
                 ],
             }),
         )
-        .await?;
+        .await
+        {
+            log_peer_write_failure(&log_path, addr, &error);
+            continue;
+        }
 
         if controller_supports_pairing_confirmation {
-            write_secure_frame(
+            if let Err(error) = write_secure_frame(
                 &mut session,
                 &Frame::Pairing(PairingEvent::Status {
                     trusted: controller_trusted,
                     armed: session_pairing_armed,
                 }),
             )
-            .await?;
+            .await
+            {
+                log_peer_write_failure(&log_path, addr, &error);
+                continue;
+            }
             let (peer_trusted, peer_armed) = match read_pairing_status(&mut session).await {
                 Ok(status) => status,
                 Err(error) => {
@@ -2707,11 +2749,15 @@ async fn run_receiver(
                         false
                     }
                 };
-                write_secure_frame(
+                if let Err(error) = write_secure_frame(
                     &mut session,
                     &Frame::Pairing(PairingEvent::Decision { accepted }),
                 )
-                .await?;
+                .await
+                {
+                    log_peer_write_failure(&log_path, addr, &error);
+                    continue;
+                }
                 let peer_accepted = if accepted {
                     read_pairing_decision(&mut session).await.unwrap_or(false)
                 } else {
@@ -2735,7 +2781,7 @@ async fn run_receiver(
                 }
 
                 pins.pin(hello.device_name.clone(), peer_fingerprint.clone());
-                pins.save(state_dir.join("pins.toml")).await?;
+                pins.save(&pins_path).await?;
                 tracing::info!(fingerprint = %peer_fingerprint, "paired peer after two-sided confirmation");
                 append_portable_log(
                     &log_path,
@@ -2805,7 +2851,12 @@ async fn run_receiver(
         let requested_monitor = config.input.inject.output.as_str();
         let screen_info = match hyprland_screen_info(requested_monitor).await {
             Ok(info) => {
-                write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await?;
+                if let Err(error) =
+                    write_secure_frame(&mut session, &Frame::ScreenInfo(info.clone())).await
+                {
+                    log_peer_write_failure(&log_path, addr, &error);
+                    continue;
+                }
                 Some(info)
             }
             Err(err) => {
@@ -2825,33 +2876,75 @@ async fn run_receiver(
                 .context("failed to bind Linux audio UDP socket")?,
         );
 
-        match handle_controller(
-            session,
-            &config,
-            &config_path,
-            &backend,
-            tray.as_ref(),
-            &mut tray_commands,
-            &log_path,
-            screen_info,
-            audio_socket,
-            addr.ip(),
-            controller_supports_audio_playback,
-            controller_supports_audio_capture,
-            controller_supports_audio_route,
-            controller_supports_input_toggle,
-            controller_supports_images,
-            controller_supports_input_capture,
-            controller_supports_input_injection,
-            controller_supports_role_switch,
-            &peer_fingerprint,
-            &identity.fingerprint(),
-            &hello.device_name,
-            #[cfg(target_os = "linux")]
-            &mut capture,
-        )
-        .await
-        {
+        let replaced = Notify::new();
+        let local_fingerprint = identity.fingerprint();
+        // Scoped so the session future releases `capture` before cleanup below.
+        let exit = {
+            let controller = handle_controller(
+                session,
+                &config,
+                &config_path,
+                &backend,
+                tray.as_ref(),
+                &mut tray_commands,
+                &log_path,
+                screen_info,
+                audio_socket,
+                addr.ip(),
+                controller_supports_audio_playback,
+                controller_supports_audio_capture,
+                controller_supports_audio_route,
+                controller_supports_input_toggle,
+                controller_supports_images,
+                controller_supports_input_capture,
+                controller_supports_input_injection,
+                controller_supports_role_switch,
+                &peer_fingerprint,
+                &local_fingerprint,
+                &hello.device_name,
+                &replaced,
+                clipboard_hub.as_ref().map(ClipboardHub::subscribe),
+                #[cfg(target_os = "linux")]
+                &mut capture,
+            );
+            tokio::pin!(controller);
+            let mut acceptor_open = true;
+            loop {
+                tokio::select! {
+                    exit = &mut controller => break exit,
+                    request = phones.next_request() => {
+                        phones.handle_request(request, &mut pins, &pins_path).await;
+                    }
+                    event = acceptor.recv(), if acceptor_open => match event {
+                        Some(AcceptEvent::Peer(peer)) if phone::is_phone_hello(&peer.hello) => {
+                            start_phone(&mut phones, *peer, &pins);
+                        }
+                        Some(AcceptEvent::Peer(peer)) => {
+                            if let Some(peer) = peer_while_connected(
+                                &hello.device_name,
+                                &peer_fingerprint,
+                                *peer,
+                                &log_path,
+                            ) {
+                                replaced.notify_one();
+                                replacement = Some(peer);
+                            }
+                        }
+                        // Already logged; the tray keeps showing the live session.
+                        Some(AcceptEvent::Failed(_)) => {}
+                        None => acceptor_open = false,
+                    },
+                }
+            }
+        };
+        match exit {
+            Ok(ControllerSessionExit::Replaced) => {
+                tracing::info!("controller session replaced by a newer connection");
+                append_portable_log(
+                    &log_path,
+                    "controller session replaced by a newer connection",
+                );
+            }
             Ok(ControllerSessionExit::QuitRequested) => {
                 tracing::info!("quit requested from tray");
                 append_portable_log(&log_path, "quit requested from tray");
@@ -2859,6 +2952,7 @@ async fn run_receiver(
             }
             Ok(ControllerSessionExit::DisconnectRequested) => {
                 connection_enabled = false;
+                replacement = None;
                 if let Some(tray) = &tray {
                     tray.disconnected_by_user().await;
                 }
@@ -2907,14 +3001,62 @@ fn install_receiver_panic_log(log_path: PathBuf) {
     }));
 }
 
+/// Past this size the log moves to `<name>.1`, replacing the previous one.
+const PORTABLE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 fn append_portable_log(path: &Path, message: impl AsRef<str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > PORTABLE_LOG_MAX_BYTES) {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, rotated);
+    }
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{:?} {}", SystemTime::now(), message.as_ref());
+        let _ = writeln!(
+            file,
+            "{} {}",
+            utc_timestamp(SystemTime::now()),
+            message.as_ref()
+        );
     }
+}
+
+/// `2026-10-13T12:34:56.789Z`.
+fn utc_timestamp(time: SystemTime) -> String {
+    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = since_epoch.as_secs();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let of_day = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
+/// algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn open_receiver_settings(config_path: &Path, log_path: &Path) {
@@ -3002,6 +3144,94 @@ async fn restart_after_settings(
 enum ControllerSessionExit {
     QuitRequested,
     DisconnectRequested,
+    /// A newer connection from the same peer took over.
+    Replaced,
+}
+
+fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) {
+    phones.start(
+        peer.session,
+        peer.addr,
+        peer.hello.device_name,
+        peer.fingerprint,
+        peer.hello
+            .extensions
+            .iter()
+            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+        pins,
+    );
+}
+
+/// Turns a peer away with an error it can show, without blocking the caller.
+fn reject_peer(mut peer: IncomingPeer, code: &'static str, message: &'static str, log_path: &Path) {
+    tracing::warn!(addr = %peer.addr, peer = %peer.hello.device_name, code, "rejected peer");
+    append_portable_log(
+        log_path,
+        format!(
+            "rejected {} ({}): {message}",
+            peer.hello.device_name, peer.addr
+        ),
+    );
+    tokio::spawn(async move {
+        reject_pairing(&mut peer.session, code, message).await;
+    });
+}
+
+/// A peer that goes away while being set up only ends its own connection, not
+/// the receiver.
+fn log_peer_write_failure(log_path: &Path, addr: std::net::SocketAddr, error: &anyhow::Error) {
+    tracing::warn!(%error, %addr, "peer disconnected during setup");
+    append_portable_log(
+        log_path,
+        format!("peer {addr} disconnected during setup: {error:#}"),
+    );
+}
+
+/// Whether a new connection comes from the peer already connected. Only that
+/// peer may take over a live session, which recovers a dropped connection
+/// without waiting for the old socket to time out. The new connection still
+/// goes through the usual pin checks.
+fn is_connected_peer(
+    connected_name: &str,
+    connected_fingerprint: &str,
+    name: &str,
+    fingerprint: &str,
+) -> bool {
+    name == connected_name && fingerprint == connected_fingerprint
+}
+
+/// Handles a peer that connects while a controller session is live. Returns
+/// the peer if it should replace that session; anyone else is told the
+/// receiver is busy.
+fn peer_while_connected(
+    connected_name: &str,
+    connected_fingerprint: &str,
+    peer: IncomingPeer,
+    log_path: &Path,
+) -> Option<IncomingPeer> {
+    if is_connected_peer(
+        connected_name,
+        connected_fingerprint,
+        &peer.hello.device_name,
+        &peer.fingerprint,
+    ) {
+        tracing::info!(addr = %peer.addr, "newer connection from the connected peer; replacing its session");
+        append_portable_log(
+            log_path,
+            format!(
+                "newer connection from {} ({}); replacing its session",
+                peer.hello.device_name, peer.addr
+            ),
+        );
+        return Some(peer);
+    }
+    reject_peer(
+        peer,
+        "receiver_busy",
+        "this receiver is already connected to another computer",
+        log_path,
+    );
+    None
 }
 
 struct AbortOnDropTask(JoinHandle<()>);
@@ -3022,14 +3252,15 @@ enum ClipboardWatchEvent {
     Closed,
 }
 
-async fn recv_clipboard_change(
-    watcher: &mut Option<ClipboardChangeWatcher>,
-) -> ClipboardWatchEvent {
-    match watcher {
-        Some(watcher) => match watcher.recv().await {
-            Some(()) => ClipboardWatchEvent::Changed,
-            None => ClipboardWatchEvent::Closed,
-        },
+async fn recv_clipboard_change(changes: &mut Option<ClipboardChanges>) -> ClipboardWatchEvent {
+    match changes {
+        Some(changes) => {
+            if changes.changed().await {
+                ClipboardWatchEvent::Changed
+            } else {
+                ClipboardWatchEvent::Closed
+            }
+        }
         None => future::pending().await,
     }
 }
@@ -3108,6 +3339,8 @@ async fn handle_controller(
     controller_fingerprint: &str,
     local_fingerprint: &str,
     controller_name: &str,
+    replaced: &Notify,
+    clipboard_changes: Option<ClipboardChanges>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
@@ -3123,17 +3356,16 @@ async fn handle_controller(
     let mut input_epoch = InputEpochGate::default();
     let mut status_log = time::interval(STATUS_LOG_INTERVAL);
     let mut stats = ReceiverInputStats::default();
+    let mut logged_stats = None;
     let (reader, mut writer) = SecureFrameSession::new(session).split();
     let mut frame_rx = spawn_controller_reader(reader);
     let mut return_watcher = RemoteReturnWatcher::new(screen_info.clone());
-    let mut clipboard_sync =
-        ReceiverClipboardState::new(config, controller_supports_images).await?;
+    let mut clipboard_sync = ReceiverClipboardState::new(config, controller_supports_images)
+        .await?
+        .withholding_phone_content(config, clipboard_changes.as_ref());
     let mut clipboard_send = time::interval(Duration::from_millis(2));
     clipboard_send.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut clipboard_watcher = config
-        .clipboard
-        .enabled
-        .then(spawn_clipboard_change_watcher);
+    let mut clipboard_watcher = clipboard_changes;
     let mut audio_sender: Option<edge_linux_audio::LinuxAudioSender> = None;
     let mut audio_receiver: Option<edge_linux_audio::LinuxAudioReceiver> = None;
     let (audio_start_tx, mut audio_start_rx) = mpsc::unbounded_channel::<AudioStartResult>();
@@ -3375,7 +3607,7 @@ async fn handle_controller(
                 );
             }
             _ = status_log.tick() => {
-                stats.log(log_path, "receiver");
+                stats.log_if_changed(log_path, "receiver", &mut logged_stats);
                 if audio_sender.as_ref().is_some_and(|sender| sender.is_finished()) {
                     if let Some(sender) = audio_sender.take() {
                         sender.stop().await.ok();
@@ -3447,6 +3679,14 @@ async fn handle_controller(
                         .await?;
                     }
                 }
+            }
+            _ = replaced.notified() => {
+                drop(audio_start_task.take());
+                if let Some(sender) = audio_sender.take() {
+                    sender.stop().await.ok();
+                }
+                drop(audio_receiver.take());
+                return Ok(ControllerSessionExit::Replaced);
             }
             command = recv_tray_command(tray_commands) => {
                 match command {
@@ -3661,9 +3901,9 @@ async fn handle_controller(
                         }
                     }
                     ClipboardWatchEvent::Closed => {
-                        tracing::warn!("Wayland clipboard watcher stopped; restarting");
-                        append_portable_log(log_path, "Wayland clipboard watcher stopped; restarting");
-                        clipboard_watcher = Some(spawn_clipboard_change_watcher());
+                        tracing::warn!("clipboard hub stopped; clipboard sync is off for this session");
+                        append_portable_log(log_path, "clipboard hub stopped; clipboard sync is off for this session");
+                        clipboard_watcher = None;
                     }
                 }
             }
@@ -4407,7 +4647,7 @@ async fn handle_controller(
                             "controller screen info"
                         );
                     }
-                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) => {}
+                    Frame::Hello(_) | Frame::Error(_) | Frame::Pairing(_) | Frame::Phone(_) | Frame::Notification(_) => {}
                 }
             },
             _ = clipboard_send.tick(), if !session_paused && clipboard_sync.outgoing.is_some() => {
@@ -4450,6 +4690,8 @@ async fn handle_controller(
     _controller_fingerprint: &str,
     _local_fingerprint: &str,
     _controller_name: &str,
+    _replaced: &Notify,
+    _clipboard_changes: Option<ClipboardChanges>,
 ) -> Result<ControllerSessionExit> {
     anyhow::bail!("Linux receiver sessions are available only on Linux")
 }
@@ -4461,6 +4703,10 @@ struct ReceiverClipboardState {
     incoming: IncomingImageTransfer,
     next_transfer_id: u64,
     peer_supports_images: bool,
+    /// Set for phone peers: what they write is recorded as phone content.
+    records_phone_writes: Option<PhoneOrigin>,
+    /// Set for PC peers when phone content mustn't be forwarded to them.
+    withholds_phone_content: Option<PhoneOrigin>,
 }
 
 #[cfg(not(unix))]
@@ -4484,7 +4730,28 @@ impl ReceiverClipboardState {
             incoming: IncomingImageTransfer::default(),
             next_transfer_id: 0,
             peer_supports_images,
+            records_phone_writes: None,
+            withholds_phone_content: None,
         })
+    }
+
+    /// For a phone peer: text it sends is recorded as phone content.
+    fn for_phone(mut self, origin: PhoneOrigin) -> Self {
+        self.records_phone_writes = Some(origin);
+        self
+    }
+
+    /// For a PC peer, unless `[phone] forward_clipboard_to_pcs` is on: never
+    /// offer it what a phone put on the clipboard.
+    fn withholding_phone_content(
+        mut self,
+        config: &AppConfig,
+        changes: Option<&ClipboardChanges>,
+    ) -> Self {
+        if !config.phone.forward_clipboard_to_pcs {
+            self.withholds_phone_content = changes.map(ClipboardChanges::phone_origin);
+        }
+        self
     }
 
     async fn handle_event(
@@ -4604,6 +4871,9 @@ impl ReceiverClipboardState {
         }
         write_clipboard_text(&config.clipboard, &remote_text).await?;
         self.tracker.mark_observed(Some(remote_id));
+        if let Some(origin) = &self.records_phone_writes {
+            origin.record(remote_id);
+        }
         tracing::info!("updated Linux clipboard from controller");
         Ok(())
     }
@@ -4654,6 +4924,12 @@ impl ReceiverClipboardState {
         force: bool,
     ) -> Result<bool> {
         let current_id = current.as_ref().map(ClipboardItem::id);
+        if let (Some(origin), Some(id)) = (&self.withholds_phone_content, &current_id)
+            && origin.is_from_phone(id)
+        {
+            self.tracker.mark_observed(current_id);
+            return Ok(false);
+        }
         let sequence = if force {
             self.tracker.offer_current(current_id)
         } else {
@@ -4717,7 +4993,7 @@ impl ReceiverClipboardState {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Eq)]
 struct ReceiverInputStats {
     motion: u64,
     buttons: u64,
@@ -4751,7 +5027,13 @@ impl ReceiverInputStats {
         }
     }
 
-    fn log(&self, path: &Path, side: &str) {
+    /// Logs the counters if they changed since the last line, so an idle
+    /// session doesn't fill the log.
+    fn log_if_changed(&self, path: &Path, side: &str, logged: &mut Option<Self>) {
+        if logged.as_ref() == Some(self) {
+            return;
+        }
+        *logged = Some(self.clone());
         append_portable_log(
             path,
             format!(
@@ -5116,6 +5398,51 @@ fn desktop_names_include_niri(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_timestamps_are_readable_utc() {
+        let at =
+            |seconds: u64, millis: u64| UNIX_EPOCH + Duration::from_millis(seconds * 1000 + millis);
+        assert_eq!(utc_timestamp(at(0, 0)), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            utc_timestamp(at(951_782_400, 5)),
+            "2000-02-29T00:00:00.005Z"
+        );
+        assert_eq!(
+            utc_timestamp(at(1_791_895_167, 237)),
+            "2026-10-13T12:39:27.237Z"
+        );
+    }
+
+    #[test]
+    fn the_portable_log_rotates_when_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receiver.log");
+        std::fs::write(&path, vec![b'x'; PORTABLE_LOG_MAX_BYTES as usize + 1]).unwrap();
+
+        append_portable_log(&path, "fresh");
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .ends_with(" fresh\n")
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("receiver.log.1"))
+                .unwrap()
+                .len(),
+            PORTABLE_LOG_MAX_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn only_the_connected_peer_may_replace_a_live_session() {
+        assert!(is_connected_peer("windows", "fp-a", "windows", "fp-a"));
+        // Same name with a different key: someone else, or a re-paired peer
+        // that must wait for the live session to end.
+        assert!(!is_connected_peer("windows", "fp-a", "windows", "fp-b"));
+        assert!(!is_connected_peer("windows", "fp-a", "laptop", "fp-a"));
+    }
 
     #[test]
     fn recognizes_niri_in_desktop_name_lists() {

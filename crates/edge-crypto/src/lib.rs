@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +26,7 @@ pub enum CryptoError {
     InvalidKeyLength(usize),
     #[error("hex decode error: {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("toml decode error: {0}")]
     TomlDecode(#[from] toml::de::Error),
@@ -65,16 +73,11 @@ impl IdentityKey {
     }
 
     pub async fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let file = IdentityFile {
             private_key_hex: hex::encode(self.private),
             public_key_hex: hex::encode(self.public),
         };
-        tokio::fs::write(path, toml::to_string_pretty(&file)?).await?;
-        Ok(())
+        write_atomic(path.as_ref(), toml::to_string_pretty(&file)?, true).await
     }
 }
 
@@ -96,13 +99,41 @@ impl IdentityFile {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinStore {
+    /// PC peers, keyed by device name.
     #[serde(default)]
     pub peers: BTreeMap<String, PinnedPeer>,
+    /// Phones, keyed by device name. Kept apart from PC peers so a phone can
+    /// never take a PC's place (or the reverse) by choosing its name. Omitted
+    /// when empty, so pin files without phones are unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phones: BTreeMap<String, PinnedPhone>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedPeer {
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedPhone {
+    pub fingerprint: String,
+    #[serde(default = "PhoneFeature::all")]
+    pub allowed_features: BTreeSet<PhoneFeature>,
+}
+
+/// What a paired phone may use. Enforced by the receiver in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhoneFeature {
+    Clipboard,
+    Notifications,
+    Audio,
+}
+
+impl PhoneFeature {
+    pub fn all() -> BTreeSet<Self> {
+        BTreeSet::from([Self::Clipboard, Self::Notifications, Self::Audio])
+    }
 }
 
 impl PinStore {
@@ -115,12 +146,7 @@ impl PinStore {
     }
 
     pub async fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, toml::to_string_pretty(self)?).await?;
-        Ok(())
+        write_atomic(path.as_ref(), toml::to_string_pretty(self)?, false).await
     }
 
     pub fn status(&self, peer: &str, fingerprint: &str) -> PinStatus {
@@ -140,6 +166,53 @@ impl PinStore {
                 fingerprint: fingerprint.into(),
             },
         );
+    }
+
+    pub fn phone_status(&self, phone: &str, fingerprint: &str) -> PinStatus {
+        match self.phones.get(phone) {
+            Some(pinned) if pinned.fingerprint == fingerprint => PinStatus::Trusted,
+            Some(pinned) => PinStatus::Changed {
+                expected: pinned.fingerprint.clone(),
+            },
+            None => PinStatus::Unknown,
+        }
+    }
+
+    pub fn phone(&self, phone: &str) -> Option<&PinnedPhone> {
+        self.phones.get(phone)
+    }
+
+    pub fn pin_phone(
+        &mut self,
+        phone: impl Into<String>,
+        fingerprint: impl Into<String>,
+        allowed_features: BTreeSet<PhoneFeature>,
+    ) {
+        self.phones.insert(
+            phone.into(),
+            PinnedPhone {
+                fingerprint: fingerprint.into(),
+                allowed_features,
+            },
+        );
+    }
+
+    pub fn remove_phone(&mut self, phone: &str) -> Option<PinnedPhone> {
+        self.phones.remove(phone)
+    }
+
+    /// Whether this key is pinned for a PC peer, under any name.
+    pub fn is_pc_key(&self, fingerprint: &str) -> bool {
+        self.peers
+            .values()
+            .any(|pinned| pinned.fingerprint == fingerprint)
+    }
+
+    /// Whether this key is pinned for a phone, under any name.
+    pub fn is_phone_key(&self, fingerprint: &str) -> bool {
+        self.phones
+            .values()
+            .any(|pinned| pinned.fingerprint == fingerprint)
     }
 }
 
@@ -219,6 +292,10 @@ where
 
     pub fn into_inner(self) -> S {
         self.io
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.io
     }
 
     pub fn split(self) -> (NoiseReader<ReadHalf<S>>, NoiseWriter<WriteHalf<S>>) {
@@ -383,6 +460,67 @@ fn remote_static_fingerprint(noise: &snow::HandshakeState) -> Result<String> {
     Ok(fingerprint(remote))
 }
 
+/// Replaces `path` with `contents` so that a crash or failed write at any
+/// point leaves either the previous file or the new one, never a mix: write a
+/// temporary file beside it, sync it, then rename it over the original.
+/// `private` restricts the file to its owner on Unix.
+async fn write_atomic(path: &Path, contents: String, private: bool) -> Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        write_atomic_with(&path, private, |file| file.write_all(contents.as_bytes()))
+    })
+    .await
+    .map_err(|err| CryptoError::Io(std::io::Error::other(err)))?
+}
+
+fn write_atomic_with(
+    path: &Path,
+    private: bool,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let temp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&temp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        // Persist the rename itself; Windows has no directory handles to sync.
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(CryptoError::Io)
+}
+
 fn vec_to_key(bytes: Vec<u8>) -> Result<[u8; 32]> {
     let len = bytes.len();
     bytes
@@ -427,6 +565,114 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[tokio::test]
+    async fn pin_files_without_phones_load_and_save_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let legacy = "[peers.\"Main PC\"]\nfingerprint = \"aa:bb\"\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(store.status("Main PC", "aa:bb"), PinStatus::Trusted);
+        assert!(store.phones.is_empty());
+        store.save(&path).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+
+    #[tokio::test]
+    async fn phone_pins_round_trip_apart_from_pc_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut store = PinStore::default();
+        store.pin("Pixel", "pc-key");
+        store.pin_phone(
+            "Pixel",
+            "phone-key",
+            BTreeSet::from([PhoneFeature::Clipboard]),
+        );
+        store.save(&path).await.unwrap();
+
+        let loaded = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(loaded.status("Pixel", "pc-key"), PinStatus::Trusted);
+        assert_eq!(
+            loaded.phone_status("Pixel", "phone-key"),
+            PinStatus::Trusted
+        );
+        assert_eq!(
+            loaded.phone_status("Pixel", "pc-key"),
+            PinStatus::Changed {
+                expected: "phone-key".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.phone("Pixel").unwrap().allowed_features,
+            BTreeSet::from([PhoneFeature::Clipboard])
+        );
+        assert!(loaded.is_pc_key("pc-key") && !loaded.is_pc_key("phone-key"));
+        assert!(loaded.is_phone_key("phone-key") && !loaded.is_phone_key("pc-key"));
+    }
+
+    #[test]
+    fn phone_pins_without_features_allow_everything() {
+        let store: PinStore =
+            toml::from_str("[phones.Pixel]\nfingerprint = \"phone-key\"\n").unwrap();
+        assert_eq!(
+            store.phone("Pixel").unwrap().allowed_features,
+            PhoneFeature::all()
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_store_save_replaces_file_without_leaving_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut store = PinStore::default();
+        store.pin("windows", "first");
+        store.save(&path).await.unwrap();
+        store.pin("windows", "second");
+        store.save(&path).await.unwrap();
+
+        let loaded = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(loaded.status("windows", "second"), PinStatus::Trusted);
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only pins.toml should remain");
+    }
+
+    #[tokio::test]
+    async fn interrupted_save_leaves_previous_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.toml");
+        let mut store = PinStore::default();
+        store.pin("windows", "existing");
+        store.save(&path).await.unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = write_atomic_with(&path, false, |file| {
+            file.write_all(b"[peers.windo")?;
+            Err(std::io::Error::other("simulated crash mid-write"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "the partial temp file should be removed");
+        let loaded = PinStore::load_or_default(&path).await.unwrap();
+        assert_eq!(loaded.status("windows", "existing"), PinStatus::Trusted);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_file_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.toml");
+        IdentityKey::load_or_create(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[tokio::test]
