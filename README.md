@@ -44,6 +44,20 @@ receiver.toml
 state/
 ```
 
+To run it in the background as a systemd user service instead:
+
+```bash
+cargo build -p edge-receiver-linux --release
+scripts/install-linux-receiver.sh
+```
+
+This installs the binary to `~/.local/bin`, the config to
+`~/.config/edge-kvm/receiver.toml` and the state (identity, pins, logs) to
+`~/.local/state/edge-kvm`, then enables and starts
+`edge-kvm-receiver.service`. The first run copies an existing portable
+`receiver.toml` and `state/` from `target/release` (or the folder you pass) so
+pairings carry over. Run it again after each build to update.
+
 The default config listens as a receiver. For the Linux computer that should
 initiate the connection and control its peer, use:
 

@@ -80,6 +80,33 @@ pub struct AppConfig {
     pub clipboard: ClipboardConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    /// Omitted from saved files while it's all defaults.
+    #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
+    pub phone: PhoneConfig,
+}
+
+/// HyprMobile phones paired with this receiver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneConfig {
+    /// Pass text sent from a phone on to connected PC peers, so the phone
+    /// and every PC share one clipboard. On by default; turn off to keep the
+    /// phone's clipboard on this machine only.
+    #[serde(default = "default_true")]
+    pub forward_clipboard_to_pcs: bool,
+}
+
+impl Default for PhoneConfig {
+    fn default() -> Self {
+        Self {
+            forward_clipboard_to_pcs: true,
+        }
+    }
+}
+
+impl PhoneConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +311,8 @@ struct ConfigFile {
     clipboard: ClipboardConfig,
     #[serde(default)]
     audio: Option<AudioConfig>,
+    #[serde(default)]
+    phone: PhoneConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -422,6 +451,7 @@ impl ConfigFile {
             input,
             clipboard: self.clipboard,
             audio,
+            phone: self.phone,
         }
     }
 }
@@ -457,6 +487,7 @@ impl AppConfig {
                 enabled: true,
                 ..AudioConfig::default()
             },
+            phone: PhoneConfig::default(),
         }
     }
 
@@ -478,6 +509,7 @@ impl AppConfig {
             },
             clipboard: ClipboardConfig::default(),
             audio: AudioConfig::default(),
+            phone: PhoneConfig::default(),
         }
     }
 
@@ -899,5 +931,20 @@ backend = "auto"
         );
         assert_eq!(validate_host(""), Err(ConfigValidationError::EmptyHost));
         assert_eq!(validate_port(0), Err(ConfigValidationError::InvalidPort));
+    }
+
+    #[test]
+    fn phone_settings_are_optional_and_share_the_clipboard_by_default() {
+        let config = AppConfig::receiver_default();
+        assert!(config.phone.forward_clipboard_to_pcs);
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(!saved.contains("[phone]"), "{saved}");
+        let reloaded: AppConfig = toml::from_str(&saved).unwrap();
+        assert!(reloaded.phone.forward_clipboard_to_pcs);
+
+        let mut text = saved;
+        text.push_str("\n[phone]\nforward_clipboard_to_pcs = false\n");
+        let loaded: AppConfig = toml::from_str(&text).unwrap();
+        assert!(!loaded.phone.forward_clipboard_to_pcs);
     }
 }

@@ -16,12 +16,18 @@ pub const CLIPBOARD_TEXT_CHUNKS_EXTENSION: &str = "clipboard-text-chunks-v1";
 /// Largest serialized frame that fits in one encrypted transport message.
 /// Noise caps a transport message at 65,535 bytes, including its 16-byte tag.
 pub const MAX_SECURE_FRAME_BYTES: usize = 65_535 - 16;
+/// Sent only by HyprMobile phones. A peer advertising it is handled as a
+/// phone: restricted frames, phone liveness, and phone pins.
+pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
+/// A phone that mirrors its notifications; the receiver echoes it back when it
+/// shows them.
+pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("frame too large: {0} bytes")]
     FrameTooLarge(u32),
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("encode error: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
@@ -43,6 +49,10 @@ pub enum Frame {
     Audio(AudioControl),
     Pairing(PairingEvent),
     Role(RoleEvent),
+    /// Only exchanged with peers that advertised `hypr-phone-v1`.
+    Phone(PhoneEvent),
+    /// Phone → receiver, only with `notifications-v1`.
+    Notification(NotificationEvent),
 }
 
 impl Frame {
@@ -73,6 +83,87 @@ impl Frame {
 pub enum PairingEvent {
     Status { trusted: bool, armed: bool },
     Decision { accepted: bool },
+}
+
+/// Phone-only messages. Phones pair with a one-time token from the
+/// receiver's QR code instead of the two-sided PC confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneEvent {
+    /// Phone → receiver, as the first frame after the receiver's `Hello`.
+    /// The phone's name comes from its `Hello`.
+    PairRequest { token: String },
+    /// Receiver → phone: the phone is pinned. Also sent when an already
+    /// pinned phone repeats its request, so a lost reply is recovered by
+    /// asking again.
+    PairAccepted,
+    /// Phone → receiver: forget this phone. The receiver removes the pin and
+    /// closes the session.
+    Unpair,
+    /// Phone → receiver: stream audio this way (stopping the other direction),
+    /// or stop with `None`. `udp_port` is the phone's audio socket; the
+    /// receiver sends to it first so the path works through its firewall.
+    AudioRequest {
+        direction: Option<AudioDirection>,
+        udp_port: u16,
+    },
+    /// Receiver → phone: keys for the requested stream. Encrypted UDP packets
+    /// use the same format as PC audio (`edge-audio`): 5 ms of 48 kHz stereo
+    /// 16-bit PCM each.
+    AudioStart {
+        direction: AudioDirection,
+        session_id: [u8; 16],
+        session_salt: [u8; 4],
+        session_key: [u8; 32],
+        jitter_target_ms: u16,
+    },
+    /// Either way: the stream ended, and why.
+    AudioStopped { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioDirection {
+    /// The computer's audio plays on the phone.
+    ToPhone,
+    /// The phone's media audio plays on the computer.
+    FromPhone,
+}
+
+/// Mirrors the phone's current notifications (view only). After every
+/// (re)connect the phone sends `SnapshotStart`, `Posted` for each current
+/// notification, then `SnapshotEnd`; the receiver closes anything it showed
+/// that wasn't posted again, so missed removals are fixed and unchanged ones
+/// aren't shown twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationEvent {
+    /// New, or an update to the notification with the same `id`.
+    Posted(PhoneNotification),
+    Removed {
+        id: u64,
+    },
+    SnapshotStart,
+    SnapshotEnd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneNotification {
+    /// Stable for one notification on the phone across updates.
+    pub id: u64,
+    pub app_name: String,
+    pub title: String,
+    pub body: String,
+    /// A small PNG (the app's icon or the notification's picture).
+    pub icon_png: Option<Vec<u8>>,
+    /// When the phone posted it, Unix milliseconds.
+    pub posted_ms: u64,
+}
+
+impl PhoneNotification {
+    pub const MAX_APP_NAME_CHARS: usize = 64;
+    pub const MAX_TITLE_CHARS: usize = 256;
+    pub const MAX_BODY_BYTES: usize = 4096;
+    /// MessagePack stores each byte of a `Vec<u8>` as up to two bytes, so
+    /// this keeps a notification well inside one 64 KiB Noise frame.
+    pub const MAX_ICON_BYTES: usize = 24 * 1024;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -744,6 +835,236 @@ mod tests {
                 expected
             );
             assert_eq!(rmp_serde::to_vec_named(&expected).unwrap(), fixture);
+        }
+    }
+
+    /// Frames exchanged by the protocol v2 Windows and Linux builds (`main`
+    /// 86fa623), paired with their frozen encodings. Multi-peer and phone
+    /// support must not change any of these bytes.
+    fn v2_wire_fixtures() -> Vec<(Frame, &'static str)> {
+        let role_state = RoleState {
+            controller_fingerprint: Some("controller-fingerprint".to_string()),
+            role_epoch: 3,
+            transition: RoleTransitionState::Preparing {
+                proposed_controller_fingerprint: "receiver-fingerprint".to_string(),
+            },
+            listener_position: Edge::Right,
+            paused: false,
+            failure_detail: None,
+        };
+        vec![
+            (
+                Frame::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    device_name: "fixture-receiver".to_string(),
+                    role: Role::Receiver,
+                    public_key_fingerprint: "receiver-fingerprint".to_string(),
+                    capabilities: Vec::new(),
+                    extensions: vec![
+                        CLIPBOARD_IMAGE_EXTENSION.to_string(),
+                        INPUT_TOGGLE_EXTENSION.to_string(),
+                        PAIRING_CONFIRMATION_EXTENSION.to_string(),
+                        AUDIO_ROUTE_EXTENSION.to_string(),
+                    ],
+                    node_capabilities: vec![
+                        NodeCapability::InputCaptureV1,
+                        NodeCapability::InputInjectV1,
+                        NodeCapability::RoleSwitchV1,
+                        NodeCapability::ScreenInfoBothSidesV1,
+                        NodeCapability::AudioCaptureV1,
+                        NodeCapability::AudioPlaybackV1,
+                    ],
+                }),
+                include_str!("../fixtures/v2-hello.hex"),
+            ),
+            (
+                Frame::Pairing(PairingEvent::Status {
+                    trusted: false,
+                    armed: true,
+                }),
+                include_str!("../fixtures/v2-pairing-status.hex"),
+            ),
+            (
+                Frame::Pairing(PairingEvent::Decision { accepted: true }),
+                include_str!("../fixtures/v2-pairing-decision.hex"),
+            ),
+            (
+                Frame::ScreenInfo(ScreenInfo {
+                    outputs: vec![OutputInfo {
+                        name: "eDP-1".to_string(),
+                        width: 2560,
+                        height: 1600,
+                        scale: 1.5,
+                        x: 0,
+                        y: -10,
+                    }],
+                    primary_output: "eDP-1".to_string(),
+                }),
+                include_str!("../fixtures/v2-screen-info.hex"),
+            ),
+            (
+                Frame::input(3, InputEvent::PointerMotion { dx: 1.5, dy: -2.25 }),
+                include_str!("../fixtures/v2-input-motion.hex"),
+            ),
+            (
+                Frame::input(
+                    3,
+                    InputEvent::Key {
+                        evdev_code: 30,
+                        down: true,
+                    },
+                ),
+                include_str!("../fixtures/v2-input-key.hex"),
+            ),
+            (
+                Frame::control(
+                    3,
+                    ControlEvent::ReleaseToLocal {
+                        reason: ReleaseReason::HeartbeatTimeout,
+                    },
+                ),
+                include_str!("../fixtures/v2-control-release.hex"),
+            ),
+            (
+                Frame::Clipboard(ClipboardEvent::TextOffer {
+                    sequence: 42,
+                    text: "line one\nemoji: ✨".to_string(),
+                }),
+                include_str!("../fixtures/v2-clipboard-text.hex"),
+            ),
+            (
+                Frame::Clipboard(ClipboardEvent::ImageStart {
+                    transfer_id: 7,
+                    sequence: 43,
+                    width: 2,
+                    height: 1,
+                    total_bytes: 8,
+                    content_sha256: [9; 32],
+                }),
+                include_str!("../fixtures/v2-clipboard-image-start.hex"),
+            ),
+            (
+                Frame::Clipboard(ClipboardEvent::TextStart {
+                    transfer_id: 8,
+                    sequence: 44,
+                    total_bytes: 5,
+                    content_sha256: [10; 32],
+                }),
+                include_str!("../fixtures/v2-clipboard-text-start.hex"),
+            ),
+            (
+                Frame::Clipboard(ClipboardEvent::TextChunk {
+                    transfer_id: 8,
+                    offset: 0,
+                    bytes: b"hello".to_vec(),
+                }),
+                include_str!("../fixtures/v2-clipboard-text-chunk.hex"),
+            ),
+            (
+                Frame::Clipboard(ClipboardEvent::TextEnd { transfer_id: 8 }),
+                include_str!("../fixtures/v2-clipboard-text-end.hex"),
+            ),
+            (
+                Frame::Heartbeat(Heartbeat { sequence: 99 }),
+                include_str!("../fixtures/v2-heartbeat.hex"),
+            ),
+            (
+                Frame::Error(RemoteError {
+                    code: "pairing_not_armed".to_string(),
+                    message: "fixture message".to_string(),
+                }),
+                include_str!("../fixtures/v2-error.hex"),
+            ),
+            (
+                Frame::Audio(AudioControl::Offer {
+                    udp_port: 42_421,
+                    codecs: vec![AudioCodec::PcmS16Stereo48Khz],
+                }),
+                include_str!("../fixtures/v2-audio-offer.hex"),
+            ),
+            (
+                Frame::Audio(AudioControl::Start {
+                    udp_port: 42_421,
+                    session_id: [7; 16],
+                    session_salt: [8; 4],
+                    session_key: [9; 32],
+                    codec: AudioCodec::PcmS16Stereo48Khz,
+                    frame_ms: 5,
+                    jitter_target_ms: 60,
+                }),
+                include_str!("../fixtures/v2-audio-start.hex"),
+            ),
+            (
+                Frame::Audio(AudioControl::SetRoute {
+                    source_fingerprint: Some("receiver-fingerprint".to_string()),
+                }),
+                include_str!("../fixtures/v2-audio-route.hex"),
+            ),
+            (
+                Frame::Role(RoleEvent::SessionState(role_state.clone())),
+                include_str!("../fixtures/v2-role-state.hex"),
+            ),
+            (
+                Frame::Role(RoleEvent::Ready {
+                    role_epoch: 3,
+                    capture_ready: true,
+                    inject_ready: false,
+                    failure_detail: Some("fixture detail".to_string()),
+                }),
+                include_str!("../fixtures/v2-role-ready.hex"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_largest_notification_fits_in_one_noise_frame() {
+        let frame = Frame::Notification(NotificationEvent::Posted(PhoneNotification {
+            id: u64::MAX,
+            app_name: "\u{1F600}".repeat(PhoneNotification::MAX_APP_NAME_CHARS),
+            title: "\u{1F600}".repeat(PhoneNotification::MAX_TITLE_CHARS),
+            body: "a".repeat(PhoneNotification::MAX_BODY_BYTES),
+            icon_png: Some(vec![0xff; PhoneNotification::MAX_ICON_BYTES]),
+            posted_ms: u64::MAX,
+        }));
+        let encoded = encode_frame(&frame).unwrap();
+        assert!(encoded.len() + 16 <= 65_535, "{} bytes", encoded.len());
+        assert_eq!(decode_frame(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn phone_events_round_trip() {
+        for event in [
+            PhoneEvent::PairRequest {
+                token: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            PhoneEvent::PairAccepted,
+            PhoneEvent::Unpair,
+            PhoneEvent::AudioRequest {
+                direction: Some(AudioDirection::FromPhone),
+                udp_port: 40_000,
+            },
+            PhoneEvent::AudioStart {
+                direction: AudioDirection::ToPhone,
+                session_id: [1; 16],
+                session_salt: [2; 4],
+                session_key: [3; 32],
+                jitter_target_ms: 80,
+            },
+            PhoneEvent::AudioStopped {
+                reason: "user".into(),
+            },
+        ] {
+            let frame = Frame::Phone(event);
+            assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn protocol_v2_wire_fixtures_remain_stable() {
+        for (expected, fixture) in v2_wire_fixtures() {
+            let fixture = decode_hex_fixture(fixture);
+            assert_eq!(decode_frame(&fixture).unwrap(), expected);
+            assert_eq!(encode_frame(&expected).unwrap(), fixture, "{expected:?}");
         }
     }
 }

@@ -52,13 +52,27 @@ struct StreamThread {
 
 impl AudioPlayer {
     pub fn open_default(stats: Arc<PlaybackStats>) -> Result<Self> {
+        Self::open(stats, None, OUTPUT_QUEUE_LIMIT_MS)
+    }
+
+    /// Plays on the output whose device ID is `device` (a PipeWire node name),
+    /// or the default output when it is `None` or the current host has no such
+    /// device. The queue holds up to `queue_limit_ms`, at least
+    /// [`OUTPUT_QUEUE_LIMIT_MS`]; senders on Wi-Fi deliver in bursts that a
+    /// short queue would drop.
+    pub fn open(
+        stats: Arc<PlaybackStats>,
+        device: Option<String>,
+        queue_limit_ms: u32,
+    ) -> Result<Self> {
+        let queue_limit_ms = queue_limit_ms.max(OUTPUT_QUEUE_LIMIT_MS);
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<OpenedStream>>();
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
         let thread_stats = stats.clone();
         thread::Builder::new()
             .name("edge-kvm-audio-output".to_string())
             .spawn(move || {
-                let stream = match open_stream(thread_stats) {
+                let stream = match open_stream(thread_stats, device.as_deref(), queue_limit_ms) {
                     Ok((stream, opened)) => {
                         let _ = ready_tx.send(Ok(opened));
                         stream
@@ -147,12 +161,27 @@ fn select_host() -> cpal::Host {
     cpal::default_host()
 }
 
-fn open_stream(stats: Arc<PlaybackStats>) -> Result<(Stream, OpenedStream)> {
+fn open_stream(
+    stats: Arc<PlaybackStats>,
+    requested: Option<&str>,
+    queue_limit_ms: u32,
+) -> Result<(Stream, OpenedStream)> {
     let host = select_host();
     let host_name = host.id().name();
-    let device = host
-        .default_output_device()
-        .context("no default audio output")?;
+    let device = match requested.and_then(|name| find_output(&host, name)) {
+        Some(device) => device,
+        None => {
+            if let Some(requested) = requested {
+                tracing::warn!(
+                    requested,
+                    host = host_name,
+                    "requested audio output not found; using the default output"
+                );
+            }
+            host.default_output_device()
+                .context("no default audio output")?
+        }
+    };
     let output_name = device.to_string();
     let supported = device
         .default_output_config()
@@ -164,7 +193,7 @@ fn open_stream(stats: Arc<PlaybackStats>) -> Result<(Stream, OpenedStream)> {
     let ring = Arc::new(AudioRing::new(duration_samples(
         output_rate,
         output_channels,
-        OUTPUT_QUEUE_LIMIT_MS,
+        queue_limit_ms,
     )));
     stats.output_samples_per_ms.store(
         duration_samples(output_rate, output_channels, 1).max(1),
@@ -198,6 +227,12 @@ fn open_stream(stats: Arc<PlaybackStats>) -> Result<(Stream, OpenedStream)> {
             output_channels,
         },
     ))
+}
+
+fn find_output(host: &cpal::Host, name: &str) -> Option<Device> {
+    host.output_devices()
+        .ok()?
+        .find(|device| device.id().is_ok_and(|id| id.id() == name))
 }
 
 fn build_stream<T>(

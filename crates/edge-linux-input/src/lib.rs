@@ -56,7 +56,7 @@ pub enum LinuxInputError {
     UinputUnsupportedKey(u16),
     #[error("command `{program}` failed: {message}")]
     CommandFailed { program: String, message: String },
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
