@@ -239,11 +239,10 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
 
     if args.settings {
         let restart_config_path = config_path.clone();
-        // Only a waiting receiver serves the control socket.
-        let link = (config.transport == TransportMode::Listen).then(|| {
+        let link = Some(
             Arc::new(control_link::ControlLink::new(receiver_log.clone()))
-                as Arc<dyn edge_ui::NodeLink>
-        });
+                as Arc<dyn edge_ui::NodeLink>,
+        );
         let settings_input = SettingsUiInput {
             role: config.preferred_role,
             can_choose_transport: true,
@@ -523,6 +522,21 @@ async fn run_linux_connector(
         (Some(tray), Some(commands))
     } else {
         (None, None)
+    };
+    let _phones = match spawn_connector_phones(
+        &config,
+        &identity,
+        clipboard_hub.as_ref(),
+        tray.as_ref(),
+        &log_path,
+    )
+    .await
+    {
+        Ok(phones) => Some(phones),
+        Err(error) => {
+            append_portable_log(&log_path, format!("phones unavailable: {error:#}"));
+            None
+        }
     };
     let mut connection_enabled = true;
     let connector_pause = Arc::new(AtomicBool::new(false));
@@ -2541,39 +2555,15 @@ async fn run_receiver(
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
     let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
     let pins_path = state_dir.join("pins.toml");
-    let mut phones = PhoneSessions::new(
-        LocalHello {
-            device_name: config.device_name.clone(),
-            role: config.preferred_role,
-            fingerprint: identity.fingerprint(),
-        },
+    let (mut phones, _control) = start_phone_sessions(
+        &config,
+        &identity,
         listen_addr,
-        log_path.clone(),
-        clipboard_hub.as_ref().map(|hub| phone::ClipboardSource {
-            config: Arc::new(config.clone()),
-            changes: hub.subscribe(),
-        }),
-    );
-    if let Some(tray) = &tray {
-        phones.set_tray(tray.clone()).await;
-    }
-    let _control = control::spawn_server(phones.requests(), tray.clone(), &log_path).await;
-    match control::socket_path() {
-        Some(control) => {
-            let icons = control.with_file_name("phone-icons");
-            match notifications::FreedesktopNotifications::connect(icons).await {
-                Ok(desktop) => phones.set_desktop_notifications(desktop),
-                Err(error) => append_portable_log(
-                    &log_path,
-                    format!("phone notifications unavailable: {error:#}"),
-                ),
-            }
-        }
-        None => append_portable_log(
-            &log_path,
-            "no runtime directory; phone notifications unavailable",
-        ),
-    }
+        clipboard_hub.as_ref(),
+        tray.as_ref(),
+        &log_path,
+    )
+    .await;
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
@@ -3217,6 +3207,108 @@ enum ControllerSessionExit {
     DisconnectRequested,
     /// A newer connection from the same peer took over.
     Replaced,
+}
+
+/// Phone sessions, their control socket and desktop notifications. Both ends
+/// of a computer link accept phones, so this serves the waiting receiver and
+/// the connector alike.
+async fn start_phone_sessions(
+    config: &AppConfig,
+    identity: &IdentityKey,
+    listen_addr: std::net::SocketAddr,
+    clipboard_hub: Option<&ClipboardHub>,
+    tray: Option<&ReceiverTrayHandle>,
+    log_path: &Path,
+) -> (PhoneSessions, Option<AbortOnDropTask>) {
+    let mut phones = PhoneSessions::new(
+        LocalHello {
+            device_name: config.device_name.clone(),
+            role: config.preferred_role,
+            fingerprint: identity.fingerprint(),
+        },
+        listen_addr,
+        log_path.to_path_buf(),
+        clipboard_hub.map(|hub| phone::ClipboardSource {
+            config: Arc::new(config.clone()),
+            changes: hub.subscribe(),
+        }),
+    );
+    if let Some(tray) = tray {
+        phones.set_tray(tray.clone()).await;
+    }
+    let control = control::spawn_server(phones.requests(), tray.cloned(), log_path).await;
+    match control::socket_path() {
+        Some(control) => {
+            let icons = control.with_file_name("phone-icons");
+            match notifications::FreedesktopNotifications::connect(icons).await {
+                Ok(desktop) => phones.set_desktop_notifications(desktop),
+                Err(error) => append_portable_log(
+                    log_path,
+                    format!("phone notifications unavailable: {error:#}"),
+                ),
+            }
+        }
+        None => append_portable_log(
+            log_path,
+            "no runtime directory; phone notifications unavailable",
+        ),
+    }
+    (phones, control)
+}
+
+/// The connector's phone side: it dials its computer peer, so this listener
+/// only takes phones and turns computers away.
+#[cfg(target_os = "linux")]
+async fn spawn_connector_phones(
+    config: &AppConfig,
+    identity: &IdentityKey,
+    clipboard_hub: Option<&ClipboardHub>,
+    tray: Option<&ReceiverTrayHandle>,
+    log_path: &Path,
+) -> Result<AbortOnDropTask> {
+    let state_dir = default_state_dir();
+    let pins_path = state_dir.join("pins.toml");
+    let mut pins = PinStore::load_or_default(&pins_path)
+        .await
+        .context("failed to load pin store")?;
+    let listen = config
+        .listen
+        .clone()
+        .unwrap_or_else(|| "0.0.0.0:42420".to_string());
+    let listener = TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("failed to bind {listen} for phones"))?;
+    let listen_addr = listener
+        .local_addr()
+        .context("failed to read the listen address")?;
+    append_portable_log(log_path, format!("listening for phones on {listen}"));
+    let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.to_path_buf());
+    let (mut phones, control) =
+        start_phone_sessions(config, identity, listen_addr, clipboard_hub, tray, log_path).await;
+    let log_path = log_path.to_path_buf();
+    Ok(AbortOnDropTask(tokio::spawn(async move {
+        let _control = control;
+        loop {
+            tokio::select! {
+                request = phones.next_request() => {
+                    phones.handle_request(request, &mut pins, &pins_path).await;
+                }
+                event = acceptor.recv() => match event {
+                    Some(AcceptEvent::Peer(peer)) if phone::is_phone_hello(&peer.hello) => {
+                        start_phone(&mut phones, *peer, &pins);
+                    }
+                    Some(AcceptEvent::Peer(peer)) => reject_peer(
+                        *peer,
+                        "connector_only",
+                        "this computer connects to its peer itself; set it to wait for a connection to accept computers",
+                        &log_path,
+                    ),
+                    Some(AcceptEvent::Failed(_)) => {}
+                    None => break,
+                },
+            }
+        }
+    })))
 }
 
 fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) {
