@@ -519,12 +519,30 @@ impl ksni::Tray for ReceiverTray {
         use ksni::menu::*;
 
         let connected = self.state == TrayState::Connected;
-        let mut items: Vec<ksni::MenuItem<Self>> = vec![disabled_item(self.summary())];
-        items.extend(
-            self.phones
-                .iter()
-                .map(|phone| disabled_item(phone_line(phone))),
-        );
+        // The status rows open Settings, which also keeps them from being
+        // greyed out like disabled rows.
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
+            StandardItem {
+                label: self.summary(),
+                icon_data: status_dot_png(self.icon_color()).to_vec(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::OpenSettings);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ];
+        items.extend(self.phones.iter().map(|phone| {
+            StandardItem {
+                label: phone_line(phone),
+                icon_name: "smartphone".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.command_tx.send(TrayCommand::OpenSettings);
+                }),
+                ..Default::default()
+            }
+            .into()
+        }));
         items.push(MenuItem::Separator);
         items.push(
             CheckmarkItem {
@@ -546,6 +564,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Add phone…".to_string(),
+                icon_name: "list-add".to_string(),
                 visible: self.phone_requests.is_some(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::AddPhone);
@@ -557,6 +576,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Pair a computer…".to_string(),
+                icon_name: "network-connect".to_string(),
                 visible: !connected,
                 enabled: !self.pairing_armed,
                 activate: Box::new(|tray: &mut Self| {
@@ -570,6 +590,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Settings…".to_string(),
+                icon_name: "configure".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::OpenSettings);
                 }),
@@ -580,6 +601,7 @@ impl ksni::Tray for ReceiverTray {
         items.push(
             StandardItem {
                 label: "Quit".to_string(),
+                icon_name: "application-exit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::Quit);
                 }),
@@ -705,6 +727,7 @@ impl ReceiverTray {
             (format!("Control {peer} from here"), ControllerChoice::Local)
         };
         ksni::menu::StandardItem {
+            icon_name: "exchange-positions".to_string(),
             label,
             visible: self.state == TrayState::Connected && self.role_switch_available,
             enabled: !self.role_switching,
@@ -860,15 +883,18 @@ impl ReceiverTray {
     fn connection_item(&self) -> ksni::MenuItem<Self> {
         use ksni::menu::StandardItem;
 
-        let (label, command): (&str, fn() -> TrayCommand) = match self.state {
-            TrayState::Paused => ("Reconnect", || TrayCommand::Reconnect),
+        let (label, icon, command): (&str, &str, fn() -> TrayCommand) = match self.state {
+            TrayState::Paused => ("Reconnect", "network-connect", || TrayCommand::Reconnect),
             TrayState::Starting
             | TrayState::Listening
             | TrayState::Connected
-            | TrayState::Error => ("Disconnect", || TrayCommand::Disconnect),
+            | TrayState::Error => ("Disconnect", "network-disconnect", || {
+                TrayCommand::Disconnect
+            }),
         };
         StandardItem {
             label: label.to_string(),
+            icon_name: icon.to_string(),
             activate: Box::new(move |tray: &mut Self| {
                 let _ = tray.command_tx.send(command());
             }),
@@ -891,6 +917,32 @@ impl ReceiverTray {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// A coloured dot for the status row, as PNG, drawn once per colour.
+fn status_dot_png(color: IconColor) -> &'static [u8] {
+    static DOTS: [std::sync::OnceLock<Vec<u8>>; 3] = [const { std::sync::OnceLock::new() }; 3];
+    let (index, rgb) = match color {
+        IconColor::Connected => (0, [0x3e, 0xcf, 0x8e]),
+        IconColor::Connecting => (1, [0x9a, 0xa1, 0xad]),
+        IconColor::Disconnected => (2, [0xf0, 0x71, 0x78]),
+    };
+    DOTS[index].get_or_init(|| {
+        const SIZE: u32 = 16;
+        const RADIUS: f32 = 4.5;
+        let dot = image::RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+            let center = SIZE as f32 / 2.0;
+            let distance =
+                ((x as f32 + 0.5 - center).powi(2) + (y as f32 + 0.5 - center).powi(2)).sqrt();
+            // One pixel of antialiasing at the edge.
+            let alpha = (RADIUS + 0.5 - distance).clamp(0.0, 1.0);
+            image::Rgba([rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        dot.write_to(&mut png, image::ImageFormat::Png)
+            .expect("a 16×16 PNG always encodes");
+        png.into_inner()
+    })
 }
 
 fn phone_line(phone: &TrayPhone) -> String {
@@ -1100,6 +1152,23 @@ mod tests {
                 "Quit",
             ]
         );
+    }
+
+    #[test]
+    fn status_row_shows_a_coloured_dot_and_opens_settings() {
+        let (mut tray, mut commands) = test_tray(TrayState::Connected);
+        let menu = tray.menu();
+        let ksni::MenuItem::Standard(status) = &menu[0] else {
+            panic!("status row is not a standard item");
+        };
+        assert!(status.enabled);
+        let dot = image::load_from_memory(&status.icon_data)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(dot.get_pixel(8, 8).0, [0x3e, 0xcf, 0x8e, 0xff]);
+        assert_eq!(dot.get_pixel(0, 0).0[3], 0);
+        (status.activate)(&mut tray);
+        assert!(matches!(commands.try_recv(), Ok(TrayCommand::OpenSettings)));
     }
 
     #[test]
