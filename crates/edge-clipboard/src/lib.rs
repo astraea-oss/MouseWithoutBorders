@@ -3,12 +3,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use edge_protocol::{ClipboardCancelReason, ClipboardEvent, Frame};
+use edge_protocol::{
+    CLIPBOARD_IMAGE_EXTENSION, CLIPBOARD_TEXT_CHUNKS_EXTENSION, ClipboardCancelReason,
+    ClipboardEvent, Frame,
+};
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use sha2::{Digest, Sha256};
 
 pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
-pub const IMAGE_CHUNK_BYTES: usize = 16 * 1024;
+/// Chunk size for image and text clipboard transfers.
+pub const TRANSFER_CHUNK_BYTES: usize = 16 * 1024;
+pub const IMAGE_CHUNK_BYTES: usize = TRANSFER_CHUNK_BYTES;
 pub const IMAGE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_HIGH_PRIORITY_FRAMES_BEFORE_IMAGE_CHUNK: u8 = 64;
 
@@ -34,7 +39,10 @@ impl ImageTransferSchedule {
     /// Records a frame this peer sent. Chunks reset the budget; everything else
     /// spends it.
     pub fn record_sent_frame(&mut self, frame: &Frame) {
-        if matches!(frame, Frame::Clipboard(ClipboardEvent::ImageChunk { .. })) {
+        if matches!(
+            frame,
+            Frame::Clipboard(ClipboardEvent::ImageChunk { .. } | ClipboardEvent::TextChunk { .. })
+        ) {
             self.record_image_chunk();
         } else {
             self.record_high_priority_frame();
@@ -51,6 +59,23 @@ impl ImageTransferSchedule {
     pub fn record_received_frame(&mut self, frame: &Frame) {
         if !matches!(frame, Frame::Clipboard(_)) {
             self.record_high_priority_frame();
+        }
+    }
+}
+
+/// Clipboard transfer features negotiated through `Hello` extensions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClipboardPeerFeatures {
+    pub images: bool,
+    pub text_chunks: bool,
+}
+
+impl ClipboardPeerFeatures {
+    pub fn from_extensions(extensions: &[String]) -> Self {
+        let has = |name: &str| extensions.iter().any(|extension| extension == name);
+        Self {
+            images: has(CLIPBOARD_IMAGE_EXTENSION),
+            text_chunks: has(CLIPBOARD_TEXT_CHUNKS_EXTENSION),
         }
     }
 }
@@ -77,6 +102,8 @@ pub enum ClipboardError {
     HashMismatch,
     #[error("image transfer expired")]
     TransferExpired,
+    #[error("clipboard text transfer is not valid UTF-8")]
+    InvalidText,
 }
 
 pub type Result<T> = std::result::Result<T, ClipboardError>;
@@ -206,10 +233,29 @@ impl ClipboardChangeTracker {
 }
 
 #[derive(Debug, Clone)]
-pub struct OutgoingImageTransfer {
+enum OutgoingPayload {
+    Image(CanonicalImage),
+    Text {
+        bytes: Vec<u8>,
+        content_sha256: [u8; 32],
+    },
+}
+
+impl OutgoingPayload {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Image(image) => &image.png,
+            Self::Text { bytes, .. } => bytes,
+        }
+    }
+}
+
+/// A clipboard item sent as a start frame, bounded chunks, and an end frame.
+#[derive(Debug, Clone)]
+pub struct OutgoingClipboardTransfer {
     transfer_id: u64,
     sequence: u64,
-    image: CanonicalImage,
+    payload: OutgoingPayload,
     offset: usize,
     stage: OutgoingStage,
 }
@@ -222,12 +268,29 @@ enum OutgoingStage {
     Done,
 }
 
-impl OutgoingImageTransfer {
-    pub fn new(transfer_id: u64, sequence: u64, image: CanonicalImage) -> Self {
+impl OutgoingClipboardTransfer {
+    pub fn image(transfer_id: u64, sequence: u64, image: CanonicalImage) -> Self {
+        Self::with_payload(transfer_id, sequence, OutgoingPayload::Image(image))
+    }
+
+    pub fn text(transfer_id: u64, sequence: u64, text: String) -> Self {
+        let bytes = text.into_bytes();
+        let content_sha256 = hash_bytes(&bytes);
+        Self::with_payload(
+            transfer_id,
+            sequence,
+            OutgoingPayload::Text {
+                bytes,
+                content_sha256,
+            },
+        )
+    }
+
+    fn with_payload(transfer_id: u64, sequence: u64, payload: OutgoingPayload) -> Self {
         Self {
             transfer_id,
             sequence,
-            image,
+            payload,
             offset: 0,
             stage: OutgoingStage::Start,
         }
@@ -235,6 +298,10 @@ impl OutgoingImageTransfer {
 
     pub fn transfer_id(&self) -> u64 {
         self.transfer_id
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self.payload, OutgoingPayload::Text { .. })
     }
 
     pub fn is_done(&self) -> bool {
@@ -252,33 +319,56 @@ impl OutgoingImageTransfer {
         match self.stage {
             OutgoingStage::Start => {
                 self.stage = OutgoingStage::Chunks;
-                Some(ClipboardEvent::ImageStart {
-                    transfer_id: self.transfer_id,
-                    sequence: self.sequence,
-                    width: self.image.width,
-                    height: self.image.height,
-                    total_bytes: self.image.png.len() as u32,
-                    content_sha256: self.image.content_sha256,
+                let total_bytes = self.payload.bytes().len() as u32;
+                Some(match &self.payload {
+                    OutgoingPayload::Image(image) => ClipboardEvent::ImageStart {
+                        transfer_id: self.transfer_id,
+                        sequence: self.sequence,
+                        width: image.width,
+                        height: image.height,
+                        total_bytes,
+                        content_sha256: image.content_sha256,
+                    },
+                    OutgoingPayload::Text { content_sha256, .. } => ClipboardEvent::TextStart {
+                        transfer_id: self.transfer_id,
+                        sequence: self.sequence,
+                        total_bytes,
+                        content_sha256: *content_sha256,
+                    },
                 })
             }
             OutgoingStage::Chunks => {
-                if self.offset >= self.image.png.len() {
+                let payload = self.payload.bytes();
+                if self.offset >= payload.len() {
                     self.stage = OutgoingStage::End;
                     return self.next_event();
                 }
-                let end = (self.offset + IMAGE_CHUNK_BYTES).min(self.image.png.len());
-                let event = ClipboardEvent::ImageChunk {
-                    transfer_id: self.transfer_id,
-                    offset: self.offset as u32,
-                    bytes: self.image.png[self.offset..end].to_vec(),
-                };
+                let end = (self.offset + TRANSFER_CHUNK_BYTES).min(payload.len());
+                let bytes = payload[self.offset..end].to_vec();
+                let offset = self.offset as u32;
                 self.offset = end;
-                Some(event)
+                Some(match self.payload {
+                    OutgoingPayload::Image(_) => ClipboardEvent::ImageChunk {
+                        transfer_id: self.transfer_id,
+                        offset,
+                        bytes,
+                    },
+                    OutgoingPayload::Text { .. } => ClipboardEvent::TextChunk {
+                        transfer_id: self.transfer_id,
+                        offset,
+                        bytes,
+                    },
+                })
             }
             OutgoingStage::End => {
                 self.stage = OutgoingStage::Done;
-                Some(ClipboardEvent::ImageEnd {
-                    transfer_id: self.transfer_id,
+                Some(match self.payload {
+                    OutgoingPayload::Image(_) => ClipboardEvent::ImageEnd {
+                        transfer_id: self.transfer_id,
+                    },
+                    OutgoingPayload::Text { .. } => ClipboardEvent::TextEnd {
+                        transfer_id: self.transfer_id,
+                    },
                 })
             }
             OutgoingStage::Done => None,
@@ -286,28 +376,40 @@ impl OutgoingImageTransfer {
     }
 }
 
+/// Size limits applied to incoming chunked clipboard transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferLimits {
+    pub max_image_bytes: usize,
+    pub max_text_bytes: usize,
+}
+
 #[derive(Debug, Default)]
-pub struct IncomingImageTransfer {
+pub struct IncomingClipboardTransfer {
     active: Option<IncomingState>,
+}
+
+#[derive(Debug)]
+enum IncomingKind {
+    Image { width: u32, height: u32 },
+    Text,
 }
 
 #[derive(Debug)]
 struct IncomingState {
     transfer_id: u64,
-    width: u32,
-    height: u32,
+    kind: IncomingKind,
     total_bytes: usize,
     content_sha256: [u8; 32],
     bytes: Vec<u8>,
     last_progress: Instant,
 }
 
-impl IncomingImageTransfer {
+impl IncomingClipboardTransfer {
     pub fn handle(
         &mut self,
         event: ClipboardEvent,
-        max_bytes: usize,
-    ) -> Result<Option<CanonicalImage>> {
+        limits: TransferLimits,
+    ) -> Result<Option<ClipboardItem>> {
         match event {
             ClipboardEvent::ImageStart {
                 transfer_id,
@@ -324,66 +426,38 @@ impl IncomingImageTransfer {
                     .and_then(|bytes| usize::try_from(bytes).ok())
                     .ok_or(ClipboardError::InvalidDimensions)?;
                 validate_dimensions(width, height, rgba_len)?;
-                if total_bytes == 0 || total_bytes > max_bytes {
-                    return Err(ClipboardError::EncodedTooLarge {
-                        actual: total_bytes,
-                        max: max_bytes,
-                    });
-                }
-                self.active = Some(IncomingState {
+                self.start(
                     transfer_id,
-                    width,
-                    height,
+                    IncomingKind::Image { width, height },
                     total_bytes,
+                    limits.max_image_bytes,
                     content_sha256,
-                    bytes: Vec::with_capacity(total_bytes),
-                    last_progress: Instant::now(),
-                });
-                Ok(None)
+                )
             }
+            ClipboardEvent::TextStart {
+                transfer_id,
+                total_bytes,
+                content_sha256,
+                ..
+            } => self.start(
+                transfer_id,
+                IncomingKind::Text,
+                total_bytes as usize,
+                limits.max_text_bytes,
+                content_sha256,
+            ),
             ClipboardEvent::ImageChunk {
                 transfer_id,
                 offset,
                 bytes,
-            } => {
-                let state = self
-                    .active
-                    .as_mut()
-                    .ok_or(ClipboardError::InvalidTransfer)?;
-                if state.transfer_id != transfer_id {
-                    return Err(ClipboardError::InvalidTransfer);
-                }
-                let expected = state.bytes.len() as u32;
-                if offset != expected {
-                    return Err(ClipboardError::OffsetMismatch {
-                        expected,
-                        actual: offset,
-                    });
-                }
-                if bytes.is_empty()
-                    || bytes.len() > IMAGE_CHUNK_BYTES
-                    || state.bytes.len().saturating_add(bytes.len()) > state.total_bytes
-                {
-                    return Err(ClipboardError::InvalidTransfer);
-                }
-                state.bytes.extend_from_slice(&bytes);
-                state.last_progress = Instant::now();
-                Ok(None)
-            }
-            ClipboardEvent::ImageEnd { transfer_id } => {
-                let state = self.active.take().ok_or(ClipboardError::InvalidTransfer)?;
-                if state.transfer_id != transfer_id || state.bytes.len() != state.total_bytes {
-                    return Err(ClipboardError::InvalidTransfer);
-                }
-                let image = CanonicalImage::from_encoded(&state.bytes, "image/png", max_bytes)?;
-                if image.width != state.width
-                    || image.height != state.height
-                    || image.content_sha256 != state.content_sha256
-                {
-                    return Err(ClipboardError::HashMismatch);
-                }
-                Ok(Some(image))
-            }
+            } => self.chunk(transfer_id, false, offset, &bytes),
+            ClipboardEvent::TextChunk {
+                transfer_id,
+                offset,
+                bytes,
+            } => self.chunk(transfer_id, true, offset, &bytes),
+            ClipboardEvent::ImageEnd { transfer_id } => self.finish(transfer_id, false, limits),
+            ClipboardEvent::TextEnd { transfer_id } => self.finish(transfer_id, true, limits),
             ClipboardEvent::ImageCancel { transfer_id, .. } => {
                 if self
                     .active
@@ -395,6 +469,102 @@ impl IncomingImageTransfer {
                 Ok(None)
             }
             _ => Err(ClipboardError::InvalidTransfer),
+        }
+    }
+
+    fn start(
+        &mut self,
+        transfer_id: u64,
+        kind: IncomingKind,
+        total_bytes: usize,
+        max_bytes: usize,
+        content_sha256: [u8; 32],
+    ) -> Result<Option<ClipboardItem>> {
+        if total_bytes == 0 || total_bytes > max_bytes {
+            return Err(ClipboardError::EncodedTooLarge {
+                actual: total_bytes,
+                max: max_bytes,
+            });
+        }
+        self.active = Some(IncomingState {
+            transfer_id,
+            kind,
+            total_bytes,
+            content_sha256,
+            bytes: Vec::with_capacity(total_bytes),
+            last_progress: Instant::now(),
+        });
+        Ok(None)
+    }
+
+    fn chunk(
+        &mut self,
+        transfer_id: u64,
+        text: bool,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<Option<ClipboardItem>> {
+        let state = self
+            .active
+            .as_mut()
+            .ok_or(ClipboardError::InvalidTransfer)?;
+        if state.transfer_id != transfer_id || matches!(state.kind, IncomingKind::Text) != text {
+            return Err(ClipboardError::InvalidTransfer);
+        }
+        let expected = state.bytes.len() as u32;
+        if offset != expected {
+            return Err(ClipboardError::OffsetMismatch {
+                expected,
+                actual: offset,
+            });
+        }
+        if bytes.is_empty()
+            || bytes.len() > TRANSFER_CHUNK_BYTES
+            || state.bytes.len().saturating_add(bytes.len()) > state.total_bytes
+        {
+            return Err(ClipboardError::InvalidTransfer);
+        }
+        state.bytes.extend_from_slice(bytes);
+        state.last_progress = Instant::now();
+        Ok(None)
+    }
+
+    fn finish(
+        &mut self,
+        transfer_id: u64,
+        text: bool,
+        limits: TransferLimits,
+    ) -> Result<Option<ClipboardItem>> {
+        let state = self.active.take().ok_or(ClipboardError::InvalidTransfer)?;
+        if state.transfer_id != transfer_id
+            || matches!(state.kind, IncomingKind::Text) != text
+            || state.bytes.len() != state.total_bytes
+        {
+            return Err(ClipboardError::InvalidTransfer);
+        }
+        match state.kind {
+            IncomingKind::Image { width, height } => {
+                let image = CanonicalImage::from_encoded(
+                    &state.bytes,
+                    "image/png",
+                    limits.max_image_bytes,
+                )?;
+                if image.width != width
+                    || image.height != height
+                    || image.content_sha256 != state.content_sha256
+                {
+                    return Err(ClipboardError::HashMismatch);
+                }
+                Ok(Some(ClipboardItem::Image(image)))
+            }
+            IncomingKind::Text => {
+                if hash_bytes(&state.bytes) != state.content_sha256 {
+                    return Err(ClipboardError::HashMismatch);
+                }
+                let text =
+                    String::from_utf8(state.bytes).map_err(|_| ClipboardError::InvalidText)?;
+                Ok(Some(ClipboardItem::Text(text)))
+            }
         }
     }
 
@@ -455,6 +625,13 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    fn limits(max_bytes: usize) -> TransferLimits {
+        TransferLimits {
+            max_image_bytes: max_bytes,
+            max_text_bytes: max_bytes,
+        }
+    }
+
     fn sample_image() -> CanonicalImage {
         CanonicalImage::from_rgba(
             2,
@@ -480,15 +657,15 @@ mod tests {
     #[test]
     fn transfer_round_trip_and_offset_validation() {
         let image = sample_image();
-        let mut outgoing = OutgoingImageTransfer::new(7, 3, image.clone());
-        let mut incoming = IncomingImageTransfer::default();
+        let mut outgoing = OutgoingClipboardTransfer::image(7, 3, image.clone());
+        let mut incoming = IncomingClipboardTransfer::default();
         let mut completed = None;
         while let Some(event) = outgoing.next_event() {
-            completed = incoming.handle(event, 1024).unwrap().or(completed);
+            completed = incoming.handle(event, limits(1024)).unwrap().or(completed);
         }
-        assert_eq!(completed.unwrap(), image);
+        assert_eq!(completed.unwrap(), ClipboardItem::Image(image));
 
-        let mut incoming = IncomingImageTransfer::default();
+        let mut incoming = IncomingClipboardTransfer::default();
         incoming
             .handle(
                 ClipboardEvent::ImageStart {
@@ -499,7 +676,7 @@ mod tests {
                     total_bytes: 4,
                     content_sha256: [0; 32],
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         assert!(matches!(
@@ -509,9 +686,88 @@ mod tests {
                     offset: 2,
                     bytes: vec![1],
                 },
-                1024
+                limits(1024)
             ),
             Err(ClipboardError::OffsetMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn text_transfer_round_trips_across_chunks() {
+        let text = "héllo wörld ".repeat(8_000);
+        assert!(text.len() > TRANSFER_CHUNK_BYTES * 4);
+        let mut outgoing = OutgoingClipboardTransfer::text(5, 2, text.clone());
+        assert!(outgoing.is_text());
+        let mut incoming = IncomingClipboardTransfer::default();
+        let mut completed = None;
+        let mut chunks = 0;
+        while let Some(event) = outgoing.next_event() {
+            if let ClipboardEvent::TextChunk { bytes, .. } = &event {
+                assert!(bytes.len() <= TRANSFER_CHUNK_BYTES);
+                chunks += 1;
+            }
+            assert!(event.is_text_transfer());
+            completed = incoming
+                .handle(event, limits(text.len()))
+                .unwrap()
+                .or(completed);
+        }
+        assert!(outgoing.is_done());
+        assert!(chunks > 4);
+        assert_eq!(completed, Some(ClipboardItem::Text(text)));
+    }
+
+    #[test]
+    fn text_transfer_enforces_size_hash_and_kind() {
+        let mut incoming = IncomingClipboardTransfer::default();
+        assert!(matches!(
+            incoming.handle(
+                ClipboardEvent::TextStart {
+                    transfer_id: 1,
+                    sequence: 1,
+                    total_bytes: 2048,
+                    content_sha256: [0; 32],
+                },
+                limits(1024),
+            ),
+            Err(ClipboardError::EncodedTooLarge { .. })
+        ));
+
+        incoming
+            .handle(
+                ClipboardEvent::TextStart {
+                    transfer_id: 2,
+                    sequence: 1,
+                    total_bytes: 3,
+                    content_sha256: [0; 32],
+                },
+                limits(1024),
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(
+                ClipboardEvent::ImageChunk {
+                    transfer_id: 2,
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                },
+                limits(1024),
+            ),
+            Err(ClipboardError::InvalidTransfer)
+        ));
+        incoming
+            .handle(
+                ClipboardEvent::TextChunk {
+                    transfer_id: 2,
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                },
+                limits(1024),
+            )
+            .unwrap();
+        assert!(matches!(
+            incoming.handle(ClipboardEvent::TextEnd { transfer_id: 2 }, limits(1024)),
+            Err(ClipboardError::HashMismatch)
         ));
     }
 
@@ -556,7 +812,7 @@ mod tests {
     #[test]
     fn cancellation_and_timeout_clear_incoming_transfer() {
         let image = sample_image();
-        let mut incoming = IncomingImageTransfer::default();
+        let mut incoming = IncomingClipboardTransfer::default();
         incoming
             .handle(
                 ClipboardEvent::ImageStart {
@@ -567,7 +823,7 @@ mod tests {
                     total_bytes: image.png.len() as u32,
                     content_sha256: image.content_sha256,
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         incoming
@@ -576,7 +832,7 @@ mod tests {
                     transfer_id: 1,
                     reason: ClipboardCancelReason::Replaced,
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         assert!(incoming.active.is_none());
@@ -591,7 +847,7 @@ mod tests {
                     total_bytes: image.png.len() as u32,
                     content_sha256: image.content_sha256,
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         incoming.active.as_mut().unwrap().last_progress =
@@ -649,7 +905,7 @@ mod tests {
     #[test]
     fn rejects_chunks_from_a_different_transfer() {
         let image = sample_image();
-        let mut incoming = IncomingImageTransfer::default();
+        let mut incoming = IncomingClipboardTransfer::default();
         incoming
             .handle(
                 ClipboardEvent::ImageStart {
@@ -660,7 +916,7 @@ mod tests {
                     total_bytes: image.png.len() as u32,
                     content_sha256: image.content_sha256,
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         assert!(matches!(
@@ -670,7 +926,7 @@ mod tests {
                     offset: 0,
                     bytes: vec![1],
                 },
-                1024
+                limits(1024)
             ),
             Err(ClipboardError::InvalidTransfer)
         ));
@@ -689,8 +945,8 @@ mod tests {
         };
 
         // Ending early, with fewer bytes than promised, must not yield an image.
-        let mut incoming = IncomingImageTransfer::default();
-        incoming.handle(start.clone(), 1024).unwrap();
+        let mut incoming = IncomingClipboardTransfer::default();
+        incoming.handle(start.clone(), limits(1024)).unwrap();
         incoming
             .handle(
                 ClipboardEvent::ImageChunk {
@@ -698,25 +954,25 @@ mod tests {
                     offset: 0,
                     bytes: image.png[..4].to_vec(),
                 },
-                1024,
+                limits(1024),
             )
             .unwrap();
         assert!(matches!(
-            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, 1024),
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, limits(1024)),
             Err(ClipboardError::InvalidTransfer)
         ));
 
         // Replaying a chunk that was already accepted is an offset mismatch.
-        let mut incoming = IncomingImageTransfer::default();
-        incoming.handle(start, 1024).unwrap();
+        let mut incoming = IncomingClipboardTransfer::default();
+        incoming.handle(start, limits(1024)).unwrap();
         let chunk = ClipboardEvent::ImageChunk {
             transfer_id: 1,
             offset: 0,
             bytes: image.png[..4].to_vec(),
         };
-        incoming.handle(chunk.clone(), 1024).unwrap();
+        incoming.handle(chunk.clone(), limits(1024)).unwrap();
         assert!(matches!(
-            incoming.handle(chunk, 1024),
+            incoming.handle(chunk, limits(1024)),
             Err(ClipboardError::OffsetMismatch {
                 expected: 4,
                 actual: 0
@@ -729,7 +985,7 @@ mod tests {
         let image = sample_image();
 
         // Correct byte count and dimensions, but the promised hash is wrong.
-        let mut incoming = IncomingImageTransfer::default();
+        let mut incoming = IncomingClipboardTransfer::default();
         incoming
             .handle(
                 ClipboardEvent::ImageStart {
@@ -740,7 +996,7 @@ mod tests {
                     total_bytes: image.png.len() as u32,
                     content_sha256: [0xAB; 32],
                 },
-                4096,
+                limits(4096),
             )
             .unwrap();
         incoming
@@ -750,17 +1006,17 @@ mod tests {
                     offset: 0,
                     bytes: image.png.clone(),
                 },
-                4096,
+                limits(4096),
             )
             .unwrap();
         assert!(matches!(
-            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, 4096),
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 1 }, limits(4096)),
             Err(ClipboardError::HashMismatch)
         ));
 
         // Bytes that are not a decodable PNG at all.
         let garbage = vec![0x7F_u8; 32];
-        let mut incoming = IncomingImageTransfer::default();
+        let mut incoming = IncomingClipboardTransfer::default();
         incoming
             .handle(
                 ClipboardEvent::ImageStart {
@@ -771,7 +1027,7 @@ mod tests {
                     total_bytes: garbage.len() as u32,
                     content_sha256: image.content_sha256,
                 },
-                4096,
+                limits(4096),
             )
             .unwrap();
         incoming
@@ -781,11 +1037,11 @@ mod tests {
                     offset: 0,
                     bytes: garbage,
                 },
-                4096,
+                limits(4096),
             )
             .unwrap();
         assert!(matches!(
-            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 2 }, 4096),
+            incoming.handle(ClipboardEvent::ImageEnd { transfer_id: 2 }, limits(4096)),
             Err(ClipboardError::Image(_))
         ));
     }

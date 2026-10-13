@@ -27,8 +27,9 @@ use crate::AbortOnDropTask;
 
 /// Phones are on Wi-Fi, so buffer more than PC peers do; quality over latency.
 pub(crate) const PHONE_JITTER_TARGET_MS: u16 = 80;
-/// Phone Wi-Fi sends in bursts even with a low-latency lock; absorb them.
-const PHONE_PLAYBACK_QUEUE_MS: usize = 200;
+/// Phone Wi-Fi sends in bursts even with a low-latency lock; queue about
+/// 200 ms above the player's 60 ms target to absorb them.
+const PHONE_PLAYBACK_QUEUE_MS: u32 = 260;
 const PATH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A running stream. Dropping it stops the stream and restores routing.

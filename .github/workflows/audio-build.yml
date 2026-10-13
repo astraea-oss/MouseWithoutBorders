@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev
       - name: Test Linux workspace
         run: cargo test --workspace --exclude edge-controller-win
       - name: Lint Linux workspace

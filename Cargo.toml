@@ -4,6 +4,7 @@ members = [
   "crates/edge-common",
   "crates/edge-clipboard",
   "crates/edge-audio",
+  "crates/edge-audio-output",
   "crates/edge-protocol",
   "crates/edge-crypto",
   "crates/edge-runtime",
