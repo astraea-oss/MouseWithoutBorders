@@ -16,6 +16,9 @@ pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
 /// A phone that mirrors its notifications; the receiver echoes it back when it
 /// shows them.
 pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
+/// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
+/// it to start a stream.
+pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -112,6 +115,10 @@ pub enum PhoneEvent {
     },
     /// Either way: the stream ended, and why.
     AudioStopped { reason: String },
+    /// Receiver → phone: please start a stream this way by sending an
+    /// `AudioRequest`, which keeps the phone's firewall path working. Only
+    /// sent to phones advertising [`PHONE_AUDIO_INVITE_EXTENSION`].
+    AudioInvite { direction: AudioDirection },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +432,70 @@ pub enum ReleaseReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub sequence: u64,
+}
+
+/// Measures the round trip between PC peers over their regular heartbeats.
+///
+/// A heartbeat with [`Self::ECHO_REQUEST`] set asks the peer to send it back
+/// with [`Self::ECHO_REPLY`] instead. Builds without this ignore both bits,
+/// as heartbeat sequences are only ever used for liveness, so against them
+/// the round trip just stays unknown.
+#[derive(Debug, Default)]
+pub struct HeartbeatPing {
+    pending: Option<(u64, std::time::Instant)>,
+    round_trip: Option<std::time::Duration>,
+}
+
+impl HeartbeatPing {
+    pub const ECHO_REQUEST: u64 = 1 << 62;
+    pub const ECHO_REPLY: u64 = 1 << 61;
+    const SEQUENCE: u64 = !(Self::ECHO_REQUEST | Self::ECHO_REPLY);
+    /// An echo this late is treated as lost and the next heartbeat asks again.
+    const ECHO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The heartbeat to send for `sequence`. It asks for an echo unless one
+    /// is still on its way.
+    pub fn outgoing(&mut self, sequence: u64, now: std::time::Instant) -> Heartbeat {
+        let sequence = sequence & Self::SEQUENCE;
+        let waiting = self
+            .pending
+            .is_some_and(|(_, sent)| now.duration_since(sent) < Self::ECHO_TIMEOUT);
+        if waiting {
+            return Heartbeat { sequence };
+        }
+        self.pending = Some((sequence, now));
+        Heartbeat {
+            sequence: sequence | Self::ECHO_REQUEST,
+        }
+    }
+
+    /// Handles a received heartbeat, returning the echo to send back if it
+    /// asked for one. Returns `None` for echoes, which only update
+    /// [`Self::round_trip`].
+    pub fn incoming(
+        &mut self,
+        heartbeat: &Heartbeat,
+        now: std::time::Instant,
+    ) -> Option<Heartbeat> {
+        let sequence = heartbeat.sequence & Self::SEQUENCE;
+        if heartbeat.sequence & Self::ECHO_REPLY != 0 {
+            if let Some((pending, sent)) = self.pending
+                && pending == sequence
+            {
+                self.round_trip = Some(now.duration_since(sent));
+                self.pending = None;
+            }
+            return None;
+        }
+        (heartbeat.sequence & Self::ECHO_REQUEST != 0).then_some(Heartbeat {
+            sequence: sequence | Self::ECHO_REPLY,
+        })
+    }
+
+    /// The latest measured round trip, if the peer echoes heartbeats.
+    pub fn round_trip(&self) -> Option<std::time::Duration> {
+        self.round_trip
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -941,10 +1012,55 @@ mod tests {
             PhoneEvent::AudioStopped {
                 reason: "user".into(),
             },
+            PhoneEvent::AudioInvite {
+                direction: AudioDirection::ToPhone,
+            },
         ] {
             let frame = Frame::Phone(event);
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn heartbeat_ping_measures_the_round_trip_of_echoed_heartbeats() {
+        let start = std::time::Instant::now();
+        let mut local = HeartbeatPing::default();
+        let mut peer = HeartbeatPing::default();
+
+        let ping = local.outgoing(7, start);
+        assert_eq!(ping.sequence, 7 | HeartbeatPing::ECHO_REQUEST);
+        // Another heartbeat before the echo arrives doesn't ask again.
+        let next = local.outgoing(8, start + std::time::Duration::from_millis(1));
+        assert_eq!(next.sequence, 8);
+        assert_eq!(peer.incoming(&next, start), None);
+
+        let echo = peer.incoming(&ping, start).expect("peer echoes the ping");
+        assert_eq!(echo.sequence, 7 | HeartbeatPing::ECHO_REPLY);
+        assert_eq!(
+            local.incoming(&echo, start + std::time::Duration::from_millis(4)),
+            None
+        );
+        assert_eq!(
+            local.round_trip(),
+            Some(std::time::Duration::from_millis(4))
+        );
+    }
+
+    #[test]
+    fn heartbeat_ping_asks_again_after_a_lost_echo() {
+        let start = std::time::Instant::now();
+        let mut local = HeartbeatPing::default();
+        local.outgoing(1, start);
+        let retry = local.outgoing(2, start + std::time::Duration::from_secs(6));
+        assert_eq!(retry.sequence, 2 | HeartbeatPing::ECHO_REQUEST);
+        // The late echo of the first ping is ignored.
+        local.incoming(
+            &Heartbeat {
+                sequence: 1 | HeartbeatPing::ECHO_REPLY,
+            },
+            start + std::time::Duration::from_secs(7),
+        );
+        assert_eq!(local.round_trip(), None);
     }
 
     #[test]

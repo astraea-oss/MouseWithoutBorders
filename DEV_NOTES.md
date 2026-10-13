@@ -62,19 +62,21 @@ All three initialize the Hyprland Wayland virtual input backend and exit 0.
 ## Linux Tray
 
 The Linux receiver publishes a KDE/freedesktop StatusNotifierItem by default,
-which Waybar's tray module can display. The tray shows:
+which Waybar's tray module can display. The menu keeps to status and everyday
+actions:
 
-- current receiver state;
-- listen address;
-- active input backend;
-- connected peer;
-- connection, input, and clipboard counters;
-- last receiver error when one occurs.
+- one status line: who is controlling whom, with the heartbeat round trip;
+- a line per connected phone, with its round trip;
+- `Share mouse and keyboard` (toggles forwarding without disconnecting, so
+  audio and clipboard keep working) and handing control the other way;
+- one audio choice: send to the PC, play from the PC, send to a phone, or off;
+- `Add phone…` (a QR code window), `Pair a computer…`, `Disconnect`,
+  `Settings…` and `Quit`.
 
-The tray menu can toggle mouse and keyboard forwarding without disconnecting,
-so audio and clipboard synchronization remain active. It also includes a
-`Pair or replace controller...` and `Quit receiver` actions. Use `--no-tray`
-for diagnostic or headless runs:
+Counters, transport, input backend and the last error moved to the settings
+window's `Copy report`. Rows that only apply sometimes are hidden rather than
+removed, so the layout only changes when a phone connects or leaves. Use
+`--no-tray` for diagnostic or headless runs:
 
 ```bash
 cargo run -p edge-receiver-linux -- --no-tray

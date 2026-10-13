@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 edge-common = { path = "../edge-common" }
 eframe.workspace = true
+qrcode = { version = "0.14", default-features = false }
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

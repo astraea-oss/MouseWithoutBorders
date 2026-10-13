@@ -1035,6 +1035,7 @@ dependencies = [
  "anyhow",
  "edge-common",
  "eframe",
+ "qrcode",
  "tracing",
  "winit",
 ]

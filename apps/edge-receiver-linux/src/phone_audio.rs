@@ -34,6 +34,7 @@ const PATH_TIMEOUT: Duration = Duration::from_secs(5);
 /// A running stream. Dropping it stops the stream and restores routing.
 pub(crate) struct PhoneAudio {
     pub generation: u64,
+    pub direction: AudioDirection,
     _task: AbortOnDropTask,
 }
 
@@ -63,6 +64,7 @@ pub(crate) fn start(
         frame,
         PhoneAudio {
             generation,
+            direction,
             _task: AbortOnDropTask(task),
         },
     )
