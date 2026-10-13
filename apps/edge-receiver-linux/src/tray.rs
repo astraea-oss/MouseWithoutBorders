@@ -538,10 +538,11 @@ impl ksni::Tray for ReceiverTray {
         let connected = self.state == TrayState::Connected;
         // The status rows open Settings, which also keeps them from being
         // greyed out like disabled rows.
+        let summary = self.summary();
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             StandardItem {
-                label: self.summary(),
-                icon_data: status_dot_png(self.icon_color()).to_vec(),
+                icon_data: tagged_png(status_dot_png(self.icon_color()), &summary),
+                label: summary,
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::OpenSettings);
                 }),
@@ -550,9 +551,10 @@ impl ksni::Tray for ReceiverTray {
             .into(),
         ];
         items.extend(self.phones.iter().map(|phone| {
+            let line = phone_line(phone);
             StandardItem {
-                label: phone_line(phone),
-                icon_data: menu_icon_png(MenuIcon::Phone).to_vec(),
+                icon_data: tagged_png(menu_icon_png(MenuIcon::Phone), &line),
+                label: line,
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.command_tx.send(TrayCommand::OpenSettings);
                 }),
@@ -1112,6 +1114,25 @@ fn menu_icon_png(icon: MenuIcon) -> &'static [u8] {
     })
 }
 
+/// The icon with the row's label written into it as a PNG text chunk.
+///
+/// Quickshell (0.3.2) applies a property update as if it listed every
+/// property, so changing just a row's label clears its icon. With the label
+/// inside the icon, a new label always arrives with the icon alongside it.
+fn tagged_png(png: &[u8], label: &str) -> Vec<u8> {
+    const IEND_LEN: usize = 12;
+    let (body, end) = png.split_at(png.len() - IEND_LEN);
+    let mut chunk = b"tEXt".to_vec();
+    chunk.extend_from_slice(b"Comment\0");
+    chunk.extend_from_slice(label.as_bytes());
+    let mut tagged = body.to_vec();
+    tagged.extend_from_slice(&((chunk.len() - 4) as u32).to_be_bytes());
+    tagged.extend_from_slice(&chunk);
+    tagged.extend_from_slice(&crc32fast::hash(&chunk).to_be_bytes());
+    tagged.extend_from_slice(end);
+    tagged
+}
+
 fn phone_line(phone: &TrayPhone) -> String {
     match phone.round_trip {
         Some(round_trip) => format!("{} · {}", phone.name, format_round_trip(round_trip)),
@@ -1329,6 +1350,15 @@ mod tests {
             panic!("status row is not a standard item");
         };
         assert!(status.enabled);
+        let mut slower = test_tray(TrayState::Connected).0;
+        slower.round_trip = Some(Duration::from_millis(40));
+        let ksni::MenuItem::Standard(slower) = &slower.menu()[0] else {
+            panic!("status row is not a standard item");
+        };
+        assert_ne!(
+            status.icon_data, slower.icon_data,
+            "a new label must bring the icon with it"
+        );
         let dot = image::load_from_memory(&status.icon_data)
             .unwrap()
             .to_rgba8();

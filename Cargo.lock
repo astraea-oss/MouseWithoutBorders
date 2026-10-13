@@ -988,6 +988,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
+ "crc32fast",
  "edge-audio",
  "edge-clipboard",
  "edge-common",
