@@ -156,7 +156,12 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   notification storage.
 - The first version uses complete staged snapshots rather than incremental event
   replay. Network queues are bounded and state writes run outside the KVM input
-  session. A notification worker failure/overflow disables notification sync for
+  session. Incoming snapshot frames are staged into one worker transaction with
+  a shared 32 MiB buffer budget, so a valid snapshot can exceed the 32-message
+  worker queue. Pending operations are sent once per connection and retried on
+  reconnect; snapshots and ACKs do not resubmit operations already in flight.
+  Duplicate operations, ACKs and unchanged snapshots avoid redundant state writes.
+  A notification worker failure/overflow disables notification sync for
   that session; reconnect after fixing the reported cause.
 - Storage is capped at 4,096 records including terminal markers, 1,024 pending
   operations, and 32 MiB serialized state. At capacity, notification operations

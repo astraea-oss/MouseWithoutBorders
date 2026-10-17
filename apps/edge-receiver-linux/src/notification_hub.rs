@@ -46,7 +46,7 @@ impl Store {
                 .iter()
                 .any(|op| op.key.origin != self.local_identity)
     }
-    fn apply(&mut self, sender: &str, operation: &NotificationOperation) -> Result<()> {
+    fn apply(&mut self, sender: &str, operation: &NotificationOperation) -> Result<bool> {
         validate_key(&operation.key)?;
         ensure!(
             operation.sequence > 0,
@@ -62,13 +62,15 @@ impl Store {
         if let Some(record) = self.records.iter_mut().find(|r| r.key == operation.key) {
             // Removal is terminal even if the source reconnects with stale state.
             if record.content.is_none() {
-                return Ok(());
+                return Ok(false);
             }
             if operation.content.is_none() || operation.sequence > record.source_sequence {
                 record.content = operation.content.clone();
                 if operation.content.is_some() {
                     record.source_sequence = operation.sequence;
                 }
+            } else {
+                return Ok(false);
             }
         } else {
             ensure!(
@@ -81,7 +83,7 @@ impl Store {
                 content: operation.content.clone(),
             });
         }
-        Ok(())
+        Ok(true)
     }
     fn view(&self) -> Vec<NotificationRecord> {
         let mut overlay = self.clone();
@@ -445,6 +447,7 @@ impl NotificationHub {
         self.clear_error();
         Some(NotificationLink {
             _activity: None,
+            sent_through: 0,
             hub: self.clone(),
             peer: peer.into(),
             changes,
@@ -615,6 +618,7 @@ impl Drop for Activity {
 
 pub struct NotificationLink {
     _activity: Option<Activity>,
+    sent_through: u64,
     hub: NotificationHub,
     peer: String,
     changes: watch::Receiver<u64>,
@@ -651,8 +655,15 @@ impl NotificationLink {
                     .extend(state.records.iter().cloned().map(NotificationSync::Record));
                 self.outgoing.push_back(NotificationSync::SnapshotEnd);
             } else {
-                self.outgoing
-                    .extend(state.pending.iter().cloned().map(NotificationSync::Submit));
+                for operation in &state.pending {
+                    if operation.sequence > self.sent_through {
+                        self.outgoing
+                            .push_back(NotificationSync::Submit(operation.clone()));
+                    }
+                }
+                if let Some(latest) = state.pending.iter().map(|op| op.sequence).max() {
+                    self.sent_through = self.sent_through.max(latest);
+                }
             }
         }
     }
@@ -675,11 +686,15 @@ impl NotificationLink {
             NotificationSync::Submit(operation) if self.hub.is_coordinator() => {
                 let mut state = self.hub.0.state.lock().await;
                 let mut next = state.clone();
-                next.apply(&self.peer, &operation)?;
-                self.hub.persist(&next).await?;
-                *state = next;
+                let changed = next.apply(&self.peer, &operation)?;
+                if changed {
+                    self.hub.persist(&next).await?;
+                    *state = next;
+                }
                 drop(state);
-                self.hub.publish();
+                if changed {
+                    self.hub.publish();
+                }
                 ensure!(
                     self.outgoing.len() < MAX_RECORDS + MAX_PENDING + 4,
                     "notification output queue full"
@@ -690,6 +705,9 @@ impl NotificationLink {
             }
             NotificationSync::Ack { sequence } if !self.hub.is_coordinator() => {
                 let mut state = self.hub.0.state.lock().await;
+                if !state.pending.iter().any(|op| op.sequence == sequence) {
+                    return Ok(());
+                }
                 let mut next = state.clone();
                 next.pending.retain(|op| op.sequence != sequence);
                 // Keep an acknowledged optimistic operation until the next full
@@ -736,6 +754,9 @@ impl NotificationLink {
                     .take()
                     .context("notification snapshot end without start")?;
                 let mut state = self.hub.0.state.lock().await;
+                if state.epoch == epoch && state.records == records {
+                    return Ok(());
+                }
                 let mut next = state.clone();
                 next.epoch = epoch;
                 next.records = records;
@@ -750,15 +771,108 @@ impl NotificationLink {
     }
 }
 
-/// Disk synchronization and snapshot assembly run outside the input session.
-/// Both directions are bounded; overload disables notification sync, never KVM.
+struct ByteBudget {
+    shared: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl ByteBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.shared
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= MAX_STORE_BYTES)
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("Notification snapshot buffer is full; reconnect to retry")
+            })?;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+impl Drop for ByteBudget {
+    fn drop(&mut self) {
+        self.shared.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+struct IncomingSnapshot {
+    epoch: String,
+    records: Vec<NotificationRecord>,
+    budget: ByteBudget,
+}
+enum IncomingNotification {
+    Event(NotificationSync),
+    Snapshot(IncomingSnapshot),
+}
+
+/// Snapshot frames are staged with bounded memory and constant work per frame.
+/// Validation and disk writes stay in the worker; KVM never waits for storage.
 pub struct SessionLink {
     hub: NotificationHub,
     outgoing: mpsc::Receiver<NotificationSync>,
-    incoming: mpsc::Sender<NotificationSync>,
+    incoming: mpsc::Sender<IncomingNotification>,
+    staged: Option<IncomingSnapshot>,
+    buffered_bytes: Arc<AtomicUsize>,
     _worker: AbortOnDropTask,
 }
 impl SessionLink {
+    fn enqueue(&mut self, event: NotificationSync) -> Result<()> {
+        let request = match event {
+            NotificationSync::SnapshotStart { epoch } => {
+                ensure!(self.staged.is_none(), "nested notification snapshot");
+                ensure!(epoch.len() == 32, "invalid notification snapshot epoch");
+                self.staged = Some(IncomingSnapshot {
+                    epoch,
+                    records: Vec::new(),
+                    budget: ByteBudget {
+                        shared: self.buffered_bytes.clone(),
+                        bytes: 0,
+                    },
+                });
+                return Ok(());
+            }
+            NotificationSync::Record(record) => {
+                let snapshot = self
+                    .staged
+                    .as_mut()
+                    .context("notification record outside snapshot")?;
+                ensure!(
+                    snapshot.records.len() < MAX_RECORDS,
+                    "notification snapshot too large"
+                );
+                let bytes = record.key.origin.len()
+                    + record.key.instance.len()
+                    + 256
+                    + record.content.as_ref().map_or(0, |c| {
+                        c.app_name.len() + c.title.len() + c.body.len() + c.icon.len()
+                    });
+                snapshot.budget.reserve(bytes)?;
+                snapshot.records.push(record);
+                return Ok(());
+            }
+            NotificationSync::SnapshotEnd => IncomingNotification::Snapshot(
+                self.staged
+                    .take()
+                    .context("notification snapshot end without start")?,
+            ),
+            event => {
+                ensure!(
+                    self.staged.is_none(),
+                    "notification control interrupted a snapshot"
+                );
+                IncomingNotification::Event(event)
+            }
+        };
+        self.incoming
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("Notification worker queue is full; reconnect to retry")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("Notification worker stopped; reconnect to retry")
+                }
+            })
+    }
     pub fn spawn(mut link: NotificationLink) -> Self {
         let (incoming, mut requests) = mpsc::channel(32);
         let (replies, outgoing) = mpsc::channel(32);
@@ -769,7 +883,20 @@ impl SessionLink {
                     biased;
                     event = requests.recv() => {
                         let Some(event) = event else { break; };
-                        if let Err(error) = link.receive(event).await {
+                        let received = async {
+                            match event {
+                                IncomingNotification::Event(event) => link.receive(event).await,
+                                IncomingNotification::Snapshot(snapshot) => {
+                                    link.receive(NotificationSync::SnapshotStart { epoch: snapshot.epoch }).await?;
+                                    for record in snapshot.records { link.receive(NotificationSync::Record(record)).await?; }
+                                    // Keep the budget until the snapshot has committed.
+                                    let result = link.receive(NotificationSync::SnapshotEnd).await;
+                                    drop(snapshot.budget);
+                                    result
+                                }
+                            }
+                        }.await;
+                        if let Err(error) = received {
                             link.hub.record_error(&error.to_string());
                             tracing::warn!(%error, "notification sync worker stopped");
                             break;
@@ -785,6 +912,8 @@ impl SessionLink {
             hub,
             incoming,
             outgoing,
+            staged: None,
+            buffered_bytes: Arc::default(),
             _worker: AbortOnDropTask(worker),
         }
     }
@@ -804,12 +933,10 @@ pub async fn next(link: &mut Option<SessionLink>) -> NotificationSync {
 }
 pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
     if let Some(session) = link
-        && session.incoming.try_send(event).is_err()
+        && let Err(error) = session.enqueue(event)
     {
-        session
-            .hub
-            .record_error("Notification queue full or closed; reconnect to retry");
-        tracing::warn!("notification queue full/closed; notifications disabled for session");
+        session.hub.record_error(&error.to_string());
+        tracing::warn!(%error, "notification reception stopped; notifications disabled for session");
         *link = None;
     }
 }
@@ -817,6 +944,142 @@ pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn snapshots_larger_than_the_worker_queue_survive_a_burst_while_storage_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = edge_crypto::fingerprint(&[1; 32]);
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: a.clone(),
+                peers: vec![a.clone()],
+            },
+            &b,
+            "Lua",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut session = Some(SessionLink::spawn(service.hub.link(&a, true).unwrap()));
+        let budget = session.as_ref().unwrap().buffered_bytes.clone();
+        let busy = service.hub.0.state.lock().await;
+        receive(
+            &mut session,
+            NotificationSync::Settings {
+                coordinator: a.clone(),
+            },
+        )
+        .await;
+        receive(
+            &mut session,
+            NotificationSync::SnapshotStart {
+                epoch: "1".repeat(32),
+            },
+        )
+        .await;
+        for i in 0..96 {
+            receive(
+                &mut session,
+                NotificationSync::Record(NotificationRecord {
+                    key: NotificationKey {
+                        origin: a.clone(),
+                        instance: format!("burst/{i}"),
+                    },
+                    source_sequence: i + 1,
+                    content: Some(content()),
+                }),
+            )
+            .await;
+            assert!(
+                session.is_some(),
+                "a valid snapshot overflowed the transport at record {i}"
+            );
+        }
+        receive(&mut session, NotificationSync::SnapshotEnd).await;
+        assert!(session.is_some());
+        assert!(budget.load(Ordering::Relaxed) > 0);
+        drop(busy);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if service.hub.0.state.lock().await.records.len() == 96
+                    && budget.load(Ordering::Relaxed) == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.hub.0.error.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_ack_changes_do_not_resubmit_operations_already_sent_on_this_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = edge_crypto::fingerprint(&[1; 32]);
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: a.clone(),
+                peers: vec![a.clone()],
+            },
+            &b,
+            "Lua",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let key = NotificationKey {
+            origin: b,
+            instance: "local/1".into(),
+        };
+        service
+            .hub
+            .local(key.clone(), Some(content()))
+            .await
+            .unwrap();
+        let mut link = service.hub.link(&a, true).unwrap();
+        assert!(matches!(
+            link.next().await,
+            NotificationSync::Settings { .. }
+        ));
+        link.receive(NotificationSync::Settings {
+            coordinator: a.clone(),
+        })
+        .await
+        .unwrap();
+        let NotificationSync::Submit(first) = link.next().await else {
+            panic!("missing first operation")
+        };
+        service.hub.publish();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), link.next())
+                .await
+                .is_err()
+        );
+        let mut update = content();
+        update.title = "Updated".into();
+        service.hub.local(key, Some(update)).await.unwrap();
+        let NotificationSync::Submit(second) = link.next().await else {
+            panic!("missing new operation")
+        };
+        assert!(second.sequence > first.sequence);
+        let mut reconnect = service.hub.link(&a, true).unwrap();
+        reconnect.next().await;
+        reconnect
+            .receive(NotificationSync::Settings { coordinator: a })
+            .await
+            .unwrap();
+        assert!(
+            matches!(reconnect.next().await, NotificationSync::Submit(op) if op.sequence == second.sequence)
+        );
+    }
+
     #[tokio::test]
     async fn mismatched_owners_are_rejected_before_any_history_is_sent() {
         let dir = tempfile::tempdir().unwrap();
