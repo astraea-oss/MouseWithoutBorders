@@ -31,6 +31,8 @@ libc = "0.2"
 image.workspace = true
 qrcode = { version = "0.14", default-features = false }
 sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 socket2 = { version = "0.6.4", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true

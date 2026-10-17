@@ -181,6 +181,48 @@ pub(crate) struct FreedesktopNotifications {
 }
 
 impl FreedesktopNotifications {
+    pub async fn close_shared(&self, id: u32) -> Result<()> {
+        self.close(id).await
+    }
+
+    pub async fn show_shared(
+        &self,
+        key: &edge_protocol::NotificationKey,
+        content: &edge_protocol::SharedNotification,
+        replaces: u32,
+        _local_name: &str,
+    ) -> Result<u32> {
+        let mut hints: HashMap<&str, Value> = HashMap::new();
+        let key_json = serde_json::to_string(key)?;
+        hints.insert("x-edge-kvm-key", Value::from(key_json.as_str()));
+        // Strings avoid JavaScript's integer precision limit.
+        let posted = content.posted_ms.to_string();
+        hints.insert("x-edge-kvm-posted-ms", Value::from(posted.as_str()));
+        hints.insert("x-edge-kvm-replay", Value::from(true));
+        hints.insert("suppress-sound", Value::from(true));
+        hints.insert("urgency", Value::from(content.urgency));
+        let reply = self
+            .connection
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "Notify",
+                &(
+                    content.app_name.as_str(),
+                    replaces,
+                    content.icon.as_str(),
+                    content.title.as_str(),
+                    content.body.as_str(),
+                    Vec::<&str>::new(),
+                    hints,
+                    0_i32,
+                ),
+            )
+            .await?;
+        Ok(reply.body().deserialize::<u32>()?)
+    }
+
     pub async fn connect(icon_dir: PathBuf) -> Result<Self> {
         let connection = zbus::Connection::session()
             .await
@@ -211,6 +253,8 @@ impl Desktop for FreedesktopNotifications {
         };
         let mut hints: HashMap<&str, Value> = HashMap::new();
         hints.insert("category", Value::from("im.received"));
+        // Legacy phone mirroring has no onward-sharing permission yet.
+        hints.insert("x-edge-kvm-phone", Value::from(true));
         if !icon.is_empty() {
             hints.insert("image-path", Value::from(icon.as_str()));
         }

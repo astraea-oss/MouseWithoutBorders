@@ -143,6 +143,7 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Error(_) => PhoneFrame::Error,
         Frame::Clipboard(_) => PhoneFrame::Clipboard,
         Frame::Notification(_) => PhoneFrame::Notification,
+        Frame::NotificationSync(_) => PhoneFrame::NotAllowed("NotificationSync"),
         Frame::Phone(PhoneEvent::PairRequest { token }) => PhoneFrame::PairRequest(token.clone()),
         Frame::Phone(PhoneEvent::Unpair) => PhoneFrame::Unpair,
         Frame::Phone(PhoneEvent::PairAccepted) => PhoneFrame::NotAllowed("PairAccepted"),

@@ -86,6 +86,7 @@ mod acceptor;
 mod clipboard_hub;
 mod control;
 mod control_link;
+mod notification_hub;
 mod notifications;
 mod phone;
 mod phone_audio;
@@ -488,6 +489,7 @@ struct LinuxPeerConnection {
     peer_supports_audio_playback: bool,
     peer_supports_audio_route: bool,
     peer_supports_images: bool,
+    peer_supports_notifications: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -532,7 +534,15 @@ async fn connect_linux_peer(
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
                 AUDIO_ROUTE_EXTENSION.to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                config
+                    .notifications
+                    .enabled
+                    .then(|| edge_protocol::NOTIFICATION_SYNC_EXTENSION.to_string()),
+            )
+            .collect(),
             node_capabilities: vec![
                 NodeCapability::InputCaptureV1,
                 NodeCapability::InputInjectV1,
@@ -704,6 +714,10 @@ async fn connect_linux_peer(
         newly_paired,
         local_name: config.device_name.clone(),
         local_fingerprint,
+        peer_supports_notifications: hello
+            .extensions
+            .iter()
+            .any(|extension| extension == edge_protocol::NOTIFICATION_SYNC_EXTENSION),
         peer_name: hello.device_name,
         peer_fingerprint,
         peer_ip,
@@ -751,6 +765,7 @@ async fn run_linux_controller_session(
     connector_pause: &AtomicBool,
     log_path: &Path,
     clipboard_changes: Option<ClipboardChanges>,
+    mut notification_link: Option<notification_hub::SessionLink>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
     replaced: &Notify,
 ) -> Result<ControllerSessionExit> {
@@ -774,6 +789,7 @@ async fn run_linux_controller_session(
         peer_supports_audio_playback,
         peer_supports_audio_route,
         peer_supports_images,
+        peer_supports_notifications: _,
     } = connection;
     if let Some(info) = &peer_screen_info {
         tracing::info!(
@@ -1453,6 +1469,9 @@ async fn run_linux_controller_session(
                         }
                     }
                 }
+                event = notification_hub::next(&mut notification_link) => {
+                    write_secure_frame_writer(&mut writer, &Frame::NotificationSync(event)).await?;
+                }
                 frame = frame_rx.recv() => {
                     let frame = frame.context("Linux peer frame reader ended")??;
                     peer_liveness.observe_authenticated_frame(tokio::time::Instant::now());
@@ -1472,6 +1491,7 @@ async fn run_linux_controller_session(
                     }
                     writer.record_received(&frame);
                     match frame {
+                        Frame::NotificationSync(event) => notification_hub::receive(&mut notification_link, event).await,
                         Frame::Heartbeat(heartbeat) => {
                             if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
                                 write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
@@ -2377,6 +2397,25 @@ async fn run_node(
 
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
     let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
+    let notification_service = notification_hub::NotificationHub::start(
+        &config.notifications,
+        &identity.fingerprint(),
+        &config.device_name,
+        &state_dir.join("notifications"),
+    )
+    .await;
+    let notification_service = match notification_service {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::warn!(%error, "notification synchronization unavailable");
+            append_portable_log(
+                &log_path,
+                format!("notification synchronization unavailable: {error:#}"),
+            );
+            None
+        }
+    };
+    let notification_hub = notification_service.as_ref().map(|service| &service.hub);
     let pins_path = state_dir.join("pins.toml");
     let (mut phones, _control) = start_phone_sessions(
         &config,
@@ -2605,6 +2644,7 @@ async fn run_node(
                     }
                     let replaced = Notify::new();
                     let exit = {
+                        let notification_link = notification_hub.and_then(|hub| hub.link(&connection.peer_fingerprint, connection.peer_supports_notifications).map(notification_hub::SessionLink::spawn));
                         let session = run_linux_controller_session(
                             connection,
                             &config,
@@ -2614,6 +2654,7 @@ async fn run_node(
                             &connector_pause,
                             &log_path,
                             clipboard_hub.as_ref().map(ClipboardHub::subscribe),
+                            notification_link,
                             &mut capture,
                             &replaced,
                         );
@@ -2729,7 +2770,15 @@ async fn run_node(
                     INPUT_TOGGLE_EXTENSION.to_string(),
                     PAIRING_CONFIRMATION_EXTENSION.to_string(),
                     AUDIO_ROUTE_EXTENSION.to_string(),
-                ],
+                ]
+                .into_iter()
+                .chain(
+                    config
+                        .notifications
+                        .enabled
+                        .then(|| edge_protocol::NOTIFICATION_SYNC_EXTENSION.to_string()),
+                )
+                .collect(),
                 node_capabilities: vec![
                     NodeCapability::InputCaptureV1,
                     NodeCapability::InputInjectV1,
@@ -2963,6 +3012,15 @@ async fn run_node(
                 &hello.device_name,
                 &replaced,
                 clipboard_hub.as_ref().map(ClipboardHub::subscribe),
+                notification_hub.and_then(|hub| {
+                    hub.link(
+                        &peer_fingerprint,
+                        hello.extensions.iter().any(|extension| {
+                            extension == edge_protocol::NOTIFICATION_SYNC_EXTENSION
+                        }),
+                    )
+                    .map(notification_hub::SessionLink::spawn)
+                }),
                 #[cfg(target_os = "linux")]
                 &mut capture,
             );
@@ -3551,6 +3609,7 @@ async fn handle_controller(
     controller_name: &str,
     replaced: &Notify,
     clipboard_changes: Option<ClipboardChanges>,
+    mut notification_link: Option<notification_hub::SessionLink>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
@@ -4125,11 +4184,15 @@ async fn handle_controller(
                     }
                 }
             }
+            event = notification_hub::next(&mut notification_link) => {
+                write_secure_frame_writer(&mut writer, &Frame::NotificationSync(event)).await?;
+            }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
                 controller_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 writer.record_received(&frame);
                 match frame {
+                    Frame::NotificationSync(event) => notification_hub::receive(&mut notification_link, event).await,
                     Frame::Input(input) => {
                         if input.role_epoch != role_epoch {
                             tracing::debug!(

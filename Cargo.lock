@@ -1006,6 +1006,8 @@ dependencies = [
  "ksni",
  "libc",
  "qrcode",
+ "serde",
+ "serde_json",
  "sha2",
  "socket2",
  "tempfile",
