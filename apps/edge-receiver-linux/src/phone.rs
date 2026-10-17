@@ -663,10 +663,26 @@ impl PhoneSessions {
         if let Some(tray) = &self.tray {
             tray.phone_disconnected(removed.fingerprint.clone()).await;
         }
-        if let (Some(desktop), Some(mirror)) =
-            (&self.desktop, self.mirrors.remove(&removed.fingerprint))
-        {
-            mirror.lock().await.close_all(desktop.as_ref()).await;
+        let cache = edge_common::default_state_dir()
+            .join("phone-notifications")
+            .join(format!("{}.json", removed.fingerprint.replace(':', "")));
+        if let Some(desktop) = &self.desktop {
+            let mirror = self
+                .mirrors
+                .remove(&removed.fingerprint)
+                .unwrap_or_default();
+            let mut mirror = mirror.lock().await;
+            if let Err(error) = mirror.restore(desktop.as_ref(), &cache).await {
+                tracing::warn!(%error, "couldn't restore phone notification identities for removal");
+            }
+            mirror.close_all(desktop.as_ref()).await;
+        }
+        match tokio::fs::remove_file(cache).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "couldn't remove unpaired phone notification cache")
+            }
         }
         Ok(true)
     }
@@ -790,6 +806,21 @@ async fn run_phone_session(
             .allowed_features
             .contains(&PhoneFeature::Notifications)
     });
+    if let Some(notifications) = &notifications {
+        let path = context
+            .state_dir
+            .join("phone-notifications")
+            .join(format!("{}.json", context.fingerprint.replace(':', "")));
+        if let Err(error) = notifications
+            .mirror
+            .lock()
+            .await
+            .restore(notifications.desktop.as_ref(), &path)
+            .await
+        {
+            tracing::warn!(%error, phone = %context.name, "couldn't restore phone notification identities");
+        }
+    }
     let mut clipboard = match context.clipboard {
         Some(source) if clipboard_allowed => {
             match PhoneClipboard::start(source, context.clipboard_images).await {

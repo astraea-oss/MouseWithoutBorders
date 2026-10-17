@@ -576,40 +576,30 @@ impl SettingsApp {
             return;
         };
         let active_peer = self.live.status.as_ref().and_then(|s| s.peer.as_deref());
+        let local_name = self.editor.device_name.clone();
         grid(ui, "notification_sharing", |ui| {
             row_label(ui, "Shared history");
             let config = &mut self.editor.notifications;
             if toggle(ui, &mut config.enabled).changed() && config.enabled {
-                if config.peers.is_empty()
-                    && let Some(peer) = setup
-                        .computers
-                        .iter()
-                        .find(|p| Some(p.name.as_str()) == active_peer)
-                        .or_else(|| (setup.computers.len() == 1).then(|| &setup.computers[0]))
-                {
-                    config.peers.push(peer.fingerprint.clone());
-                }
-                if config.coordinator_fingerprint.is_empty() {
-                    config.coordinator_fingerprint = config
-                        .peers
-                        .iter()
-                        .chain(std::iter::once(&setup.identity))
-                        .min()
-                        .cloned()
-                        .unwrap_or_default();
-                }
+                select_notification_peer(config, &setup, active_peer);
             }
             ui.end_row();
 
             if config.enabled {
                 row_label(ui, "Share with");
+                let choices = notification_choices(&setup, active_peer, &config.peers);
                 ui.vertical(|ui| {
-                    if setup.computers.is_empty() {
-                        ui.label("Pair another computer first.");
+                    if choices.is_empty() {
+                        ui.label("Connect or choose a saved pairing below.");
                     }
-                    for computer in &setup.computers {
+                    for computer in &choices {
                         let mut enrolled = config.peers.contains(&computer.fingerprint);
-                        if ui.checkbox(&mut enrolled, &computer.name).changed() {
+                        let label = if Some(computer.name.as_str()) == active_peer {
+                            format!("{} · connected", computer.name)
+                        } else {
+                            computer.name.clone()
+                        };
+                        if ui.checkbox(&mut enrolled, label).changed() {
                             if enrolled {
                                 config.peers.push(computer.fingerprint.clone());
                             } else {
@@ -617,12 +607,32 @@ impl SettingsApp {
                             }
                         }
                     }
+                    let others: Vec<_> = setup
+                        .computers
+                        .iter()
+                        .filter(|p| !choices.iter().any(|c| c.fingerprint == p.fingerprint))
+                        .collect();
+                    if !others.is_empty() {
+                        ui.collapsing(format!("Other saved pairings ({})", others.len()), |ui| {
+                            for computer in others {
+                                if ui
+                                    .small_button(format!(
+                                        "Add {} (offline pairing)",
+                                        computer.name
+                                    ))
+                                    .clicked()
+                                {
+                                    config.peers.push(computer.fingerprint.clone());
+                                }
+                            }
+                        });
+                    }
                 });
                 ui.end_row();
 
                 row_label(ui, "History stored on");
                 let owner = if config.coordinator_fingerprint == setup.identity {
-                    "This computer".to_owned()
+                    format!("{local_name} (this computer)")
                 } else {
                     setup
                         .computers
@@ -631,16 +641,23 @@ impl SettingsApp {
                         .map(|p| p.name.clone())
                         .unwrap_or_else(|| "Choose a computer".into())
                 };
+                let previous_owner = config.coordinator_fingerprint.clone();
                 ui.add_enabled_ui(!setup.has_store, |ui| {
                     egui::ComboBox::from_id_salt("notification_owner").selected_text(owner).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut config.coordinator_fingerprint, setup.identity.clone(), "This computer");
-                        for computer in &setup.computers {
-                            if config.peers.contains(&computer.fingerprint) {
-                                ui.selectable_value(&mut config.coordinator_fingerprint, computer.fingerprint.clone(), &computer.name);
-                            }
+                        ui.selectable_value(&mut config.coordinator_fingerprint, setup.identity.clone(), format!("{local_name} (this computer)"));
+                        // The connected computer is offered immediately, even
+                        // before selecting its sharing checkbox.
+                        for computer in notification_choices(&setup, active_peer, &config.peers) {
+                            ui.selectable_value(&mut config.coordinator_fingerprint, computer.fingerprint.clone(), &computer.name);
                         }
                     });
                 }).response.on_hover_text("Choose the same computer on both PCs. The owner is fixed once history is created.");
+                if previous_owner != config.coordinator_fingerprint
+                    && config.coordinator_fingerprint != setup.identity
+                    && !config.peers.contains(&config.coordinator_fingerprint)
+                {
+                    config.peers.push(config.coordinator_fingerprint.clone());
+                }
                 ui.end_row();
             }
 
@@ -834,6 +851,46 @@ impl eframe::App for SettingsApp {
 }
 
 /// Two columns: muted labels on the left, controls on the right.
+fn select_notification_peer(
+    config: &mut edge_common::NotificationConfig,
+    setup: &crate::NotificationSetup,
+    active_peer: Option<&str>,
+) {
+    if config.peers.is_empty()
+        && let Some(peer) = setup
+            .computers
+            .iter()
+            .find(|p| Some(p.name.as_str()) == active_peer)
+            .or_else(|| (setup.computers.len() == 1).then(|| &setup.computers[0]))
+    {
+        config.peers.push(peer.fingerprint.clone());
+    }
+    if config.coordinator_fingerprint.is_empty() {
+        config.coordinator_fingerprint = config
+            .peers
+            .iter()
+            .chain(std::iter::once(&setup.identity))
+            .min()
+            .cloned()
+            .unwrap_or_default();
+    }
+}
+
+fn notification_choices<'a>(
+    setup: &'a crate::NotificationSetup,
+    active_peer: Option<&str>,
+    enrolled: &[String],
+) -> Vec<&'a crate::NotificationComputer> {
+    let mut choices: Vec<_> = setup
+        .computers
+        .iter()
+        .filter(|p| Some(p.name.as_str()) == active_peer || enrolled.contains(&p.fingerprint))
+        .collect();
+    choices.sort_by_key(|p| (Some(p.name.as_str()) != active_peer, &p.name));
+    choices.dedup_by(|a, b| a.fingerprint == b.fingerprint);
+    choices
+}
+
 fn validate_notification_selection(
     config: &edge_common::NotificationConfig,
     setup: Option<&crate::NotificationSetup>,
@@ -1038,6 +1095,31 @@ mod tests {
                 !fail_install
             );
         }
+    }
+
+    #[test]
+    fn connected_computer_is_selected_and_available_as_owner_without_enrollment() {
+        let setup = crate::NotificationSetup {
+            identity: "local".into(),
+            computers: vec![
+                crate::NotificationComputer {
+                    name: "Main PC".into(),
+                    fingerprint: "old-key".into(),
+                },
+                crate::NotificationComputer {
+                    name: "Tera".into(),
+                    fingerprint: "current-key".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let choices = notification_choices(&setup, Some("Tera"), &[]);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].name, "Tera");
+        let mut config = edge_common::NotificationConfig::default();
+        select_notification_peer(&mut config, &setup, Some("Tera"));
+        assert_eq!(config.peers, ["current-key"]);
+        assert!(!config.peers.contains(&"old-key".to_string()));
     }
 
     #[test]

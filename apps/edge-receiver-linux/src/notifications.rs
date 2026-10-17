@@ -12,11 +12,12 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use edge_protocol::{NotificationEvent, PhoneNotification};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zbus::zvariant::Value;
 
@@ -31,10 +32,17 @@ pub(crate) struct DesktopNotification {
 
 /// The desktop's notification service.
 pub(crate) trait Desktop {
+    /// Session bus + notification daemon identity; numeric IDs only belong to this generation.
+    async fn generation(&self) -> Result<String>;
     /// Shows a notification, replacing `replaces` if it's non-zero. Returns
     /// the desktop's id for it.
-    async fn show(&self, notification: &DesktopNotification, replaces: u32) -> Result<u32>;
-    async fn close(&self, id: u32) -> Result<()>;
+    async fn show(
+        &self,
+        notification: &DesktopNotification,
+        replaces: u32,
+        generation: &str,
+    ) -> Result<u32>;
+    async fn close(&self, id: u32, generation: &str) -> Result<()>;
 }
 
 /// Turns a phone notification into what the desktop shows: limits enforced
@@ -64,6 +72,7 @@ pub(crate) fn desktop_notification(
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Shown {
     desktop_id: u32,
     digest: u64,
@@ -74,15 +83,97 @@ pub(crate) struct NotificationMirror {
     shown: HashMap<u64, Shown>,
     /// Phone ids posted since the current `SnapshotStart`.
     resent: Option<HashSet<u64>>,
+    owner: String,
+    path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedMirror {
+    owner: String,
+    shown: HashMap<u64, Shown>,
 }
 
 impl NotificationMirror {
+    /// Reuse retained desktop entries after a backend restart. This cache contains
+    /// only IDs and content digests, never notification text or icons.
+    pub async fn restore(&mut self, desktop: &impl Desktop, path: &Path) -> Result<()> {
+        if self.path.is_some() {
+            return Ok(());
+        }
+        let owner = desktop.generation().await?;
+        let saved = match tokio::fs::metadata(path).await {
+            Ok(meta) => {
+                anyhow::ensure!(
+                    meta.len() <= 1024 * 1024,
+                    "phone notification cache too large"
+                );
+                Some(serde_json::from_slice::<SavedMirror>(
+                    &tokio::fs::read(path).await?,
+                )?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(saved) = saved
+            && saved.owner == owner
+        {
+            self.shown = saved.shown;
+        }
+        self.owner = owner;
+        self.path = Some(path.into());
+        Ok(())
+    }
+
+    async fn sync_owner(&mut self, desktop: &impl Desktop) -> Result<()> {
+        let owner = desktop.generation().await?;
+        if self.owner != owner {
+            self.shown.clear();
+            self.resent = None;
+            self.owner = owner;
+        }
+        Ok(())
+    }
+
+    async fn persist(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let parent = path
+            .parent()
+            .context("phone notification cache directory")?;
+        tokio::fs::create_dir_all(parent).await?;
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+        let data =
+            serde_json::to_vec(&serde_json::json!({ "owner": self.owner, "shown": self.shown }))?;
+        anyhow::ensure!(
+            data.len() <= 1024 * 1024,
+            "phone notification cache too large"
+        );
+        let temporary = path.with_extension("pending");
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .await?;
+        file.write_all(&data).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(temporary, path).await?;
+        let parent = parent.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+        Ok(())
+    }
+
     pub async fn apply(
         &mut self,
         event: NotificationEvent,
         desktop: &impl Desktop,
         phone_name: &str,
     ) -> Result<()> {
+        self.sync_owner(desktop).await?;
         match event {
             NotificationEvent::Posted(notification) => {
                 if let Some(resent) = &mut self.resent {
@@ -95,13 +186,13 @@ impl NotificationMirror {
                     Some(existing) => existing.desktop_id,
                     None => 0,
                 };
-                let desktop_id = desktop.show(&shown, replaces).await?;
+                let desktop_id = desktop.show(&shown, replaces, &self.owner).await?;
                 self.shown
                     .insert(notification.id, Shown { desktop_id, digest });
             }
             NotificationEvent::Removed { id } => {
                 if let Some(shown) = self.shown.remove(&id) {
-                    desktop.close(shown.desktop_id).await?;
+                    desktop.close(shown.desktop_id, &self.owner).await?;
                 }
             }
             NotificationEvent::SnapshotStart => self.resent = Some(HashSet::new()),
@@ -117,20 +208,28 @@ impl NotificationMirror {
                     .collect();
                 for id in gone {
                     if let Some(shown) = self.shown.remove(&id) {
-                        desktop.close(shown.desktop_id).await?;
+                        desktop.close(shown.desktop_id, &self.owner).await?;
                     }
                 }
             }
         }
+        self.persist().await?;
         Ok(())
     }
 
     /// Closes everything this phone has on the desktop, e.g. after unpairing.
     pub async fn close_all(&mut self, desktop: &impl Desktop) {
+        // Never close a recycled numeric ID owned by a new daemon.
+        if self.sync_owner(desktop).await.is_err() {
+            return;
+        }
         for (_, shown) in self.shown.drain() {
-            desktop.close(shown.desktop_id).await.ok();
+            desktop.close(shown.desktop_id, &self.owner).await.ok();
         }
         self.resent = None;
+        if let Err(error) = self.persist().await {
+            tracing::warn!(%error, "couldn't save phone notification removals");
+        }
     }
 }
 
@@ -178,11 +277,12 @@ fn truncate_bytes(text: &str, max: usize) -> String {
 pub(crate) struct FreedesktopNotifications {
     connection: zbus::Connection,
     icon_dir: PathBuf,
+    bus_id: String,
 }
 
 impl FreedesktopNotifications {
     pub async fn close_shared(&self, id: u32) -> Result<()> {
-        self.close(id).await
+        self.close(id, &self.generation().await?).await
     }
 
     pub async fn show_shared(
@@ -227,9 +327,21 @@ impl FreedesktopNotifications {
         let connection = zbus::Connection::session()
             .await
             .context("no session bus for desktop notifications")?;
+        let bus_id: String = connection
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetId",
+                &(),
+            )
+            .await?
+            .body()
+            .deserialize()?;
         Ok(Self {
             connection,
             icon_dir,
+            bus_id,
         })
     }
 
@@ -246,7 +358,28 @@ impl FreedesktopNotifications {
 }
 
 impl Desktop for FreedesktopNotifications {
-    async fn show(&self, notification: &DesktopNotification, replaces: u32) -> Result<u32> {
+    async fn generation(&self) -> Result<String> {
+        let owner: String = self
+            .connection
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetNameOwner",
+                &("org.freedesktop.Notifications",),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        Ok(format!("{}/{}", self.bus_id, owner))
+    }
+
+    async fn show(
+        &self,
+        notification: &DesktopNotification,
+        replaces: u32,
+        generation: &str,
+    ) -> Result<u32> {
         let icon = match &notification.icon_png {
             Some(png) => self.icon_path(png).unwrap_or_default(),
             None => String::new(),
@@ -261,7 +394,12 @@ impl Desktop for FreedesktopNotifications {
         let reply = self
             .connection
             .call_method(
-                Some("org.freedesktop.Notifications"),
+                Some(
+                    generation
+                        .rsplit_once('/')
+                        .context("invalid notification daemon identity")?
+                        .1,
+                ),
                 "/org/freedesktop/Notifications",
                 Some("org.freedesktop.Notifications"),
                 "Notify",
@@ -281,10 +419,15 @@ impl Desktop for FreedesktopNotifications {
         Ok(reply.body().deserialize::<u32>()?)
     }
 
-    async fn close(&self, id: u32) -> Result<()> {
+    async fn close(&self, id: u32, generation: &str) -> Result<()> {
         self.connection
             .call_method(
-                Some("org.freedesktop.Notifications"),
+                Some(
+                    generation
+                        .rsplit_once('/')
+                        .context("invalid notification daemon identity")?
+                        .1,
+                ),
                 "/org/freedesktop/Notifications",
                 Some("org.freedesktop.Notifications"),
                 "CloseNotification",
@@ -305,13 +448,22 @@ mod tests {
     /// Records what would have been shown.
     #[derive(Default)]
     struct FakeDesktop {
+        owner: Mutex<String>,
         next_id: Mutex<u32>,
         shown: Mutex<HashMap<u32, DesktopNotification>>,
         calls: Mutex<Vec<String>>,
     }
 
     impl Desktop for FakeDesktop {
-        async fn show(&self, notification: &DesktopNotification, replaces: u32) -> Result<u32> {
+        async fn generation(&self) -> Result<String> {
+            Ok(self.owner.lock().unwrap().clone())
+        }
+        async fn show(
+            &self,
+            notification: &DesktopNotification,
+            replaces: u32,
+            _generation: &str,
+        ) -> Result<u32> {
             let id = if replaces == 0 {
                 let mut next = self.next_id.lock().unwrap();
                 *next += 1;
@@ -324,7 +476,7 @@ mod tests {
             Ok(id)
         }
 
-        async fn close(&self, id: u32) -> Result<()> {
+        async fn close(&self, id: u32, _generation: &str) -> Result<()> {
             self.calls.lock().unwrap().push(format!("close {id}"));
             self.shown.lock().unwrap().remove(&id);
             Ok(())
@@ -367,6 +519,98 @@ mod tests {
     ) {
         for event in events {
             mirror.apply(event, desktop, "Pixel").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_restart_reuses_phone_entries_without_merging_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache/phone.json");
+        let desktop = FakeDesktop::default();
+        *desktop.owner.lock().unwrap() = "bus-a/daemon-a".into();
+        let mut mirror = NotificationMirror::default();
+        mirror.restore(&desktop, &path).await.unwrap();
+        apply(
+            &mut mirror,
+            &desktop,
+            vec![posted(7, "Same text"), posted(8, "Same text")],
+        )
+        .await;
+        assert_eq!(desktop.titles().len(), 2);
+        desktop.calls();
+        drop(mirror);
+        let mut restored = NotificationMirror::default();
+        restored.restore(&desktop, &path).await.unwrap();
+        apply(
+            &mut restored,
+            &desktop,
+            vec![
+                NotificationEvent::SnapshotStart,
+                posted(7, "Same text"),
+                posted(8, "Same text"),
+                NotificationEvent::SnapshotEnd,
+            ],
+        )
+        .await;
+        assert!(desktop.calls().is_empty());
+        assert_eq!(desktop.titles().len(), 2);
+        apply(&mut restored, &desktop, vec![posted(7, "Updated")]).await;
+        assert_eq!(desktop.calls(), ["show 1"]);
+        assert_eq!(desktop.titles().len(), 2);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("Same text") && !saved.contains("Updated") && !saved.contains("hello")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_or_bus_restart_never_replaces_an_unrelated_recycled_id() {
+        for restart_backend in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("phone.json");
+            let desktop = FakeDesktop::default();
+            *desktop.owner.lock().unwrap() = "bus-a/daemon-a".into();
+            let mut mirror = NotificationMirror::default();
+            mirror.restore(&desktop, &path).await.unwrap();
+            apply(&mut mirror, &desktop, vec![posted(7, "Phone message")]).await;
+            *desktop.owner.lock().unwrap() = "bus-b/daemon-a".into();
+            *desktop.next_id.lock().unwrap() = 0;
+            desktop.shown.lock().unwrap().clear();
+            let unrelated = DesktopNotification {
+                app_name: "Other app".into(),
+                summary: "Keep me".into(),
+                body: String::new(),
+                icon_png: None,
+            };
+            desktop.show(&unrelated, 0, "bus-b/daemon-a").await.unwrap();
+            if restart_backend {
+                mirror = NotificationMirror::default();
+                mirror.restore(&desktop, &path).await.unwrap();
+            }
+            apply(
+                &mut mirror,
+                &desktop,
+                vec![
+                    NotificationEvent::SnapshotStart,
+                    posted(7, "Phone message"),
+                    NotificationEvent::SnapshotEnd,
+                ],
+            )
+            .await;
+            assert_eq!(desktop.titles(), ["Keep me", "Phone message"]);
         }
     }
 

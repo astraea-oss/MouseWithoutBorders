@@ -10,8 +10,10 @@ keeps its existing notification centre; edge-kvm adds no notification UI.
 Install the updated Linux build on each computer, then open **Settings →
 Notifications** from the tray:
 
-1. Turn on **Shared history** and select the paired computer by name.
-2. Choose the same computer under **History stored on** on both PCs. The initial
+1. Turn on **Shared history**. The connected computer is selected automatically;
+   older offline pairing records are under **Other saved pairings**.
+2. Choose the same computer under **History stored on** on both PCs. The connected
+   computer is available directly; selecting it also enrolls it for sharing. The initial
    default is deterministic for a pair, so the two computers agree without copying
    fingerprints. Choose the main PC before the first Save if it should own history.
 3. Press **Save**. The app installs its bundled bridge into the running Quickshell
@@ -158,6 +160,10 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   minimal terminal markers remain. Bodies are never logged. Icons use bounded
   theme names; remote image paths/URLs are not loaded.
 - Legacy phone notifications remain local and are excluded from PC sharing.
+  Their desktop ID mappings survive backend restarts in `state/phone-notifications/`,
+  with the session bus and notification daemon identity checked before reuse.
+  These files contain only IDs and digests. Existing duplicates created before
+  this cache was introduced cannot be safely identified from text alone.
   Stable mobile identities, onward-sharing permission, and phone-side dismissal
   require the next mobile protocol milestone.
 

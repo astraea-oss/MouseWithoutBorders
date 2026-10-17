@@ -1192,6 +1192,78 @@ mod tests {
                 .iter()
                 .any(|r| r.key == original_instance && r.content.is_some())
         );
+        drop(state);
+        // Phone snapshots must also remain idempotent across a backend restart
+        // and a Quickshell reload, without entering the shared desktop set.
+        use crate::notifications::{Desktop, NotificationMirror};
+        let desktop = FreedesktopNotifications::connect(root.join("phone-icons"))
+            .await
+            .unwrap();
+        let generation = desktop.generation().await.unwrap();
+        let phone = edge_protocol::PhoneNotification {
+            id: 42,
+            app_name: "Phone app".into(),
+            title: "Retained phone entry".into(),
+            body: "body".into(),
+            icon_png: None,
+            posted_ms: 1,
+        };
+        let path = root.join("phone-cache/identities.json");
+        let mut mirror = NotificationMirror::default();
+        mirror.restore(&desktop, &path).await.unwrap();
+        mirror
+            .apply(
+                edge_protocol::NotificationEvent::Posted(phone.clone()),
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
+        drop(mirror);
+        let mut mirror = NotificationMirror::default();
+        mirror.restore(&desktop, &path).await.unwrap();
+        mirror
+            .apply(
+                edge_protocol::NotificationEvent::SnapshotStart,
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        mirror
+            .apply(
+                edge_protocol::NotificationEvent::Posted(phone.clone()),
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        mirror
+            .apply(
+                edge_protocol::NotificationEvent::SnapshotEnd,
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
+        shell
+            .write_all(b"\n// phone identity reload\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(desktop.generation().await.unwrap(), generation);
+        mirror
+            .apply(
+                edge_protocol::NotificationEvent::Posted(phone),
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
+        assert_eq!(service.hub.0.state.lock().await.records.len(), 2);
         child.kill().await.unwrap();
     }
 }
