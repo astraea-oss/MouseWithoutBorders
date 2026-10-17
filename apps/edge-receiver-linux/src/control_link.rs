@@ -105,6 +105,21 @@ fn pairing_event(line: &str) -> Option<PhonePairingEvent> {
 }
 
 impl NodeLink for ControlLink {
+    fn notifications(&self) -> Option<edge_ui::NotificationSetup> {
+        let reply = self.request("notification-setup").ok()?;
+        let ("notifications", json) = split(reply.first()?) else {
+            return None;
+        };
+        serde_json::from_str(json).ok()
+    }
+
+    fn install_notification_bridge(&self, shell: &std::path::Path) -> Result<String> {
+        let setup = self
+            .notifications()
+            .context("Update and start edge-kvm before installing the bridge")?;
+        crate::notification_setup::install_bridge(shell, &setup.socket_path)
+    }
+
     fn status(&self) -> Option<NodeStatus> {
         self.request("status")
             .ok()

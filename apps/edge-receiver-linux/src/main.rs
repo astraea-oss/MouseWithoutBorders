@@ -87,6 +87,7 @@ mod clipboard_hub;
 mod control;
 mod control_link;
 mod notification_hub;
+mod notification_setup;
 mod notifications;
 mod phone;
 mod phone_audio;
@@ -2404,9 +2405,11 @@ async fn run_node(
         &state_dir.join("notifications"),
     )
     .await;
+    let mut notification_error = None;
     let notification_service = match notification_service {
         Ok(service) => service,
         Err(error) => {
+            notification_error = Some(format!("{error:#}"));
             tracing::warn!(%error, "notification synchronization unavailable");
             append_portable_log(
                 &log_path,
@@ -2424,6 +2427,18 @@ async fn run_node(
         clipboard_hub.as_ref(),
         tray.as_ref(),
         &log_path,
+        notification_setup::NotificationControl {
+            identity: identity.fingerprint(),
+            coordinator: config.notifications.coordinator_fingerprint.clone(),
+            configured_peer: (!config.peer.pinned_fingerprint.is_empty()).then(|| {
+                edge_ui::NotificationComputer {
+                    name: config.peer.name.clone(),
+                    fingerprint: config.peer.pinned_fingerprint.clone(),
+                }
+            }),
+            hub: notification_hub.cloned(),
+            error: notification_error,
+        },
     )
     .await;
     // A newer connection from the connected peer, waiting for its session to end.
@@ -3293,6 +3308,7 @@ enum ControllerSessionExit {
 /// Phone sessions, their control socket and desktop notifications. Both ends
 /// of a computer link accept phones, so this serves the waiting receiver and
 /// the connector alike.
+#[allow(clippy::too_many_arguments)]
 async fn start_phone_sessions(
     config: &AppConfig,
     identity: &IdentityKey,
@@ -3300,6 +3316,7 @@ async fn start_phone_sessions(
     clipboard_hub: Option<&ClipboardHub>,
     tray: Option<&ReceiverTrayHandle>,
     log_path: &Path,
+    notifications: notification_setup::NotificationControl,
 ) -> (PhoneSessions, Option<AbortOnDropTask>) {
     let mut phones = PhoneSessions::new(
         LocalHello {
@@ -3317,7 +3334,8 @@ async fn start_phone_sessions(
     if let Some(tray) = tray {
         phones.set_tray(tray.clone()).await;
     }
-    let control = control::spawn_server(phones.requests(), tray.cloned(), log_path).await;
+    let control =
+        control::spawn_server(phones.requests(), tray.cloned(), log_path, notifications).await;
     match control::socket_path() {
         Some(control) => {
             let icons = control.with_file_name("phone-icons");

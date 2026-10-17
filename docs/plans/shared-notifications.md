@@ -298,3 +298,15 @@ Manual acceptance on Tera and Luna:
 These API references were checked while writing the plan. Confirm compatibility
 with both installed Quickshell versions in milestone 1; the dotfiles snapshot is
 a behavioural baseline, not evidence that either machine runs a particular API version.
+
+
+### Settings integration
+
+The existing compact settings window now owns enrollment, history owner selection,
+Quickshell bridge installation/update and live health. Saving an enabled setup
+installs the bundled no-UI bridge with shell backups before saving the config;
+existing settings restart handling applies the change. Paired computer names
+replace manual fingerprints. Existing-store ownership changes are refused.
+Reviewed Tera and updated Ember shells are supported; unknown layouts are left
+untouched and reported in the settings window. A two-PC physical acceptance run
+still follows deployment of the updated build on both devices.

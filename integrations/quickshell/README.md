@@ -5,7 +5,41 @@ explicitly enrolled Linux PCs over their existing encrypted edge-kvm connection.
 One configured PC is the authority, independent of input direction. Quickshell
 keeps its existing notification centre; edge-kvm adds no notification UI.
 
-## Enable on both computers
+## Set up in the existing settings window
+
+Install the updated Linux build on each computer, then open **Settings →
+Notifications** from the tray:
+
+1. Turn on **Shared history** and select the paired computer by name.
+2. Choose the same computer under **History stored on** on both PCs. The initial
+   default is deterministic for a pair, so the two computers agree without copying
+   fingerprints. Choose the main PC before the first Save if it should own history.
+3. Press **Save**. The app installs its bundled bridge into the running Quickshell
+   configuration, backs up changed shell files, saves enrollment and restarts
+   edge-kvm. Quickshell picks up the configuration change through its normal reload.
+
+The settings page reports bridge readiness, whether a sharing link is connected,
+retained notification count, queued operations and errors. **Update bridge**
+refreshes an existing integration after upgrading the app. If multiple shell
+configurations are running or no shell can be detected, choose `shell.qml` in that
+same settings page. The installer supports the reviewed Tera notification centre
+and the updated Ember laptop centre; an unfamiliar layout is rejected before
+modifying shell files or enabling sharing. It never installs a separate notification
+centre. DND remains local, and phone notifications remain local in this milestone.
+
+Once a notification store exists, its owner is fixed in the settings UI. Disabling
+sharing preserves its identity and history so it can be enabled again safely.
+
+For an existing service installation, upgrading is:
+
+```bash
+cargo build --release -p edge-receiver-linux
+./scripts/install-linux-receiver.sh
+```
+
+The installer preserves an existing config, device identity and pairings.
+
+## Manual configuration (advanced)
 
 Build and deploy the same updated Linux binary on both computers. Keep their
 existing identities and pairings. Copy the fingerprints from their pairing/status

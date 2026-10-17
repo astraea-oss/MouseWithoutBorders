@@ -12,7 +12,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -130,6 +133,10 @@ struct Inner {
     path: PathBuf,
     state: Mutex<Store>,
     changed: watch::Sender<u64>,
+    bridges: Arc<AtomicUsize>,
+    links: Arc<AtomicUsize>,
+    error: std::sync::Mutex<Option<String>>,
+    bridge_error: std::sync::Mutex<Option<String>>,
 }
 pub struct NotificationService {
     pub hub: NotificationHub,
@@ -220,6 +227,10 @@ impl NotificationHub {
             path,
             state: Mutex::new(store),
             changed,
+            bridges: Arc::default(),
+            links: Arc::default(),
+            error: std::sync::Mutex::new(None),
+            bridge_error: std::sync::Mutex::new(None),
         }));
         hub.persist(&*hub.0.state.lock().await).await?;
         let worker = hub.clone();
@@ -235,6 +246,9 @@ impl NotificationHub {
                 // Exactly one shell bridge. It can reconnect after EOF; bounded
                 // writes prevent a stalled client from monopolizing the endpoint.
                 if let Err(error) = worker.bridge(stream).await {
+                    if let Ok(mut stored) = worker.0.bridge_error.lock() {
+                        *stored = Some(error.to_string());
+                    }
                     tracing::warn!(%error, "notification bridge disconnected");
                 }
             }
@@ -244,6 +258,39 @@ impl NotificationHub {
             hub,
             _bridge: AbortOnDropTask(task),
         }))
+    }
+    pub async fn status(&self) -> String {
+        if let Some(error) = self.0.error.lock().ok().and_then(|e| e.clone()) {
+            return format!("Needs attention: {error}");
+        }
+        if let Some(error) = self.0.bridge_error.lock().ok().and_then(|e| e.clone()) {
+            return format!("Quickshell needs attention: {error}");
+        }
+        if self.0.bridges.load(Ordering::Relaxed) == 0 {
+            return "Waiting for Quickshell bridge — install or reload the integration".into();
+        }
+        if self.0.links.load(Ordering::Relaxed) == 0 {
+            return "Quickshell connected; waiting for the other PC to enable sharing and connect"
+                .into();
+        }
+        let state = self.0.state.lock().await;
+        let retained = state.view().iter().filter(|r| r.content.is_some()).count();
+        format!(
+            "Connected · {retained} notifications · {} queued",
+            state.pending.len()
+        )
+    }
+    fn record_error(&self, error: &str) {
+        if let Ok(mut stored) = self.0.error.lock()
+            && stored.is_none()
+        {
+            *stored = Some(error.to_owned());
+        }
+    }
+    fn clear_error(&self) {
+        if let Ok(mut stored) = self.0.error.lock() {
+            *stored = None;
+        }
     }
     fn is_coordinator(&self) -> bool {
         self.0.identity == self.0.config.coordinator_fingerprint
@@ -333,7 +380,9 @@ impl NotificationHub {
         }
         let mut changes = self.0.changed.subscribe();
         changes.mark_changed();
+        self.clear_error();
         Some(NotificationLink {
+            _activity: Activity::new(self.0.links.clone()),
             hub: self.clone(),
             peer: peer.into(),
             changes,
@@ -346,6 +395,10 @@ impl NotificationHub {
     async fn bridge(&self, stream: UnixStream) -> Result<()> {
         let desktop =
             FreedesktopNotifications::connect(self.0.path.with_file_name("icons")).await?;
+        if let Ok(mut stored) = self.0.bridge_error.lock() {
+            *stored = None;
+        }
+        let _activity = Activity::new(self.0.bridges.clone());
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut changes = self.0.changed.subscribe();
@@ -483,7 +536,21 @@ enum BridgeMessage {
     End,
 }
 
+struct Activity(Arc<AtomicUsize>);
+impl Activity {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for Activity {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct NotificationLink {
+    _activity: Activity,
     hub: NotificationHub,
     peer: String,
     changes: watch::Receiver<u64>,
@@ -603,6 +670,7 @@ impl NotificationLink {
 /// Disk synchronization and snapshot assembly run outside the input session.
 /// Both directions are bounded; overload disables notification sync, never KVM.
 pub struct SessionLink {
+    hub: NotificationHub,
     outgoing: mpsc::Receiver<NotificationSync>,
     incoming: mpsc::Sender<NotificationSync>,
     _worker: AbortOnDropTask,
@@ -611,6 +679,7 @@ impl SessionLink {
     pub fn spawn(mut link: NotificationLink) -> Self {
         let (incoming, mut requests) = mpsc::channel(32);
         let (replies, outgoing) = mpsc::channel(32);
+        let hub = link.hub.clone();
         let worker = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -618,6 +687,7 @@ impl SessionLink {
                     event = requests.recv() => {
                         let Some(event) = event else { break; };
                         if let Err(error) = link.receive(event).await {
+                            link.hub.record_error(&error.to_string());
                             tracing::warn!(%error, "notification sync worker stopped");
                             break;
                         }
@@ -629,6 +699,7 @@ impl SessionLink {
             }
         });
         Self {
+            hub,
             incoming,
             outgoing,
             _worker: AbortOnDropTask(worker),
@@ -640,6 +711,9 @@ pub async fn next(link: &mut Option<SessionLink>) -> NotificationSync {
         if let Some(event) = session.outgoing.recv().await {
             return event;
         }
+        session
+            .hub
+            .record_error("Notification session stopped; reconnect to retry");
         tracing::warn!("notification worker ended; notifications disabled for session");
         *link = None;
     }
@@ -649,6 +723,9 @@ pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
     if let Some(session) = link
         && session.incoming.try_send(event).is_err()
     {
+        session
+            .hub
+            .record_error("Notification queue full or closed; reconnect to retry");
         tracing::warn!("notification queue full/closed; notifications disabled for session");
         *link = None;
     }
@@ -657,6 +734,41 @@ pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn settings_status_follows_connections_and_keeps_the_original_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = edge_crypto::fingerprint(&[1; 32]);
+        let peer = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: identity.clone(),
+                peers: vec![peer.clone()],
+            },
+            &identity,
+            "Main",
+            directory.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let hub = &service.hub;
+        assert!(hub.status().await.contains("Waiting for Quickshell"));
+        let bridge = Activity::new(hub.0.bridges.clone());
+        assert!(hub.status().await.contains("waiting for the other PC"));
+        let link = hub.link(&peer, true).unwrap();
+        assert!(hub.status().await.starts_with("Connected"));
+        hub.record_error("coordinator store reset; explicit recovery required");
+        hub.record_error("Notification session stopped");
+        assert!(hub.status().await.contains("coordinator store reset"));
+        drop(link);
+        let link = hub.link(&peer, true).unwrap();
+        assert!(hub.status().await.starts_with("Connected"));
+        drop(link);
+        drop(bridge);
+        assert!(hub.status().await.contains("Waiting for Quickshell"));
+    }
+
     fn key() -> NotificationKey {
         NotificationKey {
             origin: edge_crypto::fingerprint(&[1; 32]),

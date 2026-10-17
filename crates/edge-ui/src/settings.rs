@@ -49,6 +49,7 @@ struct Editor {
     audio_route: AudioRoutePreference,
     audio_play_local: bool,
     jitter_target_ms: u32,
+    notifications: edge_common::NotificationConfig,
 }
 
 impl Editor {
@@ -82,6 +83,7 @@ impl Editor {
             }),
             audio_play_local: config.audio.local_playback == AudioLocalPlayback::Mirror,
             jitter_target_ms: config.audio.jitter_target_ms,
+            notifications: config.notifications.clone(),
         }
     }
 
@@ -110,6 +112,7 @@ impl Editor {
             AudioLocalPlayback::Redirect
         };
         config.audio.jitter_target_ms = self.jitter_target_ms;
+        config.notifications = self.notifications.clone();
         let host = self.peer_host.trim();
         if connector_only || !host.is_empty() {
             validate_host(host)?;
@@ -138,6 +141,7 @@ struct Live {
     status: Option<NodeStatus>,
     phones: Option<Vec<PhoneEntry>>,
     autostart: Option<bool>,
+    notifications: Option<crate::NotificationSetup>,
 }
 
 pub(crate) struct SettingsApp {
@@ -155,6 +159,7 @@ pub(crate) struct SettingsApp {
     phone_pairing: Option<PhonePairing>,
     confirm_remove: Option<String>,
     message: Option<(String, bool)>,
+    shell_path: String,
     result: Arc<Mutex<SettingsUiResult>>,
 }
 
@@ -178,6 +183,7 @@ impl SettingsApp {
             phone_pairing: None,
             confirm_remove: None,
             message: None,
+            shell_path: String::new(),
             original: input.config,
             result,
         }
@@ -205,10 +211,48 @@ impl SettingsApp {
         self.live.status = link.status();
         self.live.phones = link.phones();
         self.live.autostart = link.autostart();
+        self.live.notifications = link.notifications();
+        if self.shell_path.is_empty()
+            && let Some(path) = self
+                .live
+                .notifications
+                .as_ref()
+                .and_then(|s| s.shell_path.as_ref())
+        {
+            self.shell_path = path.display().to_string();
+        }
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 
     fn save(&mut self) -> bool {
+        if self.editor.notifications != self.saved.notifications
+            && let Err(error) = validate_notification_selection(
+                &self.editor.notifications,
+                self.live.notifications.as_ref(),
+            )
+        {
+            self.message = Some((error.to_string(), true));
+            return false;
+        }
+        if self.editor.notifications.enabled
+            && self.editor.notifications != self.saved.notifications
+        {
+            let installed = self
+                .link
+                .as_ref()
+                .context("Connect to edge-kvm before enabling notifications")
+                .and_then(|link| {
+                    anyhow::ensure!(
+                        !self.shell_path.is_empty(),
+                        "Choose your Quickshell shell.qml so the bridge can be installed"
+                    );
+                    link.install_notification_bridge(std::path::Path::new(&self.shell_path))
+                });
+            if let Err(error) = installed {
+                self.message = Some((format!("{error:#}"), true));
+                return false;
+            }
+        }
         match self
             .editor
             .apply(&self.original, self.connector_only)
@@ -256,6 +300,9 @@ impl SettingsApp {
                 }
             }
             None => report.push_str("status: not reachable\n"),
+        }
+        if let Some(notifications) = &self.live.notifications {
+            report.push_str(&format!("notifications: {}\n", notifications.status));
         }
         if let Some(phones) = &self.live.phones {
             for phone in phones {
@@ -513,6 +560,135 @@ impl SettingsApp {
         }
     }
 
+    fn notification_sharing(&mut self, ui: &mut Ui) {
+        if self.connector_only {
+            return;
+        }
+        section(ui, "Notifications");
+        let Some(setup) = self.live.notifications.clone() else {
+            ui.label(
+                RichText::new(
+                    "Update and restart edge-kvm to configure notification sharing here.",
+                )
+                .small()
+                .color(FAINT),
+            );
+            return;
+        };
+        let active_peer = self.live.status.as_ref().and_then(|s| s.peer.as_deref());
+        grid(ui, "notification_sharing", |ui| {
+            row_label(ui, "Shared history");
+            let config = &mut self.editor.notifications;
+            if toggle(ui, &mut config.enabled).changed() && config.enabled {
+                if config.peers.is_empty()
+                    && let Some(peer) = setup
+                        .computers
+                        .iter()
+                        .find(|p| Some(p.name.as_str()) == active_peer)
+                        .or_else(|| (setup.computers.len() == 1).then(|| &setup.computers[0]))
+                {
+                    config.peers.push(peer.fingerprint.clone());
+                }
+                if config.coordinator_fingerprint.is_empty() {
+                    config.coordinator_fingerprint = config
+                        .peers
+                        .iter()
+                        .chain(std::iter::once(&setup.identity))
+                        .min()
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
+            ui.end_row();
+
+            if config.enabled {
+                row_label(ui, "Share with");
+                ui.vertical(|ui| {
+                    if setup.computers.is_empty() {
+                        ui.label("Pair another computer first.");
+                    }
+                    for computer in &setup.computers {
+                        let mut enrolled = config.peers.contains(&computer.fingerprint);
+                        if ui.checkbox(&mut enrolled, &computer.name).changed() {
+                            if enrolled {
+                                config.peers.push(computer.fingerprint.clone());
+                            } else {
+                                config.peers.retain(|p| p != &computer.fingerprint);
+                            }
+                        }
+                    }
+                });
+                ui.end_row();
+
+                row_label(ui, "History stored on");
+                let owner = if config.coordinator_fingerprint == setup.identity {
+                    "This computer".to_owned()
+                } else {
+                    setup
+                        .computers
+                        .iter()
+                        .find(|p| p.fingerprint == config.coordinator_fingerprint)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "Choose a computer".into())
+                };
+                ui.add_enabled_ui(!setup.has_store, |ui| {
+                    egui::ComboBox::from_id_salt("notification_owner").selected_text(owner).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut config.coordinator_fingerprint, setup.identity.clone(), "This computer");
+                        for computer in &setup.computers {
+                            if config.peers.contains(&computer.fingerprint) {
+                                ui.selectable_value(&mut config.coordinator_fingerprint, computer.fingerprint.clone(), &computer.name);
+                            }
+                        }
+                    });
+                }).response.on_hover_text("Choose the same computer on both PCs. The owner is fixed once history is created.");
+                ui.end_row();
+            }
+
+            row_label(ui, "Quickshell");
+            ui.horizontal(|ui| {
+                if setup.shell_path.is_some() {
+                    ui.label(if setup.bridge_installed {
+                        "Bridge installed"
+                    } else {
+                        "Bridge installs on Save"
+                    })
+                    .on_hover_text(&self.shell_path);
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shell_path)
+                            .hint_text("Path to shell.qml")
+                            .desired_width(180.0),
+                    );
+                }
+                if setup.bridge_installed
+                    && ui.small_button("Update bridge").clicked()
+                    && let Some(link) = &self.link
+                {
+                    match link.install_notification_bridge(std::path::Path::new(&self.shell_path)) {
+                        Ok(message) => {
+                            self.message = Some((message, false));
+                            self.live.polled = None;
+                        }
+                        Err(error) => self.message = Some((format!("{error:#}"), true)),
+                    }
+                }
+            });
+            ui.end_row();
+            row_label(ui, "Status");
+            ui.label(&setup.status);
+            ui.end_row();
+        });
+        if self.editor.notifications.enabled {
+            ui.label(
+                RichText::new(
+                    "Enable on both PCs and choose the same history owner. DND stays local.",
+                )
+                .small()
+                .color(FAINT),
+            );
+        }
+    }
+
     fn advanced(&mut self, ui: &mut Ui) {
         section(ui, "Advanced");
         grid(ui, "advanced", |ui| {
@@ -635,6 +811,7 @@ impl eframe::App for SettingsApp {
                         self.this_computer(ui);
                         self.devices(ui);
                         self.sharing(ui);
+                        self.notification_sharing(ui);
                         self.advanced(ui);
                         ui.add_space(8.0);
                     });
@@ -657,6 +834,37 @@ impl eframe::App for SettingsApp {
 }
 
 /// Two columns: muted labels on the left, controls on the right.
+fn validate_notification_selection(
+    config: &edge_common::NotificationConfig,
+    setup: Option<&crate::NotificationSetup>,
+) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let setup = setup.context("Connect to the running node before enabling notifications")?;
+    anyhow::ensure!(
+        !config.peers.is_empty(),
+        "Choose a paired computer to share notifications with"
+    );
+    anyhow::ensure!(
+        config
+            .peers
+            .iter()
+            .all(|id| setup.computers.iter().any(|p| &p.fingerprint == id)),
+        "Only paired computers can share notifications; remove any unpaired devices from the selection"
+    );
+    anyhow::ensure!(
+        config.coordinator_fingerprint == setup.identity
+            || config.peers.contains(&config.coordinator_fingerprint),
+        "Choose an enrolled computer to store history"
+    );
+    anyhow::ensure!(
+        !setup.has_store || config.coordinator_fingerprint == setup.coordinator,
+        "History already belongs to another computer; changing its owner requires migration"
+    );
+    Ok(())
+}
+
 fn grid(ui: &mut Ui, id: &str, rows: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
@@ -743,6 +951,120 @@ mod tests {
         let mut editor = Editor::from_config(&config);
         editor.peer_host.clear();
         assert!(editor.apply(&config, true).is_err());
+    }
+
+    struct TestNode {
+        fail_install: bool,
+        installed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl NodeLink for TestNode {
+        fn status(&self) -> Option<NodeStatus> {
+            None
+        }
+        fn phones(&self) -> Option<Vec<PhoneEntry>> {
+            None
+        }
+        fn unpair_phone(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn arm_pairing(&self) -> Result<()> {
+            Ok(())
+        }
+        fn pair_phone(&self) -> Result<std::sync::mpsc::Receiver<crate::PhonePairingEvent>> {
+            anyhow::bail!("unused")
+        }
+        fn autostart(&self) -> Option<bool> {
+            None
+        }
+        fn set_autostart(&self, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn open_log(&self) -> Result<()> {
+            Ok(())
+        }
+        fn install_notification_bridge(&self, _: &std::path::Path) -> Result<String> {
+            anyhow::ensure!(!self.fail_install, "Unsupported shell");
+            self.installed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok("Installed".into())
+        }
+    }
+
+    #[test]
+    fn save_installs_the_bridge_and_refuses_to_enable_when_installation_fails() {
+        for fail_install in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("receiver.toml");
+            let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let result = Arc::new(Mutex::new(SettingsUiResult::Cancelled));
+            let mut app = SettingsApp::new(
+                SettingsUiInput {
+                    role: Role::Receiver,
+                    connector_only: false,
+                    restart_on_save: true,
+                    config_path: config_path.clone(),
+                    config: AppConfig::receiver_default(),
+                    local_ip: None,
+                    pairing: PairingUiState::Idle,
+                    link: Some(Arc::new(TestNode {
+                        fail_install,
+                        installed: installed.clone(),
+                    })),
+                },
+                result.clone(),
+            );
+            app.shell_path = dir.path().join("shell.qml").display().to_string();
+            app.live.notifications = Some(crate::NotificationSetup {
+                identity: "local".into(),
+                computers: vec![crate::NotificationComputer {
+                    name: "Main PC".into(),
+                    fingerprint: "main".into(),
+                }],
+                ..Default::default()
+            });
+            app.editor.notifications = edge_common::NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: "main".into(),
+                peers: vec!["main".into()],
+            };
+            assert_eq!(app.save(), !fail_install);
+            assert_eq!(config_path.exists(), !fail_install);
+            assert_eq!(
+                installed.load(std::sync::atomic::Ordering::Relaxed),
+                !fail_install
+            );
+            assert_eq!(
+                matches!(*result.lock().unwrap(), SettingsUiResult::Saved(_)),
+                !fail_install
+            );
+        }
+    }
+
+    #[test]
+    fn sharing_requires_trusted_members_and_cannot_replace_an_existing_owner() {
+        let mut setup = crate::NotificationSetup {
+            identity: "local".into(),
+            computers: vec![crate::NotificationComputer {
+                name: "Main PC".into(),
+                fingerprint: "main".into(),
+            }],
+            coordinator: "main".into(),
+            ..Default::default()
+        };
+        let mut config = edge_common::NotificationConfig {
+            enabled: true,
+            coordinator_fingerprint: "main".into(),
+            peers: vec!["main".into()],
+        };
+        assert!(validate_notification_selection(&config, Some(&setup)).is_ok());
+        config.peers.push("stranger".into());
+        assert!(validate_notification_selection(&config, Some(&setup)).is_err());
+        config.peers.pop();
+        setup.has_store = true;
+        config.coordinator_fingerprint = "local".into();
+        assert!(validate_notification_selection(&config, Some(&setup)).is_err());
+        config.enabled = false;
+        assert!(validate_notification_selection(&config, Some(&setup)).is_ok());
     }
 
     #[test]
