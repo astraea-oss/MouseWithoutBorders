@@ -84,6 +84,16 @@ Item {
         onError: if (bridge.socketPath.length > 0) retry.restart()
         parser: SplitParser {
             onRead: data => {
+                let message;
+                try { message = JSON.parse(data); } catch (_) { return; }
+                if (message.type === "retire_phone" && typeof message.name === "string") {
+                    // Dedicated legacy marker plus the paired phone's app suffix,
+                    // never title/body matching. Shared projections lack this marker.
+                    const suffix = " (" + message.name + ")";
+                    for (const n of [...bridge.server.trackedNotifications.values]) {
+                        if (n.hints["x-edge-kvm-phone"] && n.appName.endsWith(suffix)) n.dismiss();
+                    }
+                }
                 if (bridge.sendingInventory && data === '{"type":"ready"}') {
                     state.offlineClosures = "[]";
                     bridge.sendingInventory = false;

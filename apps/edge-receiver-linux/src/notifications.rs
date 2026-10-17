@@ -261,7 +261,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
-fn truncate_bytes(text: &str, max: usize) -> String {
+pub(crate) fn truncate_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -301,6 +301,12 @@ impl FreedesktopNotifications {
         hints.insert("x-edge-kvm-replay", Value::from(true));
         hints.insert("suppress-sound", Value::from(true));
         hints.insert("urgency", Value::from(content.urgency));
+        let icon = content
+            .icon_png
+            .as_ref()
+            .map(|png| self.icon_path(png))
+            .transpose()?
+            .unwrap_or_else(|| content.icon.clone());
         let reply = self
             .connection
             .call_method(
@@ -311,7 +317,7 @@ impl FreedesktopNotifications {
                 &(
                     content.app_name.as_str(),
                     replaces,
-                    content.icon.as_str(),
+                    icon.as_str(),
                     content.title.as_str(),
                     content.body.as_str(),
                     Vec::<&str>::new(),

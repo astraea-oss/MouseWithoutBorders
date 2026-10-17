@@ -69,6 +69,9 @@ pub struct SharedNotification {
     pub body: String,
     /// Theme icon name only, never a remote filesystem path.
     pub icon: String,
+    /// Bounded phone icon bytes; receivers create their own local cache path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_png: Option<Vec<u8>>,
     pub posted_ms: u64,
     pub urgency: u8,
 }
@@ -1071,6 +1074,7 @@ mod tests {
                     title: "😀".repeat(256),
                     body: "a".repeat(4096),
                     icon: "mail-unread".into(),
+                    icon_png: Some(vec![0xff; PhoneNotification::MAX_ICON_BYTES]),
                     posted_ms: u64::MAX,
                     urgency: 2,
                 }),

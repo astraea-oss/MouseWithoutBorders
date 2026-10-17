@@ -3345,6 +3345,22 @@ async fn start_phone_sessions(
             changes: hub.subscribe(),
         }),
     );
+    phones.set_notification_hub(notifications.hub.clone());
+    if notifications.hub.is_some()
+        && let Some(shell) = notification_setup::detect_shell()
+        && std::fs::read_to_string(&shell)
+            .is_ok_and(|text| text.contains("    EdgeNotificationBridge {"))
+        && !notification_setup::integration_installed(
+            &shell,
+            &edge_common::default_state_dir().join("notifications/bridge.sock"),
+        )
+        && let Err(error) = notification_setup::install_bridge(
+            &shell,
+            &edge_common::default_state_dir().join("notifications/bridge.sock"),
+        )
+    {
+        tracing::warn!(%error, "couldn't refresh the installed Quickshell notification bridge");
+    }
     if let Some(tray) = tray {
         phones.set_tray(tray.clone()).await;
     }

@@ -200,6 +200,7 @@ impl LocalHello {
 struct SessionNotifications {
     desktop: Arc<FreedesktopNotifications>,
     mirror: Arc<tokio::sync::Mutex<NotificationMirror>>,
+    hub: Option<crate::notification_hub::NotificationHub>,
 }
 
 /// Work for the receiver loop, which owns the pin store, so pin changes
@@ -328,6 +329,7 @@ pub(crate) struct PhoneSessions {
     log_path: PathBuf,
     clipboard: Option<ClipboardSource>,
     desktop: Option<Arc<FreedesktopNotifications>>,
+    notification_hub: Option<crate::notification_hub::NotificationHub>,
     /// Per phone key, kept across reconnects.
     mirrors: HashMap<String, Arc<tokio::sync::Mutex<NotificationMirror>>>,
     timings: PhoneTimings,
@@ -353,6 +355,7 @@ impl PhoneSessions {
             log_path,
             clipboard,
             desktop: None,
+            notification_hub: None,
             mirrors: HashMap::new(),
             timings: PhoneTimings::DEFAULT,
             sessions: HashMap::new(),
@@ -373,6 +376,10 @@ impl PhoneSessions {
     /// Enables showing phone notifications on the desktop.
     pub fn set_desktop_notifications(&mut self, desktop: FreedesktopNotifications) {
         self.desktop = Some(Arc::new(desktop));
+    }
+
+    pub fn set_notification_hub(&mut self, hub: Option<crate::notification_hub::NotificationHub>) {
+        self.notification_hub = hub;
     }
 
     /// For the control socket, which sends requests from its own tasks.
@@ -460,6 +467,7 @@ impl PhoneSessions {
         let notifications = self.desktop.clone().map(|desktop| SessionNotifications {
             desktop,
             mirror: Arc::clone(self.mirrors.entry(fingerprint.clone()).or_default()),
+            hub: self.notification_hub.clone(),
         });
         let log_path = self.log_path.clone();
         let timings = self.timings;
@@ -660,6 +668,10 @@ impl PhoneSessions {
         }
         // Dropping the session aborts it and closes its socket.
         self.sessions.remove(&removed.fingerprint);
+        let shared_removal = match &self.notification_hub {
+            Some(hub) => hub.remove_phone(&removed.fingerprint).await,
+            None => Ok(()),
+        };
         if let Some(tray) = &self.tray {
             tray.phone_disconnected(removed.fingerprint.clone()).await;
         }
@@ -684,6 +696,7 @@ impl PhoneSessions {
                 tracing::warn!(%error, "couldn't remove unpaired phone notification cache")
             }
         }
+        shared_removal.context("phone unpaired, but shared notification removal failed")?;
         Ok(true)
     }
 
@@ -821,6 +834,10 @@ async fn run_phone_session(
             tracing::warn!(%error, phone = %context.name, "couldn't restore phone notification identities");
         }
     }
+    let mut shared_phone = notifications
+        .as_ref()
+        .and_then(|n| n.hub.as_ref())
+        .map(|hub| hub.phone_source(&context.fingerprint, &context.name));
     let mut clipboard = match context.clipboard {
         Some(source) if clipboard_allowed => {
             match PhoneClipboard::start(source, context.clipboard_images).await {
@@ -952,9 +969,20 @@ async fn run_phone_session(
                             tracing::debug!(phone = %context.name, "ignored notification from a phone without notification access");
                             continue;
                         };
-                        let mut mirror = notifications.mirror.lock().await;
-                        if let Err(error) = mirror.apply(event, notifications.desktop.as_ref(), &context.name).await {
-                            tracing::warn!(%error, phone = %context.name, "couldn't show phone notification");
+                        if let Some(source) = &mut shared_phone {
+                            let snapshot_end = matches!(event, edge_protocol::NotificationEvent::SnapshotEnd);
+                            // Fail the session on storage errors so the next phone
+                            // snapshot retries instead of silently dropping input.
+                            source.apply(event).await?;
+                            if snapshot_end {
+                                // Retire legacy local copies only after successful import.
+                                notifications.mirror.lock().await.close_all(notifications.desktop.as_ref()).await;
+                            }
+                        } else {
+                            let mut mirror = notifications.mirror.lock().await;
+                            if let Err(error) = mirror.apply(event, notifications.desktop.as_ref(), &context.name).await {
+                                tracing::warn!(%error, phone = %context.name, "couldn't show phone notification");
+                            }
                         }
                     }
                     PhoneFrame::Clipboard => {

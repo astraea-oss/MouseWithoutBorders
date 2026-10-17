@@ -29,7 +29,7 @@ configurations are running or no shell can be detected, choose `shell.qml` in th
 same settings page. The installer supports the reviewed Tera notification centre
 and the updated Ember laptop centre; an unfamiliar layout is rejected before
 modifying shell files or enabling sharing. It never installs a separate notification
-centre. DND remains local, and phone notifications remain local in this milestone.
+centre. DND remains local. Paired phone notifications enter the same shared history.
 
 The owner can be corrected before a replica has received any shared history.
 Its local queued notifications are preserved if the initial owner is corrected.
@@ -171,14 +171,36 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
 - The store contains private notification text in plaintext, protected by a 0700
   directory and 0600 files/socket. Removed content is deleted from state while
   minimal terminal markers remain. Bodies are never logged. Icons use bounded
-  theme names; remote image paths/URLs are not loaded.
-- Legacy phone notifications remain local and are excluded from PC sharing.
-  Their desktop ID mappings survive backend restarts in `state/phone-notifications/`,
-  with the session bus and notification daemon identity checked before reuse.
-  These files contain only IDs and digests. Existing duplicates created before
-  this cache was introduced cannot be safely identified from text alone.
-  Stable mobile identities, onward-sharing permission, and phone-side dismissal
-  require the next mobile protocol milestone.
+  theme names or bounded phone PNG bytes; remote image paths/URLs are not loaded.
+- With sharing enabled, authenticated phone notifications write directly to the
+  shared store, using the gateway PC identity plus phone fingerprint and phone
+  notification ID. Both PC centres project those records; no second local phone
+  delivery runs alongside them. Phone reconnect snapshots are idempotent, missing
+  entries are removed only after a complete snapshot, and PC dismissals remain
+  terminal even if the phone resends an entry. Unpairing removes that phone's
+  shared entries. The gateway durably tracks each phone ID's lifetime, so an ID
+  reused after phone-side removal creates a fresh entry; a mere reconnect does
+  not. Lifetime metadata and notification operations commit atomically.
+  Pair each phone with one gateway PC; simultaneous gateways for
+  the same phone are not deduplicated across different PC source identities.
+- A successful first phone snapshot retires the old local desktop copies using
+  their persisted ID mappings in `state/phone-notifications/`, checking the
+  notification daemon generation before closing anything. The bridge also retires
+  orphaned legacy copies using their dedicated phone marker and paired phone name,
+  after a complete successful import; it never matches notification titles/bodies.
+  With PC sharing disabled, ordinary local phone mirroring remains available.
+  Legacy copies stay excluded from Quickshell ingestion because the phone adapter
+  now imports them directly; removing that exclusion would create duplicates.
+- Phone icons travel as bounded PNG bytes (24 KiB maximum), never as remote
+  filesystem paths. Receivers create their own local icon cache. Older v2 peers
+  ignore this optional icon field; update both PCs to retain phone icons.
+- Dismissal on either PC removes the shared phone entry from both PC centres.
+  Phone-side removal also propagates. Dismissing the original Android notification
+  from a PC requires a mobile protocol command that the current phone app does
+  not expose; the Android tray itself is not a replica of the shared PC history.
+- When sharing is already enabled, startup refreshes an existing supported bridge
+  if its bundled version changed, preserving backups and requesting a reload.
+  Upgrading the phone gateway binary therefore upgrades its installed bridge too.
 
 The initial version has no automatic coordinator migration/reset or remote cache
 revocation command. Back up the coordinator store before changes. A replica rejects
@@ -204,5 +226,6 @@ reload identity. The ordinary tests cover offline dismissal recovery, stale
 updates, terminal removals, enrollment, and coordinator reset detection.
 
 Still perform live acceptance between the physical PCs after both binaries and
-shell bridges are installed. Windows notification integration and phone-wide
-notification parity are not implemented by this milestone.
+shell bridges are installed. The phone gateway PC needs the updated binary to
+import phone notifications. Windows notification integration and Android tray
+replication remain separate work.

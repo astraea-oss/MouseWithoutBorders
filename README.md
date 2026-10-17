@@ -254,4 +254,6 @@ Opt-in shared desktop notifications use the existing Quickshell notification
 centres, with one configured coordinator and synchronized dismissals. See the
 [Quickshell setup and current limits](integrations/quickshell/README.md) and
 [implementation plan](docs/plans/shared-notifications.md). Both PCs need the
-updated binary and shell bridge; existing view-only phone forwarding stays local.
+updated binary and shell bridge. Paired phone notifications join that same history;
+dismissal on either PC removes them from both PC centres. The current phone
+protocol cannot dismiss the original Android notification from a PC.

@@ -9,7 +9,7 @@ use edge_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -36,6 +36,16 @@ struct Store {
     sequence: u64,
     records: Vec<NotificationRecord>,
     pending: Vec<NotificationOperation>,
+    #[serde(default)]
+    phone_instances: BTreeMap<String, PhoneInstance>,
+    #[serde(default)]
+    imported_phones: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PhoneInstance {
+    instance: String,
+    present: bool,
 }
 impl Store {
     fn coordinator_locked(&self) -> bool {
@@ -85,6 +95,50 @@ impl Store {
         }
         Ok(true)
     }
+    fn queue_local(
+        &mut self,
+        key: NotificationKey,
+        content: Option<SharedNotification>,
+        coordinator: bool,
+    ) -> Result<bool> {
+        // Repeated inventory, updates, and retries must not allocate new operations.
+        if let Some(record) = self.view().iter().find(|r| r.key == key)
+            && (record.content.is_none() || record.content == content)
+        {
+            return Ok(false);
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .context("notification sequence exhausted")?;
+        let operation = NotificationOperation {
+            sequence: self.sequence,
+            key,
+            content,
+        };
+        validate_key(&operation.key)?;
+        if let Some(content) = &operation.content {
+            validate_content(content)?;
+            ensure!(
+                operation.key.origin == self.local_identity,
+                "invalid local origin"
+            );
+        }
+        if coordinator {
+            self.apply(&self.local_identity.clone(), &operation)?;
+        } else {
+            // Keep only the newest unsent operation for an instance. A terminal
+            // removal cannot be overwritten because the view check above rejects it.
+            self.pending.retain(|pending| pending.key != operation.key);
+            ensure!(
+                self.pending.len() < MAX_PENDING
+                    && self.records.len() + self.pending.len() < MAX_RECORDS,
+                "notification outbox is full"
+            );
+            self.pending.push(operation);
+        }
+        Ok(true)
+    }
     fn view(&self) -> Vec<NotificationRecord> {
         let mut overlay = self.clone();
         for operation in &self.pending {
@@ -131,6 +185,13 @@ fn validate_content(content: &SharedNotification) -> Result<()> {
         "notification icon must be a theme name"
     );
     ensure!(content.urgency <= 2, "invalid notification urgency");
+    ensure!(
+        content
+            .icon_png
+            .as_ref()
+            .is_none_or(|png| png.len() <= edge_protocol::PhoneNotification::MAX_ICON_BYTES),
+        "notification icon too large"
+    );
     Ok(())
 }
 
@@ -175,7 +236,163 @@ pub struct NotificationService {
     pub hub: NotificationHub,
     _bridge: AbortOnDropTask,
 }
+
+/// Authenticated phone input to the same durable history as desktop input.
+/// Snapshot membership is session-local; retained identities live in the store.
+pub(crate) struct PhoneNotificationSource {
+    hub: NotificationHub,
+    prefix: String,
+    name: String,
+    resent: Option<HashSet<String>>,
+}
+
+impl PhoneNotificationSource {
+    pub async fn apply(&mut self, event: edge_protocol::NotificationEvent) -> Result<()> {
+        let result = self.apply_inner(event).await;
+        if let Err(error) = &result {
+            self.hub
+                .record_error(&format!("Phone notification history: {error}"));
+        }
+        result
+    }
+
+    async fn apply_inner(&mut self, event: edge_protocol::NotificationEvent) -> Result<()> {
+        use edge_protocol::NotificationEvent;
+        if matches!(event, NotificationEvent::SnapshotStart) {
+            ensure!(self.resent.is_none(), "nested phone notification snapshot");
+            self.resent = Some(HashSet::new());
+            return Ok(());
+        }
+        let mut state = self.hub.0.state.lock().await;
+        let mut next = state.clone();
+        let mut changed = false;
+        let mut operations = Vec::new();
+        match event {
+            NotificationEvent::Posted(phone) => {
+                let id = format!("{}{id}", self.prefix, id = phone.id);
+                if let Some(resent) = &mut self.resent {
+                    ensure!(
+                        resent.len() < MAX_RECORDS || resent.contains(&id),
+                        "phone notification snapshot full"
+                    );
+                    resent.insert(id.clone());
+                }
+                // A phone may reuse an ID after removal. Keep the same instance
+                // through updates/reconnects, then allocate a new lifetime only
+                // after the source has explicitly withdrawn it.
+                if !next
+                    .phone_instances
+                    .get(&id)
+                    .is_some_and(|entry| entry.present)
+                {
+                    ensure!(
+                        next.phone_instances.contains_key(&id)
+                            || next.phone_instances.len() < MAX_RECORDS,
+                        "phone notification identities full"
+                    );
+                    next.phone_instances.insert(
+                        id.clone(),
+                        PhoneInstance {
+                            instance: format!("{id}/{}", new_epoch()?),
+                            present: true,
+                        },
+                    );
+                    changed = true;
+                }
+                let instance = next.phone_instances[&id].instance.clone();
+                let shown = crate::notifications::desktop_notification(&phone, &self.name);
+                operations.push((
+                    instance,
+                    Some(SharedNotification {
+                        app_name: shown.app_name.chars().take(64).collect(),
+                        title: shown.summary.chars().take(256).collect(),
+                        body: crate::notifications::truncate_bytes(&shown.body, 4096),
+                        icon: "phone".into(),
+                        icon_png: shown.icon_png,
+                        posted_ms: phone.posted_ms,
+                        urgency: 1,
+                    }),
+                ));
+            }
+            NotificationEvent::Removed { id } => {
+                if let Some(entry) = next
+                    .phone_instances
+                    .get_mut(&format!("{}{id}", self.prefix))
+                    && entry.present
+                {
+                    entry.present = false;
+                    changed = true;
+                    operations.push((entry.instance.clone(), None));
+                }
+            }
+            NotificationEvent::SnapshotEnd => {
+                let present = self
+                    .resent
+                    .take()
+                    .context("phone notification snapshot end without start")?;
+                if !self.name.is_empty()
+                    && next.imported_phones.get(&self.prefix) != Some(&self.name)
+                {
+                    ensure!(
+                        next.imported_phones.contains_key(&self.prefix)
+                            || next.imported_phones.len() < MAX_RECORDS,
+                        "phone notification imports full"
+                    );
+                    next.imported_phones
+                        .insert(self.prefix.clone(), self.name.clone());
+                    changed = true;
+                }
+                for (id, entry) in &mut next.phone_instances {
+                    if id.starts_with(&self.prefix) && entry.present && !present.contains(id) {
+                        entry.present = false;
+                        changed = true;
+                        operations.push((entry.instance.clone(), None));
+                    }
+                }
+            }
+            NotificationEvent::SnapshotStart => unreachable!(),
+        }
+        for (instance, content) in operations {
+            changed |= next.queue_local(
+                NotificationKey {
+                    origin: self.hub.0.identity.clone(),
+                    instance,
+                },
+                content,
+                self.hub.is_coordinator(),
+            )?;
+        }
+        if changed {
+            // Commit phone lifetime metadata and its shared operations together.
+            self.hub.persist(&next).await?;
+            *state = next;
+            drop(state);
+            self.hub.publish();
+        }
+        Ok(())
+    }
+}
+
 impl NotificationHub {
+    pub(crate) fn phone_source(&self, fingerprint: &str, name: &str) -> PhoneNotificationSource {
+        PhoneNotificationSource {
+            hub: self.clone(),
+            prefix: format!("phone/{}/", fingerprint.replace(':', "")),
+            name: name.into(),
+            resent: None,
+        }
+    }
+
+    pub(crate) async fn remove_phone(&self, fingerprint: &str) -> Result<()> {
+        let mut source = self.phone_source(fingerprint, "");
+        source
+            .apply(edge_protocol::NotificationEvent::SnapshotStart)
+            .await?;
+        source
+            .apply(edge_protocol::NotificationEvent::SnapshotEnd)
+            .await
+    }
+
     pub async fn start(
         config: &NotificationConfig,
         identity: &str,
@@ -392,42 +609,9 @@ impl NotificationHub {
     }
     async fn local(&self, key: NotificationKey, content: Option<SharedNotification>) -> Result<()> {
         let mut state = self.0.state.lock().await;
-        // Repeated inventory, updates, and retries must not allocate new operations.
-        if let Some(record) = state.view().iter().find(|r| r.key == key)
-            && (record.content.is_none() || record.content == content)
-        {
-            return Ok(());
-        }
         let mut next = state.clone();
-        next.sequence = next
-            .sequence
-            .checked_add(1)
-            .context("notification sequence exhausted")?;
-        let operation = NotificationOperation {
-            sequence: next.sequence,
-            key,
-            content,
-        };
-        validate_key(&operation.key)?;
-        if let Some(content) = &operation.content {
-            validate_content(content)?;
-            ensure!(
-                operation.key.origin == self.0.identity,
-                "invalid local origin"
-            );
-        }
-        if self.is_coordinator() {
-            next.apply(&self.0.identity, &operation)?;
-        } else {
-            // Keep only the newest unsent operation for an instance. A terminal
-            // removal cannot be overwritten because the view check above rejects it.
-            next.pending.retain(|pending| pending.key != operation.key);
-            ensure!(
-                next.pending.len() < MAX_PENDING
-                    && next.records.len() + next.pending.len() < MAX_RECORDS,
-                "notification outbox is full"
-            );
-            next.pending.push(operation);
+        if !next.queue_local(key, content, self.is_coordinator())? {
+            return Ok(());
         }
         self.persist(&next).await?;
         *state = next;
@@ -493,8 +677,17 @@ impl NotificationHub {
                         }
                         BridgeMessage::Copy { id, key, content } => {
                             // Only a known committed entry can be registered as a copy.
-                            if self.0.state.lock().await.view().iter().any(|r| r.key == key && r.content.is_some()) {
-                                projections.insert(key, (id, content));
+                            let record = self.0.state.lock().await.view().into_iter().find(|r| r.key == key);
+                            if let Some(record) = record {
+                                if record.content.is_none() {
+                                    desktop.close_shared(id).await?;
+                                } else {
+                                    // Inventory may be stale, so reconcile once using
+                                    // its displayed fields. Later callbacks cannot
+                                    // overwrite our canonical projection with text
+                                    // truncation or missing icon bytes and loop.
+                                    projections.entry(key).or_insert((id, content));
+                                }
                             }
                         }
                         BridgeMessage::Closed { id, reason, instance, key } => {
@@ -568,6 +761,27 @@ impl NotificationHub {
                 if let Some((id, _)) = projections.remove(&key) {
                     desktop.close_shared(id).await.ok();
                 }
+            }
+            // Retire even legacy copies missing from the old desktop-ID cache,
+            // but only after that phone's full authoritative inventory committed.
+            let phones: Vec<_> = self
+                .0
+                .state
+                .lock()
+                .await
+                .imported_phones
+                .values()
+                .cloned()
+                .collect();
+            for name in phones.into_iter().filter(|name| !name.is_empty()) {
+                let mut message =
+                    serde_json::to_vec(&serde_json::json!({"type": "retire_phone", "name": name}))?;
+                message.push(b'\n');
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    writer.write_all(&message),
+                )
+                .await??;
             }
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1228,10 +1442,206 @@ mod tests {
             title: "Hello".into(),
             body: "world".into(),
             icon: "mail-unread".into(),
+            icon_png: None,
             posted_ms: 1,
             urgency: 1,
         }
     }
+    #[tokio::test]
+    async fn phone_history_survives_restart_reconciles_absence_and_keeps_dismissals() {
+        use edge_protocol::{NotificationEvent as Event, PhoneNotification};
+        let directory = tempfile::tempdir().unwrap();
+        let a = key().origin;
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let phone = edge_crypto::fingerprint(&[3; 32]);
+        let other_phone = edge_crypto::fingerprint(&[4; 32]);
+        let config = NotificationConfig {
+            enabled: true,
+            coordinator_fingerprint: a.clone(),
+            peers: vec![b.clone()],
+        };
+        let service = NotificationHub::start(&config, &a, "Tera", directory.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let post = |id| {
+            Event::Posted(PhoneNotification {
+                id,
+                app_name: "Messages".into(),
+                title: "Hello".into(),
+                body: "<&".repeat(2048),
+                icon_png: None,
+                posted_ms: 123,
+            })
+        };
+        let mut source = service.hub.phone_source(&phone, "Phone");
+        source.apply(Event::SnapshotStart).await.unwrap();
+        source.apply(post(1)).await.unwrap();
+        source.apply(post(2)).await.unwrap();
+        source.apply(Event::SnapshotEnd).await.unwrap();
+        let first = service.hub.0.state.lock().await.records[0].key.clone();
+        assert!(
+            service.hub.0.state.lock().await.records[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .body
+                .len()
+                <= 4096
+        );
+        // The same numeric phone ID on another authenticated phone stays distinct.
+        service
+            .hub
+            .phone_source(&other_phone, "Other phone")
+            .apply(post(1))
+            .await
+            .unwrap();
+        drop(source);
+        drop(service);
+        let service = NotificationHub::start(&config, &a, "Tera", directory.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source = service.hub.phone_source(&phone, "Phone");
+        let sequence = service.hub.0.state.lock().await.sequence;
+        source.apply(Event::SnapshotStart).await.unwrap();
+        source.apply(post(1)).await.unwrap();
+        source.apply(post(2)).await.unwrap();
+        source.apply(Event::SnapshotEnd).await.unwrap();
+        assert_eq!(
+            service.hub.0.state.lock().await.sequence,
+            sequence,
+            "reconnect allocated duplicate operations"
+        );
+        // An incomplete snapshot must not delete retained entries.
+        source.apply(Event::SnapshotStart).await.unwrap();
+        source.apply(post(1)).await.unwrap();
+        drop(source);
+        assert_eq!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .filter(|r| r.content.is_some())
+                .count(),
+            3
+        );
+        let mut source = service.hub.phone_source(&phone, "Phone");
+        source.apply(Event::SnapshotStart).await.unwrap();
+        source.apply(post(1)).await.unwrap();
+        source.apply(Event::SnapshotEnd).await.unwrap();
+        assert_eq!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .filter(|r| r.content.is_some())
+                .count(),
+            2
+        );
+        // Replicate the phone history to Lua through the real sync messages.
+        let replica = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: a.clone(),
+                peers: vec![a.clone()],
+            },
+            &b,
+            "Lua",
+            &directory.path().join("replica"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut remote = service.hub.link(&b, true).unwrap();
+        let mut incoming = replica.hub.link(&a, true).unwrap();
+        incoming.receive(remote.next().await).await.unwrap();
+        remote.receive(incoming.next().await).await.unwrap();
+        async fn snapshot(from: &mut NotificationLink, to: &mut NotificationLink) {
+            loop {
+                let event = from.next().await;
+                let end = matches!(event, NotificationSync::SnapshotEnd);
+                to.receive(event).await.unwrap();
+                if end {
+                    break;
+                }
+            }
+        }
+        snapshot(&mut remote, &mut incoming).await;
+        assert_eq!(
+            replica.hub.0.state.lock().await.records,
+            service.hub.0.state.lock().await.records
+        );
+        // Lua can dismiss a phone entry even though only Tera talks to the phone.
+        replica.hub.local(first.clone(), None).await.unwrap();
+        remote.receive(incoming.next().await).await.unwrap();
+        source.apply(post(1)).await.unwrap();
+        assert!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .find(|r| r.key == first)
+                .unwrap()
+                .content
+                .is_none()
+        );
+        // Phone removal is terminal too; unpair only clears that phone's records.
+        source.apply(post(3)).await.unwrap();
+        source.apply(Event::Removed { id: 3 }).await.unwrap();
+        let previous = service.hub.0.state.lock().await.phone_instances
+            [&format!("{}{id}", source.prefix, id = 3)]
+            .instance
+            .clone();
+        source.apply(post(3)).await.unwrap();
+        let state = service.hub.0.state.lock().await;
+        let current = &state.phone_instances[&format!("{}{id}", source.prefix, id = 3)].instance;
+        assert_ne!(
+            current, &previous,
+            "reused source ID was suppressed by an old tombstone"
+        );
+        assert!(
+            state
+                .records
+                .iter()
+                .any(|r| &r.key.instance == current && r.content.is_some())
+        );
+        drop(state);
+        source.apply(post(4)).await.unwrap();
+        service.hub.remove_phone(&phone).await.unwrap();
+        snapshot(&mut remote, &mut incoming).await;
+        assert_eq!(
+            replica.hub.0.state.lock().await.records,
+            service.hub.0.state.lock().await.records
+        );
+        assert!(replica.hub.0.state.lock().await.pending.is_empty());
+        let state = service.hub.0.state.lock().await;
+        let active: Vec<_> = state
+            .records
+            .iter()
+            .filter(|r| r.content.is_some())
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0]
+                .key
+                .instance
+                .contains(&other_phone.replace(':', ""))
+        );
+    }
+
     #[test]
     fn dismissal_is_terminal_and_stale_updates_cannot_replace_newer_content() {
         let mut store = Store::default();
@@ -1740,7 +2150,7 @@ mod tests {
         assert_eq!(desktop.generation().await.unwrap(), generation);
         mirror
             .apply(
-                edge_protocol::NotificationEvent::Posted(phone),
+                edge_protocol::NotificationEvent::Posted(phone.clone()),
                 &desktop,
                 "Test phone",
             )
@@ -1748,6 +2158,111 @@ mod tests {
             .unwrap();
         assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
         assert_eq!(service.hub.0.state.lock().await.records.len(), 2);
+        let mut orphaned_mirror = NotificationMirror::default();
+        orphaned_mirror
+            .apply(
+                edge_protocol::NotificationEvent::Posted(phone.clone()),
+                &desktop,
+                "Test phone",
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 3);
+        // Upgrade legacy phone delivery into the shared history without leaving
+        // both the original and projection visible after migration.
+        let phone_fingerprint = edge_crypto::fingerprint(&[3; 32]);
+        let mut source = service.hub.phone_source(&phone_fingerprint, "Test phone");
+        source
+            .apply(edge_protocol::NotificationEvent::SnapshotStart)
+            .await
+            .unwrap();
+        source
+            .apply(edge_protocol::NotificationEvent::Posted(phone.clone()))
+            .await
+            .unwrap();
+        source
+            .apply(edge_protocol::NotificationEvent::SnapshotEnd)
+            .await
+            .unwrap();
+        mirror.close_all(&desktop).await;
+        let mut phone_copy = None;
+        for _ in 0..100 {
+            let list = entries(root, &environment).await.unwrap();
+            phone_copy = list
+                .iter()
+                .find(|e| e["key"].as_str().is_some_and(|key| key.contains("phone/")))
+                .cloned();
+            if phone_copy.is_some() && list.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let phone_copy = phone_copy.expect("phone history was not projected");
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
+        // Replay an icon-bearing phone update, which the shell cannot echo back
+        // as bytes. It must replace once and settle, rather than loop forever.
+        let mut updated = phone.clone();
+        updated.title = "Updated phone entry".into();
+        updated.icon_png = Some(vec![0; 32]);
+        source
+            .apply(edge_protocol::NotificationEvent::Posted(updated))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let list = entries(root, &environment).await.unwrap();
+        assert_eq!(list.len(), 2);
+        let copy = list.iter().find(|e| e["key"] == phone_copy["key"]).unwrap();
+        assert_eq!(copy["id"], phone_copy["id"]);
+        assert_eq!(copy["title"], "Updated phone entry");
+        let output = tokio::process::Command::new("quickshell")
+            .arg("-p")
+            .arg(root)
+            .args([
+                "ipc",
+                "--any-display",
+                "call",
+                "test",
+                "dismiss",
+                &copy["id"].to_string(),
+            ])
+            .envs(&environment)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let phone_key: NotificationKey =
+            serde_json::from_str(copy["key"].as_str().unwrap()).unwrap();
+        for _ in 0..100 {
+            if service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .any(|r| r.key == phone_key && r.content.is_none())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        source
+            .apply(edge_protocol::NotificationEvent::Posted(phone))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .any(|r| r.key == phone_key && r.content.is_none())
+        );
+        assert_eq!(entries(root, &environment).await.unwrap().len(), 1);
         child.kill().await.unwrap();
     }
 }
