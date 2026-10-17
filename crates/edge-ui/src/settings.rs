@@ -630,7 +630,7 @@ impl SettingsApp {
                 });
                 ui.end_row();
 
-                row_label(ui, "History stored on");
+                row_label(ui, "History owner");
                 let owner = if config.coordinator_fingerprint == setup.identity {
                     format!("{local_name} (this computer)")
                 } else {
@@ -651,7 +651,7 @@ impl SettingsApp {
                             ui.selectable_value(&mut config.coordinator_fingerprint, computer.fingerprint.clone(), &computer.name);
                         }
                     });
-                }).response.on_hover_text("Choose the same computer on both PCs. The owner is fixed once history is created.");
+                }).response.on_hover_text("Choose the same computer on both PCs. The owner is fixed after notifications are recorded or history is received.");
                 if previous_owner != config.coordinator_fingerprint
                     && config.coordinator_fingerprint != setup.identity
                     && !config.peers.contains(&config.coordinator_fingerprint)
@@ -664,11 +664,15 @@ impl SettingsApp {
             row_label(ui, "Quickshell");
             ui.horizontal(|ui| {
                 if setup.shell_path.is_some() {
-                    ui.label(if setup.bridge_installed {
-                        "Bridge installed"
-                    } else {
-                        "Bridge installs on Save"
-                    })
+                    ui.label(
+                        if setup.bridge_installed && setup.active && !setup.bridge_connected {
+                            "Installed · not connected"
+                        } else if setup.bridge_installed {
+                            "Bridge installed"
+                        } else {
+                            "Bridge installs on Save"
+                        },
+                    )
                     .on_hover_text(&self.shell_path);
                 } else {
                     ui.add(
@@ -678,7 +682,7 @@ impl SettingsApp {
                     );
                 }
                 if setup.bridge_installed
-                    && ui.small_button("Update bridge").clicked()
+                    && ui.small_button("Reload bridge").clicked()
                     && let Some(link) = &self.link
                 {
                     match link.install_notification_bridge(std::path::Path::new(&self.shell_path)) {

@@ -3,28 +3,44 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Services.Notifications
 
-// Headless fixture: real Quickshell notification server, no desktop windows.
+// The reviewed centre's lifecycle, without desktop windows or popups.
 ShellRoot {
     id: root
+    property bool dnd: false
+    readonly property var notificationTimes: JSON.parse(notificationState.times)
     PersistentProperties {
-        id: bridgeState
+        id: notificationState
         reloadableId: "notificationIntegrationState"
+        property string times: "{}"
         property string epoch: ""
         property string offlineClosures: "[]"
     }
+    function retainNotification(notification, time) { notification.tracked = true; }
+    function releaseTransients() {}
+    function removeNotificationPopup(id) {}
     NotificationServer {
-        id: notifications
+        id: notificationServer
         persistenceSupported: true
-        onNotification: n => { n.tracked = true; }
+        onNotification: notification => {
+            if (notification.lastGeneration) { root.retainNotification(notification); return; }
+            if (notification.transient) notification.tracked = true;
+            else root.retainNotification(notification, Number(notification.hints["x-edge-kvm-posted-ms"]) || Date.now());
+            if (root.dnd || notification.hints["x-edge-kvm-replay"]) return;
+        }
     }
-    EdgeNotificationBridge { server: notifications; state: bridgeState }
+    EdgeNotificationBridge {
+        server: notificationServer
+        state: notificationState
+        timestamps: root.notificationTimes
+    }
+    component EmberButton: Item {}
     IpcHandler {
         target: "test"
         function entries(): string {
-            return JSON.stringify(notifications.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, key: n.hints["x-edge-kvm-key"] || "" })));
+            return JSON.stringify(notificationServer.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, key: n.hints["x-edge-kvm-key"] || "" })));
         }
         function dismiss(id: int): void {
-            const entry = notifications.trackedNotifications.values.find(n => n.id === id);
+            const entry = notificationServer.trackedNotifications.values.find(n => n.id === id);
             if (entry) entry.dismiss();
         }
     }

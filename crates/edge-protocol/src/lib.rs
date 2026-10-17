@@ -17,7 +17,7 @@ pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
 /// shows them.
 pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
 /// Shared desktop notification state; independent of KVM input roles.
-pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v1";
+pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
 /// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
 /// it to start a stream.
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
@@ -95,6 +95,7 @@ pub enum NotificationSync {
     SnapshotStart { epoch: String },
     Record(NotificationRecord),
     SnapshotEnd,
+    Settings { coordinator: String },
 }
 
 impl Frame {

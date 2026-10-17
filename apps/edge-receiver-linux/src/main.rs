@@ -2420,6 +2420,7 @@ async fn run_node(
     };
     let notification_hub = notification_service.as_ref().map(|service| &service.hub);
     let pins_path = state_dir.join("pins.toml");
+    let connected_notification_peer = Arc::new(std::sync::Mutex::new(None));
     let (mut phones, _control) = start_phone_sessions(
         &config,
         &identity,
@@ -2438,6 +2439,7 @@ async fn run_node(
             }),
             hub: notification_hub.cloned(),
             error: notification_error,
+            connected: connected_notification_peer.clone(),
         },
     )
     .await;
@@ -2473,6 +2475,9 @@ async fn run_node(
     #[cfg(target_os = "linux")]
     let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
     loop {
+        if let Ok(mut peer) = connected_notification_peer.lock() {
+            *peer = None;
+        }
         if dial_at.is_none()
             && dialing.is_none()
             && !dial_blocked
@@ -2651,6 +2656,9 @@ async fn run_node(
                     if connection.newly_paired {
                         pins.pin(peer_name.clone(), peer_fingerprint.clone());
                         pins.save(&pins_path).await?;
+                    }
+                    if let Ok(mut current) = connected_notification_peer.lock() {
+                        *current = Some(edge_ui::NotificationComputer { name: peer_name.clone(), fingerprint: peer_fingerprint.clone() });
                     }
                     pairing_armed = false;
                     if let Some(tray) = &tray {
@@ -2932,6 +2940,12 @@ async fn run_node(
             }
         }
 
+        if let Ok(mut current) = connected_notification_peer.lock() {
+            *current = Some(edge_ui::NotificationComputer {
+                name: hello.device_name.clone(),
+                fingerprint: peer_fingerprint.clone(),
+            });
+        }
         if let Some(tray) = &tray {
             tray.connected(hello.device_name.clone()).await;
         }

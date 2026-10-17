@@ -12,7 +12,7 @@ Notifications** from the tray:
 
 1. Turn on **Shared history**. The connected computer is selected automatically;
    older offline pairing records are under **Other saved pairings**.
-2. Choose the same computer under **History stored on** on both PCs. The connected
+2. Choose the same computer under **History owner** on both PCs. The connected
    computer is available directly; selecting it also enrolls it for sharing. The initial
    default is deterministic for a pair, so the two computers agree without copying
    fingerprints. Choose the main PC before the first Save if it should own history.
@@ -21,16 +21,24 @@ Notifications** from the tray:
    edge-kvm. Quickshell picks up the configuration change through its normal reload.
 
 The settings page reports bridge readiness, whether a sharing link is connected,
-retained notification count, queued operations and errors. **Update bridge**
-refreshes an existing integration after upgrading the app. If multiple shell
+retained notification count, queued operations and errors. **Reload bridge**
+refreshes the integration and explicitly requests a Quickshell reload. Installed
+files and a connected bridge are reported separately. Symlinked dotfiles retain
+their launch path for QML imports and their watched shell inode. If multiple shell
 configurations are running or no shell can be detected, choose `shell.qml` in that
 same settings page. The installer supports the reviewed Tera notification centre
 and the updated Ember laptop centre; an unfamiliar layout is rejected before
 modifying shell files or enabling sharing. It never installs a separate notification
 centre. DND remains local, and phone notifications remain local in this milestone.
 
-Once a notification store exists, its owner is fixed in the settings UI. Disabling
-sharing preserves its identity and history so it can be enabled again safely.
+The owner can be corrected before a replica has received any shared history.
+Its local queued notifications are preserved if the initial owner is corrected.
+After authoritative records or a coordinator epoch are received, ownership is
+fixed to protect history. Disabling sharing preserves its identity and history.
+The PCs confirm that they selected the same owner before exchanging history;
+a transport connection alone is not reported as working notification sharing.
+This uses `notification-sync-v2`; both PCs need this version. Older peers retain
+normal KVM operation while notification sharing waits for their update.
 
 For an existing service installation, upgrading is:
 

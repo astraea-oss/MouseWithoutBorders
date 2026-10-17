@@ -38,6 +38,14 @@ struct Store {
     pending: Vec<NotificationOperation>,
 }
 impl Store {
+    fn coordinator_locked(&self) -> bool {
+        !self.epoch.is_empty()
+            || !self.records.is_empty()
+            || self
+                .pending
+                .iter()
+                .any(|op| op.key.origin != self.local_identity)
+    }
     fn apply(&mut self, sender: &str, operation: &NotificationOperation) -> Result<()> {
         validate_key(&operation.key)?;
         ensure!(
@@ -124,6 +132,29 @@ fn validate_content(content: &SharedNotification) -> Result<()> {
     Ok(())
 }
 
+fn new_epoch() -> Result<String> {
+    let mut bytes = [0; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("notification epoch generation: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+pub async fn coordinator_locked_on_disk(path: &Path) -> Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => {
+            ensure!(
+                meta.len() <= MAX_STORE_BYTES as u64,
+                "notification store too large"
+            );
+            Ok(
+                serde_json::from_slice::<Store>(&tokio::fs::read(path).await?)?
+                    .coordinator_locked(),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone)]
 pub struct NotificationHub(Arc<Inner>);
 struct Inner {
@@ -176,13 +207,35 @@ impl NotificationHub {
                     meta.len() <= MAX_STORE_BYTES as u64,
                     "notification store too large"
                 );
-                let state: Store = serde_json::from_slice(&tokio::fs::read(&path).await?)
+                let mut state: Store = serde_json::from_slice(&tokio::fs::read(&path).await?)
                     .context("notification store corrupt; explicit recovery required")?;
                 ensure!(
-                    state.coordinator == config.coordinator_fingerprint
-                        && state.local_identity == identity,
-                    "notification identity/coordinator changed; explicit migration required"
+                    state.local_identity == identity,
+                    "notification identity changed; explicit migration required"
                 );
+                if state.coordinator != config.coordinator_fingerprint {
+                    ensure!(
+                        !state.coordinator_locked(),
+                        "notification history owner changed; explicit migration required"
+                    );
+                    let backup = directory.join(format!(
+                        "store.before-owner-change-{}.json",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos()
+                    ));
+                    tokio::fs::copy(&path, backup).await?;
+                    state.coordinator = config.coordinator_fingerprint.clone();
+                    if state.coordinator == identity {
+                        // A bridge may have queued local notifications between
+                        // choosing the owner and restarting. Commit them here;
+                        // initial setup must never discard that local outbox.
+                        for operation in std::mem::take(&mut state.pending) {
+                            state.apply(identity, &operation)?;
+                        }
+                        state.epoch = new_epoch()?;
+                    }
+                }
                 ensure!(
                     state.records.len() <= MAX_RECORDS && state.pending.len() <= MAX_PENDING,
                     "notification store limits exceeded"
@@ -191,10 +244,7 @@ impl NotificationHub {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Store {
                 epoch: if config.coordinator_fingerprint == identity {
-                    let mut bytes = [0; 16];
-                    getrandom::getrandom(&mut bytes)
-                        .map_err(|e| anyhow::anyhow!("notification epoch generation: {e}"))?;
-                    hex::encode(bytes)
+                    new_epoch()?
                 } else {
                     String::new()
                 },
@@ -259,6 +309,12 @@ impl NotificationHub {
             _bridge: AbortOnDropTask(task),
         }))
     }
+    pub fn bridge_connected(&self) -> bool {
+        self.0.bridges.load(Ordering::Relaxed) > 0
+    }
+    pub async fn coordinator_locked(&self) -> bool {
+        self.0.state.lock().await.coordinator_locked()
+    }
     pub async fn status(&self) -> String {
         if let Some(error) = self.0.error.lock().ok().and_then(|e| e.clone()) {
             return format!("Needs attention: {error}");
@@ -270,10 +326,16 @@ impl NotificationHub {
             return "Waiting for Quickshell bridge — install or reload the integration".into();
         }
         if self.0.links.load(Ordering::Relaxed) == 0 {
-            return "Quickshell connected; waiting for the other PC to enable sharing and connect"
+            return "Quickshell connected; waiting for the other PC to enable/update sharing and confirm the history owner"
                 .into();
         }
         let state = self.0.state.lock().await;
+        if !self.is_coordinator() && state.epoch.is_empty() {
+            return format!(
+                "Owner confirmed; waiting for initial history · {} queued",
+                state.pending.len()
+            );
+        }
         let retained = state.view().iter().filter(|r| r.content.is_some()).count();
         format!(
             "Connected · {retained} notifications · {} queued",
@@ -382,11 +444,13 @@ impl NotificationHub {
         changes.mark_changed();
         self.clear_error();
         Some(NotificationLink {
-            _activity: Activity::new(self.0.links.clone()),
+            _activity: None,
             hub: self.clone(),
             peer: peer.into(),
             changes,
-            outgoing: VecDeque::new(),
+            outgoing: VecDeque::from([NotificationSync::Settings {
+                coordinator: self.0.config.coordinator_fingerprint.clone(),
+            }]),
             staged: None,
             dirty: false,
             pacing: tokio::time::interval(std::time::Duration::from_millis(2)),
@@ -550,7 +614,7 @@ impl Drop for Activity {
 }
 
 pub struct NotificationLink {
-    _activity: Activity,
+    _activity: Option<Activity>,
     hub: NotificationHub,
     peer: String,
     changes: watch::Receiver<u64>,
@@ -565,6 +629,11 @@ impl NotificationLink {
         loop {
             if let Some(event) = self.outgoing.pop_front() {
                 return event;
+            }
+            // The session worker cancels this wait when the peer's Settings
+            // arrives. Do not emit records or local submissions before agreement.
+            if self._activity.is_none() {
+                std::future::pending::<()>().await;
             }
             if !self.dirty {
                 if self.changes.changed().await.is_err() {
@@ -588,6 +657,20 @@ impl NotificationLink {
         }
     }
     pub async fn receive(&mut self, event: NotificationSync) -> Result<()> {
+        if let NotificationSync::Settings { coordinator } = event {
+            ensure!(
+                coordinator == self.hub.0.config.coordinator_fingerprint,
+                "History owner differs between PCs. Choose the same computer in Notifications settings on both PCs"
+            );
+            if self._activity.is_none() {
+                self._activity = Some(Activity::new(self.hub.0.links.clone()));
+            }
+            return Ok(());
+        }
+        ensure!(
+            self._activity.is_some(),
+            "Notification peer did not confirm the history owner"
+        );
         match event {
             NotificationSync::Submit(operation) if self.hub.is_coordinator() => {
                 let mut state = self.hub.0.state.lock().await;
@@ -735,6 +818,97 @@ pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn mismatched_owners_are_rejected_before_any_history_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = edge_crypto::fingerprint(&[1; 32]);
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: b.clone(),
+                peers: vec![b.clone()],
+            },
+            &a,
+            "Lua",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut link = service.hub.link(&b, true).unwrap();
+        assert!(matches!(
+            link.next().await,
+            NotificationSync::Settings { .. }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), link.next())
+                .await
+                .is_err()
+        );
+        assert!(
+            link.receive(NotificationSync::Settings { coordinator: a })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("History owner differs")
+        );
+        assert_eq!(service.hub.0.links.load(Ordering::Relaxed), 0);
+        assert!(!service.hub.coordinator_locked().await);
+    }
+
+    #[tokio::test]
+    async fn an_unsynchronized_replica_can_correct_its_owner_without_losing_local_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = edge_crypto::fingerprint(&[1; 32]);
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let mut config = NotificationConfig {
+            enabled: true,
+            coordinator_fingerprint: a.clone(),
+            peers: vec![a],
+        };
+        let replica = NotificationHub::start(&config, &b, "Tera", dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!replica.hub.coordinator_locked().await);
+        replica
+            .hub
+            .local(
+                NotificationKey {
+                    origin: b.clone(),
+                    instance: "setup/1".into(),
+                },
+                Some(content()),
+            )
+            .await
+            .unwrap();
+        assert!(!replica.hub.coordinator_locked().await);
+        drop(replica);
+        tokio::task::yield_now().await;
+        config.coordinator_fingerprint = b.clone();
+        let corrected = NotificationHub::start(&config, &b, "Tera", dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(corrected.hub.is_coordinator());
+        assert!(corrected.hub.coordinator_locked().await);
+        assert_eq!(corrected.hub.0.state.lock().await.records.len(), 1);
+        assert!(corrected.hub.0.state.lock().await.pending.is_empty());
+        assert!(std::fs::read_dir(dir.path()).unwrap().flatten().any(|p| {
+            p.file_name()
+                .to_string_lossy()
+                .starts_with("store.before-owner-change-")
+        }));
+        let mut state = Store::default();
+        state.pending.push(NotificationOperation {
+            sequence: 1,
+            key: key(),
+            content: Some(content()),
+        });
+        assert!(state.coordinator_locked());
+    }
+
+    #[tokio::test]
     async fn settings_status_follows_connections_and_keeps_the_original_error() {
         let directory = tempfile::tempdir().unwrap();
         let identity = edge_crypto::fingerprint(&[1; 32]);
@@ -756,13 +930,23 @@ mod tests {
         assert!(hub.status().await.contains("Waiting for Quickshell"));
         let bridge = Activity::new(hub.0.bridges.clone());
         assert!(hub.status().await.contains("waiting for the other PC"));
-        let link = hub.link(&peer, true).unwrap();
+        let mut link = hub.link(&peer, true).unwrap();
+        link.receive(NotificationSync::Settings {
+            coordinator: identity.clone(),
+        })
+        .await
+        .unwrap();
         assert!(hub.status().await.starts_with("Connected"));
         hub.record_error("coordinator store reset; explicit recovery required");
         hub.record_error("Notification session stopped");
         assert!(hub.status().await.contains("coordinator store reset"));
         drop(link);
-        let link = hub.link(&peer, true).unwrap();
+        let mut link = hub.link(&peer, true).unwrap();
+        link.receive(NotificationSync::Settings {
+            coordinator: identity.clone(),
+        })
+        .await
+        .unwrap();
         assert!(hub.status().await.starts_with("Connected"));
         drop(link);
         drop(bridge);
@@ -887,6 +1071,8 @@ mod tests {
         main.hub.local(key(), Some(content())).await.unwrap();
         let mut outgoing = main.hub.link(&b, true).unwrap();
         let mut incoming = laptop.hub.link(&a, true).unwrap();
+        incoming.receive(outgoing.next().await).await.unwrap();
+        outgoing.receive(incoming.next().await).await.unwrap();
         loop {
             let event = outgoing.next().await;
             let end = matches!(event, NotificationSync::SnapshotEnd);
@@ -949,15 +1135,28 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/quickshell");
-        tokio::fs::copy(assets.join("tests/shell.qml"), root.join("shell.qml"))
+        let original = tokio::fs::read_to_string(assets.join("tests/shell.qml"))
             .await
             .unwrap();
-        tokio::fs::copy(
-            assets.join("EdgeNotificationBridge.qml"),
-            root.join("EdgeNotificationBridge.qml"),
-        )
-        .await
-        .unwrap();
+        let start = original.find("    EdgeNotificationBridge {").unwrap();
+        let end = start + original[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        let original = format!("{}{}", &original[..start], &original[end..])
+            .replace("        property string epoch: \"\"\n", "")
+            .replace("        property string offlineClosures: \"[]\"\n", "")
+            .replace(
+                "Number(notification.hints[\"x-edge-kvm-posted-ms\"]) || Date.now()",
+                "Date.now()",
+            )
+            .replace(
+                "if (root.dnd || notification.hints[\"x-edge-kvm-replay\"]) return;",
+                "if (root.dnd) return;",
+            );
+        tokio::fs::create_dir(root.join("checkout")).await.unwrap();
+        tokio::fs::write(root.join("checkout/shell.qml"), original)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("checkout/shell.qml"), root.join("shell.qml"))
+            .unwrap();
         let a = edge_crypto::fingerprint(&[1; 32]);
         let b = edge_crypto::fingerprint(&[2; 32]);
         let service = NotificationHub::start(
@@ -1063,6 +1262,23 @@ mod tests {
                 .unwrap()
         }
         let native_id = notify(&connection, 0, "Original").await;
+        assert!(service.hub.0.state.lock().await.records.is_empty());
+        crate::notification_setup::install_bridge(
+            &root.join("shell.qml"),
+            &root.join("state/bridge.sock"),
+        )
+        .unwrap();
+        for _ in 0..150 {
+            if service.hub.0.bridges.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            service.hub.0.bridges.load(Ordering::Relaxed) > 0,
+            "Hot-installed bridge did not connect with retained history: {}",
+            std::fs::read_to_string(root.join("shell.log")).unwrap()
+        );
         for _ in 0..100 {
             if service.hub.0.state.lock().await.records.len() == 1 {
                 break;
@@ -1100,6 +1316,11 @@ mod tests {
             instance: "remote/1".into(),
         };
         let mut link = service.hub.link(&b, true).unwrap();
+        link.receive(NotificationSync::Settings {
+            coordinator: a.clone(),
+        })
+        .await
+        .unwrap();
         link.receive(NotificationSync::Submit(NotificationOperation {
             sequence: 1,
             key: remote.clone(),

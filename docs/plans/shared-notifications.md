@@ -310,3 +310,14 @@ replace manual fingerprints. Existing-store ownership changes are refused.
 Reviewed Tera and updated Ember shells are supported; unknown layouts are left
 untouched and reported in the settings window. A two-PC physical acceptance run
 still follows deployment of the updated build on both devices.
+
+
+### Setup reconciliation fixes
+
+Notification sync v2 begins with history-owner agreement; a mismatched pair fails
+with an actionable status before applying history. Connected names come from the
+authenticated PC Hello rather than the legacy configured `Peer` label. An uninitialized replica can correct its owner without a manual reset; its
+local outbox is retained and its previous store is backed up. Authoritative
+records, an accepted epoch or nonlocal operations keep ownership locked. Bridge installation preserves symlink import paths and
+the watched shell inode, and reinstalling requests a reload. The integration test
+hot-installs into a running symlinked shell with retained history.

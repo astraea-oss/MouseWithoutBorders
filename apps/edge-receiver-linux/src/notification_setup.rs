@@ -16,6 +16,7 @@ pub(crate) struct NotificationControl {
     pub configured_peer: Option<NotificationComputer>,
     pub hub: Option<NotificationHub>,
     pub error: Option<String>,
+    pub connected: std::sync::Arc<std::sync::Mutex<Option<NotificationComputer>>>,
 }
 
 impl NotificationControl {
@@ -35,6 +36,9 @@ impl NotificationControl {
         {
             computers.push(peer.clone());
         }
+        if let Some(peer) = self.connected.lock().ok().and_then(|p| p.clone()) {
+            prefer_connected_name(&mut computers, peer);
+        }
         let shell_path = detect_shell();
         let socket_path = state.join("notifications/bridge.sock");
         let bridge_installed = shell_path
@@ -49,13 +53,30 @@ impl NotificationControl {
                 _ => "Off".into(),
             },
             active: self.hub.is_some(),
-            has_store: state.join("notifications/store.json").exists(),
+            has_store: match &self.hub {
+                Some(hub) => hub.coordinator_locked().await,
+                None => {
+                    crate::notification_hub::coordinator_locked_on_disk(
+                        &state.join("notifications/store.json"),
+                    )
+                    .await?
+                }
+            },
             coordinator: self.coordinator.clone(),
             shell_path,
             socket_path,
             bridge_installed,
+            bridge_connected: self
+                .hub
+                .as_ref()
+                .is_some_and(NotificationHub::bridge_connected),
         })
     }
+}
+
+fn prefer_connected_name(computers: &mut Vec<NotificationComputer>, peer: NotificationComputer) {
+    computers.retain(|p| p.fingerprint != peer.fingerprint);
+    computers.insert(0, peer);
 }
 
 pub(crate) fn detect_shell() -> Option<PathBuf> {
@@ -108,7 +129,7 @@ pub(crate) fn detect_shell() -> Option<PathBuf> {
                 _ => {}
             }
         }
-        if let Ok(path) = path.canonicalize() {
+        if path.is_file() {
             paths.push(path);
         }
     }
@@ -217,9 +238,14 @@ pub(crate) fn install_bridge(shell: &Path, socket: &Path) -> Result<String> {
         socket.is_absolute(),
         "Notification socket path must be absolute"
     );
-    let shell = shell
-        .canonicalize()
-        .context("Choose an existing Quickshell shell.qml")?;
+    ensure!(shell.is_file(), "Choose an existing Quickshell shell.qml");
+    // Preserve the launch path: QML resolves local components beside this URL,
+    // even when shell.qml itself is a symlink into a dotfiles checkout.
+    let shell = if shell.is_absolute() {
+        shell.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(shell)
+    };
     ensure!(
         shell.file_name().is_some_and(|n| n == "shell.qml"),
         "Choose shell.qml"
@@ -231,7 +257,21 @@ pub(crate) fn install_bridge(shell: &Path, socket: &Path) -> Result<String> {
         && std::fs::read_to_string(parent.join("EdgeNotificationBridge.qml"))
             .is_ok_and(|text| text == BRIDGE)
     {
-        return Ok("Quickshell bridge is up to date".into());
+        // Re-request a reload even when the files already match: a previous
+        // symlink/atomic replacement may never have reached the running shell.
+        // A directory event also recovers a watch detached by an earlier
+        // atomic shell replacement. The component contents are identical here.
+        let refresh = parent.join(format!(
+            ".edge-bridge-reload-{}.qml",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::write(&refresh, BRIDGE)?;
+        std::fs::rename(refresh, parent.join("EdgeNotificationBridge.qml"))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&shell)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        return Ok("Requested Quickshell bridge reload; check connection status".into());
     }
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let backup = parent.join(format!("shell.qml.before-edge-notifications-{stamp}"));
@@ -245,19 +285,16 @@ pub(crate) fn install_bridge(shell: &Path, socket: &Path) -> Result<String> {
             parent.join(format!("EdgeNotificationBridge.qml.before-{stamp}")),
         )?;
     }
-    let temporary = parent.join(format!(".edge-notifications-{stamp}.qml"));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    use std::io::Write;
-    file.write_all(patched.as_bytes())?;
-    file.sync_all()?;
-    std::fs::set_permissions(&temporary, std::fs::metadata(&shell)?.permissions())?;
     let component_tmp = parent.join(format!(".edge-bridge-{stamp}.qml"));
     std::fs::write(&component_tmp, BRIDGE)?;
     std::fs::rename(&component_tmp, &component)?;
-    std::fs::rename(&temporary, &shell)?;
+    // Keep the watched shell inode, including when shell.qml is a symlink into
+    // a dotfiles checkout. Replacing its target can detach Quickshell's watch.
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().write(true).open(&shell)?;
+    file.write_all(patched.as_bytes())?;
+    file.set_len(patched.len() as u64)?;
+    file.sync_all()?;
     Ok(format!(
         "Bridge installed. Quickshell reloads automatically; backup: {}",
         backup.display()
@@ -268,6 +305,23 @@ pub(crate) fn install_bridge(shell: &Path, socket: &Path) -> Result<String> {
 mod tests {
     use super::*;
     const SHELL: &str = "id: notificationState\nid: notificationServer\nfunction retainNotification\nfunction releaseTransients\nfunction removeNotificationPopup\nnotification.lastGeneration\nnotification.transient\nproperty string times: \"{}\"\nroot.retainNotification(notification, Date.now());\nif (root.dnd) return;\n    component EmberButton: Rectangle {}\n";
+    #[test]
+    fn authenticated_name_replaces_a_legacy_peer_label_for_the_same_key() {
+        let mut computers = vec![NotificationComputer {
+            name: "Peer".into(),
+            fingerprint: "lua-key".into(),
+        }];
+        prefer_connected_name(
+            &mut computers,
+            NotificationComputer {
+                name: "Lua".into(),
+                fingerprint: "lua-key".into(),
+            },
+        );
+        assert_eq!(computers.len(), 1);
+        assert_eq!(computers[0].name, "Lua");
+    }
+
     #[test]
     fn installing_and_reinstalling_keeps_one_bridge_and_silent_replay() {
         let once = patch_shell(SHELL, Path::new("/tmp/a.sock")).unwrap();

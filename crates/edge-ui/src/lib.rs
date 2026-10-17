@@ -78,6 +78,8 @@ pub struct NotificationSetup {
     pub shell_path: Option<PathBuf>,
     pub socket_path: PathBuf,
     pub bridge_installed: bool,
+    #[serde(default)]
+    pub bridge_connected: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
