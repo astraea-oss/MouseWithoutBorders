@@ -66,9 +66,12 @@ Item {
     function closed(n, reason) {
         if (!n) return;
         entryClosed(n.id);
-        if (n.transient || n.hints["x-edge-kvm-phone"]) return;
+        if (!socketPath.length || n.transient || n.hints["x-edge-kvm-phone"]) return;
+        const key = copyKey(n);
+        // Copies only forward explicit user dismissals, never programmatic closes.
+        if (key && Number(reason) !== 2) return;
         const message = { type: "closed", id: n.id, reason: Number(reason),
-            instance: state.epoch + "/" + n.id, key: copyKey(n) };
+            instance: state.epoch + "/" + n.id, key: key };
         if (!socket.connected) {
             let queue = JSON.parse(state.offlineClosures);
             if (queue.length >= 1024) { console.warn("edge-kvm offline closure queue full"); return; }
@@ -105,7 +108,7 @@ Item {
                     // never title/body matching. Shared projections lack this marker.
                     const suffix = " (" + message.name + ")";
                     for (const n of [...bridge.server.trackedNotifications.values]) {
-                        if (n.hints["x-edge-kvm-phone"] && n.appName.endsWith(suffix)) n.dismiss();
+                        if (n.hints["x-edge-kvm-phone"] && n.appName.endsWith(suffix)) n.expire();
                     }
                 }
                 if (bridge.sendingInventory && data === '{"type":"ready"}') {
@@ -124,7 +127,7 @@ Item {
         }
     }
     Instantiator {
-        model: bridge.server.trackedNotifications.values
+        model: bridge.server.trackedNotifications
         delegate: QtObject {
             required property var modelData
             Component.onCompleted: bridge.post(modelData)

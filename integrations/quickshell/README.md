@@ -146,12 +146,17 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
 - Remote copies appear silently in the normal centre. Fresh remote popups and
   remote actions/replies are deferred. Existing local actions continue working.
 - Individual dismiss and Clear synchronize removals. Dismissed instances cannot
-  be resurrected by stale inventories or updates.
+  be resurrected by stale inventories or updates. Programmatic closure of a
+  projected copy is not forwarded as a new removal. Legacy phone-copy cleanup
+  uses expiry, preserving dismissal reasons for explicit user actions.
 - DND stays local. Popup expiry, shell reload, and remote programmatic close do
   not become user dismissals. Source withdrawal/expiry removes its shared entry.
 - With the coordinator offline, local notifications continue, cached shared
   entries remain, and operations queue durably for the next connection. No
   automatic leader election occurs.
+- A disabled bridge (empty socket path) does not connect or queue closures.
+  The bridge observes the notification model directly, so adding one entry does
+  not repost the entire history.
 - A shell reconnect reconciles its complete inventory before projecting copies.
   Cached entries missing after a cold shell restart are restored silently.
 - Notification state and pending operations survive edge-kvm restarts. Quickshell's
