@@ -145,7 +145,7 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         {
             let settings_input = SettingsUiInput {
                 role: Role::Controller,
-                can_choose_transport: false,
+                connector_only: true,
                 restart_on_save: false,
                 config_path,
                 local_ip: detect_primary_local_ip(),

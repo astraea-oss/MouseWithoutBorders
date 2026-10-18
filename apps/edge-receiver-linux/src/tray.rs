@@ -170,18 +170,6 @@ impl ReceiverTrayHandle {
         .await;
     }
 
-    #[cfg(target_os = "linux")]
-    pub async fn connecting(&self) {
-        self.set_round_trip(None);
-        self.update(|tray| {
-            tray.state = TrayState::Starting;
-            tray.connected_peer = None;
-            tray.round_trip = None;
-            tray.last_error = None;
-        })
-        .await;
-    }
-
     pub async fn pairing_armed(&self, armed: bool) {
         self.update(move |tray| tray.pairing_armed = armed).await;
     }
