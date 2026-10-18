@@ -224,6 +224,7 @@ struct Inner {
     config: NotificationConfig,
     identity: String,
     name: String,
+    source_names: std::sync::Mutex<BTreeMap<String, String>>,
     path: PathBuf,
     state: Mutex<Store>,
     changed: watch::Sender<u64>,
@@ -489,10 +490,22 @@ impl NotificationHub {
             .context("bind notification bridge (Unix socket paths must fit the OS limit)")?;
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).await?;
         let (changed, _) = watch::channel(0);
+        let pins = edge_crypto::PinStore::load_or_default(
+            directory.parent().unwrap_or(directory).join("pins.toml"),
+        )
+        .await?;
+        let mut source_names: BTreeMap<_, _> = pins
+            .peers
+            .into_iter()
+            .filter(|(_, pin)| config.peers.contains(&pin.fingerprint))
+            .map(|(name, pin)| (pin.fingerprint, name.chars().take(64).collect::<String>()))
+            .collect();
+        source_names.insert(identity.into(), name.chars().take(64).collect());
         let hub = Self(Arc::new(Inner {
             config: config.clone(),
             identity: identity.into(),
             name: name.into(),
+            source_names: std::sync::Mutex::new(source_names),
             path,
             state: Mutex::new(store),
             changed,
@@ -530,6 +543,19 @@ impl NotificationHub {
     }
     pub fn bridge_connected(&self) -> bool {
         self.0.bridges.load(Ordering::Relaxed) > 0
+    }
+    pub fn set_peer_name(&self, fingerprint: &str, name: &str) {
+        if !self.enrolled(fingerprint) {
+            return;
+        }
+        let name: String = name.chars().take(64).collect();
+        if let Ok(mut names) = self.0.source_names.lock()
+            && names.get(fingerprint) != Some(&name)
+        {
+            names.insert(fingerprint.into(), name);
+            drop(names);
+            self.publish();
+        }
     }
     pub async fn coordinator_locked(&self) -> bool {
         self.0.state.lock().await.coordinator_locked()
@@ -783,6 +809,21 @@ impl NotificationHub {
                 )
                 .await??;
             }
+            let names = self
+                .0
+                .source_names
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default();
+            let mut message = serde_json::to_vec(
+                &serde_json::json!({"type": "sources", "identity": self.0.identity, "names": names}),
+            )?;
+            message.push(b'\n');
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                writer.write_all(&message),
+            )
+            .await??;
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 writer.write_all(b"{\"type\":\"ready\"}\n"),
@@ -1988,6 +2029,7 @@ mod tests {
             origin: b.clone(),
             instance: "remote/1".into(),
         };
+        service.hub.set_peer_name(&b, "Lua");
         let mut link = service.hub.link(&b, true).unwrap();
         link.receive(NotificationSync::Settings {
             coordinator: a.clone(),
@@ -2006,7 +2048,10 @@ mod tests {
             let list = entries(root, &environment).await.unwrap();
             remote_id = list
                 .iter()
-                .find(|e| e["key"].as_str().is_some_and(|key| !key.is_empty()))
+                .find(|e| {
+                    e["label"] == "Mail (Lua)"
+                        && e["key"].as_str().is_some_and(|key| !key.is_empty())
+                })
                 .map(|e| e["id"].as_u64().unwrap());
             if remote_id.is_some() {
                 break;
@@ -2014,6 +2059,30 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let remote_id = remote_id.expect("remote notification not projected");
+        assert!(
+            entries(root, &environment)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e["label"] == "Local test (Main)")
+        );
+        assert_eq!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .find(|r| r.key == remote)
+                .unwrap()
+                .content
+                .as_ref()
+                .unwrap()
+                .app_name,
+            "Mail"
+        );
         let output = tokio::process::Command::new("quickshell")
             .arg("-p")
             .arg(root)
@@ -2198,6 +2267,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let phone_copy = phone_copy.expect("phone history was not projected");
+        assert_eq!(phone_copy["label"], "Phone app (Test phone)");
         assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
         // Replay an icon-bearing phone update, which the shell cannot echo back
         // as bytes. It must replace once and settle, rather than loop forever.

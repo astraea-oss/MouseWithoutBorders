@@ -12,6 +12,8 @@ Item {
     property string socketPath: Quickshell.env("EDGE_KVM_NOTIFICATION_SOCKET") || ""
     property bool sendingInventory: false
     property bool initialized: false
+    property string localIdentity: ""
+    property var sourceNames: ({})
     signal entryClosed(int id)
 
     // Keep this PersistentProperties object at the ShellRoot level so its
@@ -46,6 +48,14 @@ Item {
     function copyKey(n) {
         try { return JSON.parse(n.hints["x-edge-kvm-key"] || "null"); }
         catch (_) { return null; }
+    }
+    function appLabel(n) {
+        const app = n.appName || "Notification";
+        const key = copyKey(n);
+        if (n.hints["x-edge-kvm-phone"] || (key && typeof key.instance === "string" && key.instance.startsWith("phone/"))) return app;
+        const origin = key ? key.origin : localIdentity;
+        const name = sourceNames[origin];
+        return name ? app + " (" + name + ")" : app;
     }
     function post(n) {
         if (!n || n.transient || n.hints["x-edge-kvm-phone"]) return;
@@ -86,6 +96,10 @@ Item {
             onRead: data => {
                 let message;
                 try { message = JSON.parse(data); } catch (_) { return; }
+                if (message.type === "sources") {
+                    bridge.localIdentity = message.identity;
+                    bridge.sourceNames = message.names;
+                }
                 if (message.type === "retire_phone" && typeof message.name === "string") {
                     // Dedicated legacy marker plus the paired phone's app suffix,
                     // never title/body matching. Shared projections lack this marker.

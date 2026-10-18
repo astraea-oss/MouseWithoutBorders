@@ -2653,6 +2653,9 @@ async fn run_node(
                     last_dial_error = None;
                     let peer_name = connection.peer_name.clone();
                     let peer_fingerprint = connection.peer_fingerprint.clone();
+                    if let Some(hub) = notification_hub {
+                        hub.set_peer_name(&peer_fingerprint, &peer_name);
+                    }
                     if connection.newly_paired {
                         pins.pin(peer_name.clone(), peer_fingerprint.clone());
                         pins.save(&pins_path).await?;
@@ -2945,6 +2948,9 @@ async fn run_node(
                 name: hello.device_name.clone(),
                 fingerprint: peer_fingerprint.clone(),
             });
+        }
+        if let Some(hub) = notification_hub {
+            hub.set_peer_name(&peer_fingerprint, &hello.device_name);
         }
         if let Some(tray) = &tray {
             tray.connected(hello.device_name.clone()).await;

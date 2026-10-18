@@ -29,6 +29,7 @@ ShellRoot {
         }
     }
     EdgeNotificationBridge {
+        id: edgeNotificationBridge
         server: notificationServer
         state: notificationState
         timestamps: root.notificationTimes
@@ -37,7 +38,7 @@ ShellRoot {
     IpcHandler {
         target: "test"
         function entries(): string {
-            return JSON.stringify(notificationServer.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, key: n.hints["x-edge-kvm-key"] || "" })));
+            return JSON.stringify(notificationServer.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, label: typeof edgeNotificationBridge === "undefined" ? n.appName : edgeNotificationBridge.appLabel(n), key: n.hints["x-edge-kvm-key"] || "" })));
         }
         function dismiss(id: int): void {
             const entry = notificationServer.trackedNotifications.values.find(n => n.id === id);

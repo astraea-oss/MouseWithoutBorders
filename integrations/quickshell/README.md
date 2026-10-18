@@ -138,6 +138,11 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
 
 - Local posts and replacements enter the shared set. A source notification keeps
   its identity across a shell reload.
+- Centre app labels include the source computer's configured device name, such
+  as `Flameshot (Lua)` or `discord (Tera)`, for both native and shared entries.
+  Names come from saved pairings and authenticated peer greetings; existing
+  history is labelled without rewriting its app names or IDs. Phone labels keep
+  their existing phone name instead of acquiring the gateway PC's name.
 - Remote copies appear silently in the normal centre. Fresh remote popups and
   remote actions/replies are deferred. Existing local actions continue working.
 - Individual dismiss and Clear synchronize removals. Dismissed instances cannot

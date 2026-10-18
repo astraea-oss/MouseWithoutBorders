@@ -162,9 +162,15 @@ fn replace_once(text: &str, before: &str, after: &str) -> Result<String> {
 }
 
 fn patch_shell(original: &str, socket: &Path) -> Result<String> {
+    let labelled = original.replace(
+        "text: modelData.appName;",
+        "text: edgeNotificationBridge.appLabel(modelData); textFormat: Text.PlainText;",
+    );
+    let original = labelled.as_str();
     let socket = serde_json::to_string(socket.to_str().context("socket path must be UTF-8")?)?;
     let bridge = format!(
         r#"    EdgeNotificationBridge {{
+        id: edgeNotificationBridge
         server: notificationServer
         state: notificationState
         timestamps: root.notificationTimes
