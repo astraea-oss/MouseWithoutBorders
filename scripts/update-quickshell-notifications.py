@@ -60,12 +60,18 @@ def update(reference, current, socket):
     panel = reference[start:reference.index('    PanelWindow {', start + 20)]
     panel = panel.replace('    PanelWindow {', '    PanelWindow {\n        id: notificationsPanel', 1).replace('screen: bar.screen', 'screen: root.panelScreen')
     panel = panel.replace('text: modelData.summary; color:', 'text: modelData.summary; textFormat: Text.PlainText; color:')
+    # Keep the laptop's right-hand layout, including the pinned exclusive zone.
+    panel = panel.replace('left: true; right: !root.notificationsPinned', 'left: !root.notificationsPinned; right: true')
+    panel = panel.replace('left: parent.left; leftMargin: root.hyprGap', 'right: parent.right; rightMargin: root.hyprGap')
+    panel = panel.replace("moves the scrolling layout's left edge to the panel's right edge.", "moves the scrolling layout's right edge to the panel's left edge.")
     old_panel_start = result.index('    PanelWindow {\n        id: notificationsPanel')
     old_panel_end = result.index('    PanelWindow {', old_panel_start + 20)
     result = result[:old_panel_start] + panel + result[old_panel_end:]
     overlay_start = reference.index('    PanelWindow {\n        id: notificationOverlay')
     overlay_end = reference.index('    PanelWindow {', overlay_start + 20)
     overlay = reference[overlay_start:overlay_end].replace('screen: bar.screen', 'screen: root.panelScreen')
+    overlay = overlay.replace('anchors { bottom: true; left: true }', 'anchors { bottom: true; right: true }')
+    overlay = overlay.replace('margins { left: root.barWidth + root.panelGap; bottom: 20 }', 'margins { right: root.panelGap; bottom: 20 }')
     result = result.replace(panel, overlay + panel, 1)
     return result
 
