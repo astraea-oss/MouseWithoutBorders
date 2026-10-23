@@ -291,6 +291,7 @@ impl FreedesktopNotifications {
         content: &edge_protocol::SharedNotification,
         replaces: u32,
         _local_name: &str,
+        silent: bool,
     ) -> Result<u32> {
         let mut hints: HashMap<&str, Value> = HashMap::new();
         let key_json = serde_json::to_string(key)?;
@@ -298,8 +299,10 @@ impl FreedesktopNotifications {
         // Strings avoid JavaScript's integer precision limit.
         let posted = content.posted_ms.to_string();
         hints.insert("x-edge-kvm-posted-ms", Value::from(posted.as_str()));
-        hints.insert("x-edge-kvm-replay", Value::from(true));
-        hints.insert("suppress-sound", Value::from(true));
+        if silent {
+            hints.insert("x-edge-kvm-replay", Value::from(true));
+            hints.insert("suppress-sound", Value::from(true));
+        }
         hints.insert("urgency", Value::from(content.urgency));
         let icon = content
             .icon_png

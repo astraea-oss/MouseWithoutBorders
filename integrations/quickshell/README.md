@@ -175,9 +175,12 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   that session; reconnect after fixing the reported cause.
 - Storage is capped at 4,096 records including terminal markers, 1,024 pending
   operations, and 32 MiB serialized state. At capacity, notification operations
-  fail with a diagnostic; native notification delivery continues. Automatic
-  tombstone compaction is deferred, so this initial version needs explicit
-  maintenance when its record limit is reached.
+  fail with a diagnostic without disconnecting the Quickshell bridge or phone
+  session. Native notifications and local phone delivery continue; phone clipboard
+  and audio remain connected. New overflow entries are local-only until history
+  capacity is recovered. Automatic tombstone compaction remains deferred: deleting
+  markers without an origin-retirement protocol could resurrect dismissed entries.
+  This initial version still requires explicit maintenance at the history limit.
 - The store contains private notification text in plaintext, protected by a 0700
   directory and 0600 files/socket. Removed content is deleted from state while
   minimal terminal markers remain. Bodies are never logged. Icons use bounded
@@ -185,7 +188,13 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
 - With sharing enabled, authenticated phone notifications write directly to the
   shared store, using the gateway PC identity plus phone fingerprint and phone
   notification ID. Both PC centres project those records; no second local phone
-  delivery runs alongside them. Phone reconnect snapshots are idempotent, missing
+  delivery runs alongside them. Fresh phone posts pop up on the gateway PC,
+  respecting local DND; snapshot/reconnect/restored copies stay silent. Gateway
+  delivery also works while the bridge is disconnected. A private, daemon-scoped
+  `phone-projections.json` cache shares IDs between direct delivery and bridge
+  reconciliation; it stores only IDs, keys, digests and local dismissal flags.
+  Overflow dismissals remain suppressed on retry and become terminal if later
+  admitted to the shared store. Phone reconnect snapshots are idempotent, missing
   entries are removed only after a complete snapshot, and PC dismissals remain
   terminal even if the phone resends an entry. Unpairing removes that phone's
   shared entries. The gateway durably tracks each phone ID's lifetime, so an ID
@@ -197,7 +206,8 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   their persisted ID mappings in `state/phone-notifications/`, checking the
   notification daemon generation before closing anything. The bridge also retires
   orphaned legacy copies using their dedicated phone marker and paired phone name,
-  after a complete successful import; it never matches notification titles/bodies.
+  after a complete successful import and local delivery; partial/failed imports
+  never trigger legacy retirement. It never matches notification titles/bodies.
   With PC sharing disabled, ordinary local phone mirroring remains available.
   Legacy copies stay excluded from Quickshell ingestion because the phone adapter
   now imports them directly; removing that exclusion would create duplicates.

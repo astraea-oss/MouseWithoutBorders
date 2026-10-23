@@ -971,10 +971,15 @@ async fn run_phone_session(
                         };
                         if let Some(source) = &mut shared_phone {
                             let snapshot_end = matches!(event, edge_protocol::NotificationEvent::SnapshotEnd);
-                            // Fail the session on storage errors so the next phone
-                            // snapshot retries instead of silently dropping input.
-                            source.apply(event).await?;
-                            if snapshot_end {
+                            // History failure must not tear down phone clipboard/audio.
+                            let imported = match source.apply_and_deliver(event, notifications.desktop.as_ref()).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(%error, phone = %context.name, "phone notification history needs attention");
+                                    false
+                                }
+                            };
+                            if snapshot_end && imported {
                                 // Retire legacy local copies only after successful import.
                                 notifications.mirror.lock().await.close_all(notifications.desktop.as_ref()).await;
                             }
@@ -1076,6 +1081,106 @@ fn io_error<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<&'a std:
         | (_, _, _, Some(ProtocolError::Io(io))) => Some(io),
         _ => None,
     }
+}
+
+/// Exercises the actual encrypted phone loop on the private notification test bus.
+#[cfg(test)]
+pub(crate) async fn assert_history_failure_keeps_phone_connected(
+    hub: crate::notification_hub::NotificationHub,
+    desktop: Arc<FreedesktopNotifications>,
+    state_dir: PathBuf,
+) {
+    use edge_crypto::{IdentityKey, accept_noise_session, initiate_noise_session};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = IdentityKey::generate().unwrap();
+    let phone_identity = IdentityKey::generate().unwrap();
+    let (requests, _requests_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (session, _) = accept_noise_session(stream, &identity).await.unwrap();
+        let fingerprint = edge_crypto::fingerprint(&[8; 32]);
+        let hello = LocalHello {
+            device_name: "Test gateway".into(),
+            role: Role::Receiver,
+            fingerprint: identity.fingerprint(),
+        }
+        .frame(false, true);
+        let context = SessionContext {
+            name: "Overflow phone".into(),
+            fingerprint: fingerprint.clone(),
+            ip: "127.0.0.1".parse().unwrap(),
+            requests,
+            clipboard: None,
+            clipboard_images: false,
+            notifications: Some(SessionNotifications {
+                desktop,
+                mirror: Arc::default(),
+                hub: Some(hub),
+            }),
+            state_dir,
+            accepts_audio_invite: false,
+            tray: None,
+        };
+        let (_commands, commands) = mpsc::unbounded_channel();
+        let _ = run_phone_session(
+            session,
+            hello,
+            Entry::Pinned(PinnedPhone {
+                fingerprint,
+                allowed_features: PhoneFeature::all(),
+            }),
+            context,
+            PhoneTimings::DEFAULT,
+            commands,
+        )
+        .await;
+    });
+    let _task = AbortOnDropTask(task);
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut phone, _) = initiate_noise_session(stream, &phone_identity, None)
+        .await
+        .unwrap();
+    let _hello = phone.read_packet().await.unwrap();
+    phone
+        .write_packet(
+            &edge_protocol::encode_frame(&Frame::Notification(
+                edge_protocol::NotificationEvent::Posted(edge_protocol::PhoneNotification {
+                    id: 91,
+                    app_name: "Chat".into(),
+                    title: "Session survives full history".into(),
+                    body: "test".into(),
+                    icon_png: None,
+                    posted_ms: 91,
+                }),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    phone
+        .write_packet(
+            &edge_protocol::encode_frame(&Frame::Heartbeat(Heartbeat { sequence: 246 })).unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = edge_protocol::decode_frame(&phone.read_packet().await.unwrap()).unwrap();
+            if frame == Frame::Heartbeat(Heartbeat { sequence: 246 }) {
+                break;
+            }
+            if let Frame::Heartbeat(beat) = frame {
+                phone
+                    .write_packet(&edge_protocol::encode_frame(&Frame::Heartbeat(beat)).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("notification overflow must not disconnect the phone session");
 }
 
 #[cfg(test)]

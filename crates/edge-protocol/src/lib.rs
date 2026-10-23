@@ -52,7 +52,7 @@ pub enum Frame {
     Phone(PhoneEvent),
     /// Phone → receiver, only with `notifications-v1`.
     Notification(NotificationEvent),
-    /// Only exchanged by explicitly enrolled PCs advertising notification-sync-v1.
+    /// Only exchanged by explicitly enrolled PCs advertising notification-sync-v2.
     NotificationSync(NotificationSync),
 }
 
