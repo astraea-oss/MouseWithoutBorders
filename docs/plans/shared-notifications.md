@@ -1,9 +1,12 @@
 # Shared notifications through Quickshell
 
-Status: initial Linux PC implementation written. The laptop notification centre
-has been ported from the merged Tera configuration. Physical two-PC deployment
-and acceptance, mobile integration, incremental replay, and automatic compaction
-remain outstanding. See [setup and current limits](../../integrations/quickshell/README.md).
+Status: Linux PC synchronization, existing-settings setup, source device labels,
+and phone notification ingestion are implemented. The laptop notification centre
+has been ported from the merged Tera configuration. Final physical two-PC
+acceptance, reverse Android dismissal, incremental replay, and automatic
+compaction remain outstanding. See
+[setup and current limits](../../integrations/quickshell/README.md) for implemented
+behaviour; the sections below also include deferred design work.
 
 The sections below describe the target design. The first implementation uses
 bounded full snapshots instead of an incremental commit log. Remote entries are
@@ -20,12 +23,14 @@ edge-kvm owns synchronization and the canonical shared state. Quickshell remains
 the notification server and the only desktop notification UI. No additional
 inbox, notification daemon, cloud service, or web UI is introduced.
 
-The initial target is Tera (main PC) and Luna (laptop), both using Quickshell.
+The initial target is Tera (main PC) and Lua (laptop), both using Quickshell.
 The shared model must stay platform independent so future Windows/mobile adapters
 can use it without changing conflict rules. Native Windows integration is a
 separate milestone, not a prerequisite for these Linux computers.
 
-## Existing implementation and reference behaviour
+## Starting point and reference behaviour
+
+This section records the implementation before shared notification support.
 
 - `crates/edge-protocol/src/lib.rs` has `notifications-v1`: phone-to-receiver
   posts, removals, and reconnect snapshots. It has no reverse dismissal command
@@ -45,15 +50,15 @@ The standard does not provide an API to enumerate a notification centre's histor
 so posting via D-Bus alone cannot capture all local entries. A small Quickshell
 bridge is necessary.
 
-Prerequisite: fix [astraea.files issue #1](https://github.com/astraea-oss/astraea.files/issues/1).
-Tera currently calls `dismiss()` on arrival during DND, losing history and making
-suppression indistinguishable from user dismissal. Port the notification changes
-to Luna without copying machine-specific monitor, wallpaper, or home paths.
+Completed prerequisite: fix [astraea.files issue #1](https://github.com/astraea-oss/astraea.files/issues/1).
+The original Tera shell called `dismiss()` on arrival during DND, losing history
+and making suppression indistinguishable from user dismissal. The reviewed
+notification lifecycle fixes were ported to Lua while preserving its local layout.
 
 ## One authority
 
 Configure Tera's pinned device identity as the notification coordinator. Its
-notification hub is the single writer of committed shared state. Luna and phone
+notification hub is the single writer of committed shared state. Lua and phone
 gateways submit operations and maintain caches; they do not become authorities
 when disconnected. Coordination is independent of KVM controller/receiver roles,
 input forwarding, and the connection initiator.
@@ -63,7 +68,7 @@ Tera local apps -> Tera Quickshell <-> local bridge <-> Tera notification hub
                                                         ^       |
                                              encrypted operations/state
                                                         |       v
-Luna local apps -> Luna Quickshell <-> local bridge <-> Luna cache/outbox
+Lua local apps -> Lua Quickshell <-> local bridge <-> Lua cache/outbox
                                                         ^
                                                         |
                                                  paired phone gateway
@@ -74,7 +79,7 @@ operations to Tera without changing the phone's origin identity. Do not broadcas
 phone content to other trusted peers implicitly: participation in this shared set
 requires explicit permission, including onward sharing from each phone.
 
-If Tera is unavailable, local notifications continue working. Luna keeps its last
+If Tera is unavailable, local notifications continue working. Lua keeps its last
 committed shared view, adds local provisional entries, and queues changes. A local
 dismissal hides the entry immediately, but other devices converge only when the
 coordinator can be reached. No automatic election or split-brain fallback in v1.
@@ -143,7 +148,7 @@ depends on mobile support, permissions, and native notification restrictions.
 ## Quickshell bridge
 
 Keep `NotificationServer` and the existing notification list in Quickshell. Add a
-small reusable bridge component, shared between the Tera and Luna dotfiles:
+small reusable bridge component, shared between the Tera and Lua dotfiles:
 
 1. Connect to the local edge-kvm process over a private Unix socket using
    `Quickshell.Io.Socket`. Use versioned, bounded newline-delimited JSON with
@@ -246,7 +251,7 @@ as authority to silently delete all cached entries.
 1. **Dotfiles prerequisite and API spike.** Resolve issue #1; extract the bridge
    component; check installed versions, replacement observation, close reasons,
    custom hints, icon rendering, silent replay, and reload identity preservation.
-   Update only Luna's relevant configuration after reviewing its local differences.
+   Update only Lua's relevant configuration after reviewing its local differences.
 2. **Shared state and protocol.** Implement the reducer, persistence, identities,
    extension negotiation, membership checks, commit ordering, and reconnect rules
    in reusable Rust code. Add a single process-level hub, not one store per session.
@@ -272,7 +277,7 @@ origins/phone relays. Use fake adapters for callback ordering and echo preventio
 Run affected Rust tests plus workspace checks when code is implemented; this
 document alone does not require runtime tests.
 
-Manual acceptance on Tera and Luna:
+Manual acceptance on Tera and Lua:
 
 - A local notification from either computer appears once in both existing centres.
 - An update replaces both entries in place; icons, source time, and Unicode survive.
