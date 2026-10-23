@@ -305,7 +305,9 @@ impl OutputConverter {
             }
             self.source_position += step;
         }
-        let consumed = self.source_position.floor() as usize;
+        // Downsampling can step past this chunk. Carry the remaining position
+        // into the next chunk instead of draining beyond the buffered frames.
+        let consumed = (self.source_position.floor() as usize).min(self.input_frames.len());
         self.input_frames.drain(..consumed);
         self.source_position -= consumed as f64;
         output
@@ -419,6 +421,17 @@ mod tests {
                 .iter()
                 .all(|sample| (*sample - 0.25).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn downsampling_carries_skipped_frames_across_short_chunks() {
+        let mut converter = OutputConverter::new(8_000, 2);
+        let mut output = Vec::new();
+        for _ in 0..240 {
+            output.extend(converter.convert(&[0.25; 4], 1.0));
+        }
+        assert_eq!(output.len(), 80 * 2);
+        assert!(output.iter().all(|sample| *sample == 0.25));
     }
 
     #[test]
