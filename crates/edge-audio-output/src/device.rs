@@ -293,3 +293,28 @@ pub fn play_test_tone() -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires PipeWire and EDGE_KVM_AUDIO_TEST_OUTPUT naming a non-default output"]
+    fn named_phone_output_opens_the_requested_device() {
+        let requested = std::env::var("EDGE_KVM_AUDIO_TEST_OUTPUT").expect("set output device ID");
+        let host = select_host();
+        assert_eq!(host.id().name(), "PipeWire");
+        let expected = find_output(&host, &requested).expect("requested device must exist");
+        let default = host.default_output_device().unwrap();
+        assert_ne!(
+            expected.id().unwrap(),
+            default.id().unwrap(),
+            "use a non-default device to detect accidental fallback"
+        );
+        let stats = Arc::new(PlaybackStats::default());
+        let (stream, opened) = open_stream(stats, Some(&requested), 260).unwrap();
+        assert_eq!(opened.output_name, expected.to_string());
+        // Opening an empty stream exercises the phone path without audible audio.
+        drop(stream);
+    }
+}
