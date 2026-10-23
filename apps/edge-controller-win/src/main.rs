@@ -35,7 +35,7 @@ use edge_protocol::Edge;
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStopReason, AudioStreamState,
     CLIPBOARD_IMAGE_EXTENSION, CLIPBOARD_TEXT_CHUNKS_EXTENSION, ClipboardCancelReason,
-    ClipboardEvent, ControlEvent, Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH,
+    ClipboardEvent, ControlEvent, Frame, HeartbeatPing, Hello, INITIAL_ROLE_EPOCH,
     INPUT_TOGGLE_EXTENSION, InputEvent, MouseButton, NodeCapability, OutputInfo,
     PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent, RoleEvent, RoleState,
     RoleTransitionState, ScreenInfo, decode_frame, encode_frame, fits_secure_frame,
@@ -147,12 +147,13 @@ async fn run_main(controller_log: PathBuf) -> Result<()> {
         {
             let settings_input = SettingsUiInput {
                 role: Role::Controller,
-                can_choose_transport: false,
+                connector_only: true,
                 restart_on_save: false,
                 config_path,
                 local_ip: detect_primary_local_ip(),
                 pairing: controller_pairing_state(&config),
                 config,
+                link: None,
             };
             tokio::task::spawn_blocking(move || edge_ui::run_settings_window(settings_input))
                 .await
@@ -543,6 +544,9 @@ fn append_portable_log(path: &Path, message: impl AsRef<str>) {
 
 #[cfg(windows)]
 fn update_windows_tray_status(status: &str, log_path: &Path) {
+    if !status.starts_with("Connected") {
+        edge_windows_input::set_tray_round_trip(None);
+    }
     if let Err(err) = edge_windows_input::update_tray_status(status) {
         tracing::warn!(%err, status, "failed to update Windows tray status");
         append_portable_log(
@@ -1309,6 +1313,7 @@ async fn run_connected_inner(
     let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
     tokio::pin!(heartbeat);
     let mut heartbeat_sequence = 0_u64;
+    let mut heartbeat_ping = HeartbeatPing::default();
     let mut connection_watchdog = time::interval(Duration::from_millis(250));
     connection_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut receiver_liveness = LivenessTracker::new(liveness_config, tokio::time::Instant::now());
@@ -1557,7 +1562,9 @@ async fn run_connected_inner(
                 heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
                 write_secure_frame_writer(
                     &mut writer,
-                    &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                    &Frame::Heartbeat(
+                        heartbeat_ping.outgoing(heartbeat_sequence, std::time::Instant::now()),
+                    ),
                 )
                 .await?;
                 let input_active = if local_is_controller {
@@ -1835,7 +1842,12 @@ async fn run_connected_inner(
                 let frame = frame.context("receiver frame reader ended")??;
                 receiver_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 match frame {
-                    Frame::Heartbeat(heartbeat) => tracing::trace!(sequence = heartbeat.sequence, "heartbeat"),
+                    Frame::Heartbeat(heartbeat) => {
+                        if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
+                            write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
+                        }
+                        edge_windows_input::set_tray_round_trip(heartbeat_ping.round_trip());
+                    }
                     Frame::Input(input) => {
                         if input.role_epoch != role_epoch
                             || local_is_controller

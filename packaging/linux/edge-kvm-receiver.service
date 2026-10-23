@@ -8,6 +8,7 @@ PartOf=graphical-session.target
 Type=simple
 Environment=EDGE_KVM_CONFIG=%h/.config/edge-kvm/receiver.toml
 Environment=EDGE_KVM_STATE_DIR=%h/.local/state/edge-kvm
+Environment=EDGE_KVM_SERVICE_MANAGED=1
 ExecStart=%h/.local/bin/edge-receiver-linux
 Restart=always
 RestartSec=2

@@ -21,7 +21,7 @@ use edge_clipboard::{
     ClipboardPeerFeatures, IncomingClipboardTransfer, OutgoingClipboardTransfer, TransferLimits,
 };
 use edge_common::{
-    AppConfig, AudioLocalPlayback, AudioRoutePreference, Role, TransportMode, default_state_dir,
+    AppConfig, AudioLocalPlayback, AudioRoutePreference, Role, default_state_dir,
     detect_primary_local_ip, init_tracing, portable_config_path,
 };
 #[cfg(target_os = "linux")]
@@ -38,7 +38,7 @@ use edge_linux_input::{
 use edge_protocol::{
     AUDIO_ROUTE_EXTENSION, AudioCodec, AudioControl, AudioStreamState, CLIPBOARD_IMAGE_EXTENSION,
     CLIPBOARD_TEXT_CHUNKS_EXTENSION, ClipboardCancelReason, ClipboardEvent, ControlEvent, Edge,
-    Frame, Heartbeat, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent,
+    Frame, HeartbeatPing, Hello, INITIAL_ROLE_EPOCH, INPUT_TOGGLE_EXTENSION, InputEvent,
     NodeCapability, OutputInfo, PAIRING_CONFIRMATION_EXTENSION, PROTOCOL_VERSION, PairingEvent,
     ReleaseReason, RemoteError, RoleEvent, ScreenInfo, decode_frame, encode_frame,
     fits_secure_frame,
@@ -52,7 +52,7 @@ use edge_runtime::{
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use edge_ui::{
     PairingConfirmationInput, PairingUiState, SettingsUiInput, SettingsUiResult,
-    run_settings_window,
+    run_phone_pairing_window, run_settings_window,
 };
 #[cfg(target_os = "linux")]
 use socket2::SockRef;
@@ -83,10 +83,14 @@ const RETURN_EDGE_CONFIRMATIONS: u8 = 2;
 const RETURN_EDGE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const RETURN_EDGE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 static SETTINGS_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
+static PHONE_PAIRING_PROCESS_OPEN: AtomicBool = AtomicBool::new(false);
 
 mod acceptor;
 mod clipboard_hub;
 mod control;
+mod control_link;
+mod notification_hub;
+mod notification_setup;
 mod notifications;
 mod phone;
 mod phone_audio;
@@ -125,6 +129,9 @@ struct Args {
     settings: bool,
     #[arg(long, hide = true)]
     settings_parent_pid: Option<u32>,
+    /// Show the phone pairing QR code for the running receiver.
+    #[arg(long, hide = true)]
+    add_phone: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -156,10 +163,12 @@ impl From<TestCaptureEdge> for Edge {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     // Control commands talk to the running receiver; they aren't receivers.
-    if let Some(command) = Args::parse().command {
+    if let Some(command) = args.command {
         return control::run_client(command).await;
     }
+    let window_process = args.settings || args.add_phone;
     init_tracing();
     let receiver_log = default_state_dir().join("receiver.log");
     install_receiver_panic_log(receiver_log.clone());
@@ -193,6 +202,11 @@ async fn main() -> Result<()> {
             format!("receiver process exited with error: {err:#}"),
         ),
     }
+    // A window runs on a blocking thread, which the runtime would wait for
+    // on shutdown, so a signal alone wouldn't close it.
+    if window_process {
+        std::process::exit(i32::from(result.is_err()));
+    }
     result
 }
 
@@ -222,16 +236,29 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         );
     }
 
+    if args.add_phone {
+        let link = Arc::new(control_link::ControlLink::new(receiver_log.clone()));
+        tokio::task::spawn_blocking(move || run_phone_pairing_window(link))
+            .await
+            .context("phone pairing window task failed")??;
+        return Ok(());
+    }
+
     if args.settings {
         let restart_config_path = config_path.clone();
+        let link = Some(
+            Arc::new(control_link::ControlLink::new(receiver_log.clone()))
+                as Arc<dyn edge_ui::NodeLink>,
+        );
         let settings_input = SettingsUiInput {
             role: config.preferred_role,
-            can_choose_transport: true,
+            connector_only: false,
             restart_on_save: args.settings_parent_pid.is_some(),
             config_path,
             config,
             local_ip: detect_primary_local_ip(),
             pairing: PairingUiState::Idle,
+            link,
         };
         let result = tokio::task::spawn_blocking(move || run_settings_window(settings_input))
             .await
@@ -274,23 +301,16 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    match config.transport {
-        TransportMode::Listen => {
-            let backend = ReceiverBackend::from_config(&config)?;
-            run_receiver(
-                config,
-                config_path,
-                args.pair,
-                backend,
-                !args.no_tray,
-                receiver_log,
-            )
-            .await
-        }
-        TransportMode::Connect => {
-            run_linux_connector(config, config_path, args.pair, !args.no_tray, receiver_log).await
-        }
-    }
+    let backend = ReceiverBackend::from_config(&config)?;
+    run_node(
+        config,
+        config_path,
+        args.pair,
+        backend,
+        !args.no_tray,
+        receiver_log,
+    )
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -463,6 +483,8 @@ async fn run_input_test(backend: &ReceiverBackend, test: TestInput) -> Result<()
 #[cfg(target_os = "linux")]
 struct LinuxPeerConnection {
     session: NoiseSession<TcpStream>,
+    /// Pairing was confirmed on both computers during this connection.
+    newly_paired: bool,
     local_name: String,
     local_fingerprint: String,
     peer_name: String,
@@ -478,198 +500,18 @@ struct LinuxPeerConnection {
     peer_supports_audio_playback: bool,
     peer_supports_audio_route: bool,
     peer_clipboard: ClipboardPeerFeatures,
-}
-
-#[cfg(target_os = "linux")]
-async fn run_linux_connector(
-    mut config: AppConfig,
-    config_path: PathBuf,
-    initial_pairing_armed: bool,
-    enable_tray: bool,
-    log_path: PathBuf,
-) -> Result<()> {
-    let identity = IdentityKey::load_or_create(default_state_dir().join("identity.toml"))
-        .await
-        .context("failed to load Linux connector identity")?;
-    // First-time setup should lead directly to the mutual confirmation dialog.
-    // Keep replacement of an existing identity behind the explicit pair action.
-    let mut pairing_armed = initial_pairing_armed || config.peer.pinned_fingerprint.is_empty();
-    let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
-    let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
-    let (tray, mut tray_commands) = if enable_tray {
-        let (tray, commands) = ReceiverTrayHandle::spawn(
-            format!("Connect: {endpoint}"),
-            "InputCapture portal".to_string(),
-            pairing_armed,
-        )
-        .await
-        .context("failed to start Linux tray")?;
-        (Some(tray), Some(commands))
-    } else {
-        (None, None)
-    };
-    let mut connection_enabled = true;
-    let connector_pause = Arc::new(AtomicBool::new(false));
-    // Keep one compositor capture session across transport reconnects. Creating a
-    // fresh portal session for every short network interruption is wasteful and
-    // triggers session leaks in affected xdg-desktop-portal-hyprland releases.
-    let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
-
-    loop {
-        if !connection_enabled {
-            let command = recv_tray_command(&mut tray_commands).await;
-            match command {
-                TrayCommandEvent::Command(TrayCommand::Reconnect) => {
-                    connection_enabled = true;
-                    continue;
-                }
-                TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
-                    pairing_armed = true;
-                    connection_enabled = true;
-                    if let Some(tray) = &tray {
-                        tray.pairing_armed(true).await;
-                    }
-                    continue;
-                }
-                TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
-                    open_receiver_settings(&config_path, &log_path);
-                }
-                TrayCommandEvent::Command(TrayCommand::Quit) => break,
-                TrayCommandEvent::Command(
-                    TrayCommand::Disconnect
-                    | TrayCommand::ToggleInputForwarding
-                    | TrayCommand::SetAudio(_)
-                    | TrayCommand::SetController(_),
-                )
-                | TrayCommandEvent::Closed => {}
-            }
-            continue;
-        }
-
-        if let Some(tray) = &tray {
-            tray.connecting().await;
-        }
-        let connection = connect_linux_peer(
-            &config,
-            &config_path,
-            &identity,
-            pairing_armed,
-            connector_pause.load(Ordering::Acquire),
-            &log_path,
-        )
-        .await;
-        let connection = match connection {
-            Ok(connection) => {
-                pairing_armed = false;
-                config.peer.pinned_fingerprint = connection.peer_fingerprint.clone();
-                if let Some(tray) = &tray {
-                    tray.pairing_armed(false).await;
-                    tray.connected(format!(
-                        "{} ({})",
-                        connection.peer_name, connection.peer_fingerprint
-                    ))
-                    .await;
-                }
-                connection
-            }
-            Err(error) => {
-                let message = error.to_string();
-                append_portable_log(&log_path, format!("Linux connector failed: {error:#}"));
-                if let Some(tray) = &tray {
-                    tray.error(message.clone()).await;
-                }
-                if message.contains("Upgrade the other computer") {
-                    connection_enabled = false;
-                    continue;
-                }
-                tokio::select! {
-                    _ = time::sleep(Duration::from_secs(2)) => {}
-                    command = recv_tray_command(&mut tray_commands) => {
-                        match command {
-                            TrayCommandEvent::Command(TrayCommand::Quit) => break,
-                            TrayCommandEvent::Command(TrayCommand::Disconnect) => {
-                                connection_enabled = false;
-                            }
-                            TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
-                                pairing_armed = true;
-                                if let Some(tray) = &tray {
-                                    tray.pairing_armed(true).await;
-                                }
-                            }
-                            TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
-                                open_receiver_settings(&config_path, &log_path);
-                            }
-                            TrayCommandEvent::Command(
-                                TrayCommand::Reconnect
-                                | TrayCommand::ToggleInputForwarding
-                                | TrayCommand::SetAudio(_)
-                                | TrayCommand::SetController(_),
-                            )
-                            | TrayCommandEvent::Closed => {}
-                        }
-                    }
-                }
-                continue;
-            }
-        };
-
-        match run_linux_controller_session(
-            connection,
-            &config,
-            &config_path,
-            tray.as_ref(),
-            &mut tray_commands,
-            &connector_pause,
-            &log_path,
-            clipboard_hub.as_ref().map(ClipboardHub::subscribe),
-            &mut capture,
-        )
-        .await
-        {
-            Ok(ControllerSessionExit::QuitRequested) => break,
-            // Only accepted sessions are replaced; an outgoing one just reconnects.
-            Ok(ControllerSessionExit::Replaced) => {}
-            Ok(ControllerSessionExit::DisconnectRequested) => {
-                connection_enabled = false;
-                if let Some(tray) = &tray {
-                    tray.disconnected_by_user().await;
-                }
-            }
-            Err(error) => {
-                append_portable_log(
-                    &log_path,
-                    format!("Linux controller session ended: {error:#}"),
-                );
-                if let Some(tray) = &tray {
-                    tray.disconnected(Some(error.to_string())).await;
-                }
-                time::sleep(Duration::from_secs(2)).await;
-            }
-        }
-    }
-
-    if let Some(tray) = &tray {
-        tray.shutdown().await;
-    }
-    Ok(())
+    peer_supports_notifications: bool,
 }
 
 #[cfg(target_os = "linux")]
 async fn connect_linux_peer(
     config: &AppConfig,
-    config_path: &Path,
     identity: &IdentityKey,
+    paired_computers: &[String],
     pairing_armed: bool,
     session_paused: bool,
     log_path: &Path,
 ) -> Result<LinuxPeerConnection> {
-    if config.peer.host.trim().is_empty() {
-        anyhow::bail!("peer.host is required when transport = \"connect\"");
-    }
-    if config.peer.pinned_fingerprint.is_empty() && !pairing_armed {
-        anyhow::bail!("peer is not paired; choose 'Pair or replace peer...' on both computers");
-    }
-
     let endpoint = format!("{}:{}", config.peer.host, config.peer.port);
     let stream = time::timeout(Duration::from_secs(5), TcpStream::connect(&endpoint))
         .await
@@ -677,16 +519,18 @@ async fn connect_linux_peer(
         .with_context(|| format!("failed to connect to {endpoint}"))?;
     let peer_ip = stream.peer_addr()?.ip();
     configure_controller_socket(&stream)?;
-    let expected_fingerprint = (!pairing_armed && !config.peer.pinned_fingerprint.is_empty())
-        .then_some(config.peer.pinned_fingerprint.as_str());
+    // Trust is checked after the handshake, against every paired computer,
+    // the same way an incoming computer is checked.
     let (mut session, peer_fingerprint) = time::timeout(
         Duration::from_secs(15),
-        initiate_noise_session(stream, identity, expected_fingerprint),
+        initiate_noise_session(stream, identity, None),
     )
     .await
     .context("encrypted handshake timed out")?
     .context("failed encrypted handshake with Linux peer")?;
-    let locally_trusted = config.peer.pinned_fingerprint == peer_fingerprint;
+    let locally_trusted = paired_computers.contains(&peer_fingerprint)
+        || config.peer.pinned_fingerprint == peer_fingerprint;
+    let mut newly_paired = false;
 
     write_secure_frame(
         &mut session,
@@ -702,7 +546,15 @@ async fn connect_linux_peer(
                 INPUT_TOGGLE_EXTENSION.to_string(),
                 PAIRING_CONFIRMATION_EXTENSION.to_string(),
                 AUDIO_ROUTE_EXTENSION.to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                config
+                    .notifications
+                    .enabled
+                    .then(|| edge_protocol::NOTIFICATION_SYNC_EXTENSION.to_string()),
+            )
+            .collect(),
             node_capabilities: vec![
                 NodeCapability::InputCaptureV1,
                 NodeCapability::InputInjectV1,
@@ -777,11 +629,7 @@ async fn connect_linux_peer(
             if !accepted || !read_pairing_decision(&mut session).await? {
                 anyhow::bail!("pairing was not approved on both computers");
             }
-            let mut updated = AppConfig::load(config_path)
-                .await
-                .unwrap_or_else(|_| config.clone());
-            updated.peer.pinned_fingerprint = peer_fingerprint.clone();
-            updated.save(config_path).await?;
+            newly_paired = true;
             append_portable_log(
                 log_path,
                 format!("paired peer {} ({peer_fingerprint})", hello.device_name),
@@ -872,8 +720,13 @@ async fn connect_linux_peer(
     let peer_clipboard = ClipboardPeerFeatures::from_extensions(&hello.extensions);
     Ok(LinuxPeerConnection {
         session,
+        newly_paired,
         local_name: config.device_name.clone(),
         local_fingerprint,
+        peer_supports_notifications: hello
+            .extensions
+            .iter()
+            .any(|extension| extension == edge_protocol::NOTIFICATION_SYNC_EXTENSION),
         peer_name: hello.device_name,
         peer_fingerprint,
         peer_ip,
@@ -921,12 +774,15 @@ async fn run_linux_controller_session(
     connector_pause: &AtomicBool,
     log_path: &Path,
     clipboard_changes: Option<ClipboardChanges>,
+    mut notification_link: Option<notification_hub::SessionLink>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
+    replaced: &Notify,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
 
     let LinuxPeerConnection {
         session,
+        newly_paired: _,
         local_name,
         local_fingerprint,
         peer_name,
@@ -942,6 +798,7 @@ async fn run_linux_controller_session(
         peer_supports_audio_playback,
         peer_supports_audio_route,
         peer_clipboard,
+        peer_supports_notifications: _,
     } = connection;
     if let Some(info) = &peer_screen_info {
         tracing::info!(
@@ -1106,6 +963,7 @@ async fn run_linux_controller_session(
     let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
     tokio::pin!(heartbeat);
     let mut heartbeat_sequence = 0_u64;
+    let mut heartbeat_ping = HeartbeatPing::default();
     let mut input_active = false;
     let mut capture_released_for_liveness = false;
 
@@ -1118,6 +976,7 @@ async fn run_linux_controller_session(
 
             tokio::select! {
                 biased;
+                _ = replaced.notified() => break Ok(ControllerSessionExit::Replaced),
                 _ = watchdog.tick() => {
                     if local_is_controller
                         && input_forwarding_enabled
@@ -1209,7 +1068,9 @@ async fn run_linux_controller_session(
                     heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
                     write_secure_frame_writer(
                         &mut writer,
-                        &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence }),
+                        &Frame::Heartbeat(
+                            heartbeat_ping.outgoing(heartbeat_sequence, std::time::Instant::now()),
+                        ),
                     )
                     .await?;
                     heartbeat.as_mut().reset(
@@ -1393,6 +1254,9 @@ async fn run_linux_controller_session(
                     match command {
                         TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                             open_receiver_settings(config_path, log_path);
+                        }
+                        TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                            open_phone_pairing(log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
                             if !session_paused
@@ -1663,6 +1527,9 @@ async fn run_linux_controller_session(
                     )
                     .await?;
                 }
+                event = notification_hub::next(&mut notification_link) => {
+                    write_secure_frame_writer(&mut writer, &Frame::NotificationSync(event)).await?;
+                }
                 frame = frame_rx.recv() => {
                     let frame = frame.context("Linux peer frame reader ended")??;
                     peer_liveness.observe_authenticated_frame(tokio::time::Instant::now());
@@ -1682,7 +1549,15 @@ async fn run_linux_controller_session(
                     }
                     writer.record_received(&frame);
                     match frame {
-                        Frame::Heartbeat(_) => {}
+                        Frame::NotificationSync(event) => notification_hub::receive(&mut notification_link, event).await,
+                        Frame::Heartbeat(heartbeat) => {
+                            if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
+                                write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
+                            }
+                            if let Some(tray) = tray {
+                                tray.peer_round_trip(heartbeat_ping.round_trip());
+                            }
+                        }
                         Frame::Clipboard(event) => {
                             if !session_paused
                                 && clipboard_sync.handle_event(config, &mut writer, event).await?
@@ -2460,6 +2335,34 @@ fn peer_position_to_edge(position: edge_common::PeerPosition) -> Edge {
     }
 }
 
+fn edge_to_peer_position(edge: Edge) -> edge_common::PeerPosition {
+    match edge {
+        Edge::Left => edge_common::PeerPosition::Left,
+        Edge::Right => edge_common::PeerPosition::Right,
+        Edge::Top => edge_common::PeerPosition::Top,
+        Edge::Bottom => edge_common::PeerPosition::Bottom,
+    }
+}
+
+/// The computer that dialled sets the layout for the session, as where this
+/// computer sits from its side. Saving it from this side means the screens
+/// line up the same way when this computer is the one that dials.
+async fn remember_peer_position(config_path: &Path, listener_position: Edge) {
+    let position = edge_to_peer_position(opposite_edge(listener_position));
+    let mut config = match AppConfig::load(config_path).await {
+        Ok(config) if config.layout.listener_position != position => config,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(%error, "couldn't read the config to save the screen layout");
+            return;
+        }
+    };
+    config.layout.listener_position = position;
+    if let Err(error) = config.save(config_path).await {
+        tracing::warn!(%error, "couldn't save the screen layout");
+    }
+}
+
 fn opposite_edge(edge: Edge) -> Edge {
     match edge {
         Edge::Left => Edge::Right,
@@ -2469,18 +2372,7 @@ fn opposite_edge(edge: Edge) -> Edge {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn run_linux_connector(
-    _config: AppConfig,
-    _config_path: PathBuf,
-    _initial_pairing_armed: bool,
-    _enable_tray: bool,
-    _log_path: PathBuf,
-) -> Result<()> {
-    anyhow::bail!("Linux controller mode is available only on Linux")
-}
-
-async fn run_receiver(
+async fn run_node(
     config: AppConfig,
     config_path: PathBuf,
     initial_pairing_armed: bool,
@@ -2507,9 +2399,16 @@ async fn run_receiver(
         .local_addr()
         .context("failed to read the listen address")?;
 
+    // Every node accepts computers and phones that dial it, and dials the
+    // computer it has an address for.
+    let dial_endpoint = (!config.peer.host.trim().is_empty())
+        .then(|| format!("{}:{}", config.peer.host.trim(), config.peer.port));
     let (tray, mut tray_commands) = if enable_tray {
         match ReceiverTrayHandle::spawn(
-            format!("Listen: {listen}"),
+            match &dial_endpoint {
+                Some(endpoint) => format!("Listen: {listen} · dial: {endpoint}"),
+                None => format!("Listen: {listen}"),
+            },
             backend.label().to_string(),
             initial_pairing_armed,
         )
@@ -2548,47 +2447,106 @@ async fn run_receiver(
 
     let mut acceptor = Acceptor::spawn(listener, identity.clone(), log_path.clone());
     let clipboard_hub = config.clipboard.enabled.then(ClipboardHub::spawn);
-    let pins_path = state_dir.join("pins.toml");
-    let mut phones = PhoneSessions::new(
-        LocalHello {
-            device_name: config.device_name.clone(),
-            role: config.preferred_role,
-            fingerprint: identity.fingerprint(),
-        },
-        listen_addr,
-        log_path.clone(),
-        clipboard_hub.as_ref().map(|hub| phone::ClipboardSource {
-            config: Arc::new(config.clone()),
-            changes: hub.subscribe(),
-        }),
-    );
-    let _control = control::spawn_server(phones.requests(), &log_path).await;
-    match control::socket_path() {
-        Some(control) => {
-            let icons = control.with_file_name("phone-icons");
-            match notifications::FreedesktopNotifications::connect(icons).await {
-                Ok(desktop) => phones.set_desktop_notifications(desktop),
-                Err(error) => append_portable_log(
-                    &log_path,
-                    format!("phone notifications unavailable: {error:#}"),
-                ),
-            }
+    let notification_service = notification_hub::NotificationHub::start(
+        &config.notifications,
+        &identity.fingerprint(),
+        &config.device_name,
+        &state_dir.join("notifications"),
+    )
+    .await;
+    let mut notification_error = None;
+    let notification_service = match notification_service {
+        Ok(service) => service,
+        Err(error) => {
+            notification_error = Some(format!("{error:#}"));
+            tracing::warn!(%error, "notification synchronization unavailable");
+            append_portable_log(
+                &log_path,
+                format!("notification synchronization unavailable: {error:#}"),
+            );
+            None
         }
-        None => append_portable_log(
-            &log_path,
-            "no runtime directory; phone notifications unavailable",
-        ),
-    }
+    };
+    let notification_hub = notification_service.as_ref().map(|service| &service.hub);
+    let pins_path = state_dir.join("pins.toml");
+    let connected_notification_peer = Arc::new(std::sync::Mutex::new(None));
+    let (mut phones, _control) = start_phone_sessions(
+        &config,
+        &identity,
+        listen_addr,
+        clipboard_hub.as_ref(),
+        tray.as_ref(),
+        &log_path,
+        notification_setup::NotificationControl {
+            identity: identity.fingerprint(),
+            coordinator: config.notifications.coordinator_fingerprint.clone(),
+            configured_peer: (!config.peer.pinned_fingerprint.is_empty()).then(|| {
+                edge_ui::NotificationComputer {
+                    name: config.peer.name.clone(),
+                    fingerprint: config.peer.pinned_fingerprint.clone(),
+                }
+            }),
+            hub: notification_hub.cloned(),
+            error: notification_error,
+            connected: connected_notification_peer.clone(),
+        },
+    )
+    .await;
     // A newer connection from the connected peer, waiting for its session to end.
     let mut replacement: Option<IncomingPeer> = None;
     let mut connection_enabled = true;
     let mut pairing_armed = initial_pairing_armed;
+    let local_fingerprint = identity.fingerprint();
+    // First run with an address goes straight to the two-sided confirmation.
+    if dial_endpoint.is_some() && paired_computer_keys(&pins, &config).is_empty() && !pairing_armed
+    {
+        pairing_armed = true;
+        if let Some(tray) = &tray {
+            tray.pairing_armed(true).await;
+        }
+    }
+    let connector_pause = AtomicBool::new(false);
+    let mut dial_at = dial_endpoint.as_ref().map(|_| {
+        time::Instant::now()
+            + dial_delay(
+                &local_fingerprint,
+                &paired_computer_keys(&pins, &config),
+                Duration::ZERO,
+            )
+    });
+    let mut dialing: Option<DialAttempt<'_>> = None;
+    // Set by a version mismatch; cleared by Reconnect or Pair.
+    let mut dial_blocked = false;
+    let mut last_dial_error: Option<String> = None;
     // Keep one compositor capture session across transport reconnects. Creating a
     // fresh portal session for every short network interruption is wasteful and
     // triggers session leaks in affected xdg-desktop-portal-hyprland releases.
     #[cfg(target_os = "linux")]
     let mut capture: Option<edge_linux_input::PortalCaptureBackend> = None;
     loop {
+        if let Ok(mut peer) = connected_notification_peer.lock() {
+            *peer = None;
+        }
+        if dial_at.is_none()
+            && dialing.is_none()
+            && !dial_blocked
+            && connection_enabled
+            && dial_endpoint.is_some()
+        {
+            dial_at = Some(
+                time::Instant::now()
+                    + dial_delay(
+                        &local_fingerprint,
+                        &paired_computer_keys(&pins, &config),
+                        DIAL_RETRY,
+                    ),
+            );
+        }
+        let may_dial = dial_endpoint.is_some()
+            && connection_enabled
+            && !dial_blocked
+            && dialing.is_none()
+            && (pairing_armed || !paired_computer_keys(&pins, &config).is_empty());
         let incoming = if let Some(peer) = replacement.take() {
             peer
         } else {
@@ -2598,8 +2556,13 @@ async fn run_receiver(
                         TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                             open_receiver_settings(&config_path, &log_path);
                         }
+                        TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                            open_phone_pairing(&log_path);
+                        }
                         TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                             pairing_armed = true;
+                            dial_blocked = false;
+                            dial_at = dial_endpoint.as_ref().map(|_| time::Instant::now());
                             if let Some(tray) = &tray {
                                 tray.pairing_armed(true).await;
                                 tray.listening().await;
@@ -2617,12 +2580,16 @@ async fn run_receiver(
                         }
                         TrayCommandEvent::Command(TrayCommand::Disconnect) => {
                             connection_enabled = false;
+                            dialing = None;
+                            dial_at = None;
                             if let Some(tray) = &tray {
                                 tray.disconnected_by_user().await;
                             }
                         }
                         TrayCommandEvent::Command(TrayCommand::Reconnect) => {
                             connection_enabled = true;
+                            dial_blocked = false;
+                            dial_at = dial_endpoint.as_ref().map(|_| time::Instant::now());
                             if let Some(tray) = &tray {
                                 tray.listening().await;
                             }
@@ -2655,7 +2622,23 @@ async fn run_receiver(
                     continue;
                 }
                 event = acceptor.recv() => match event {
-                    Some(AcceptEvent::Peer(peer)) => *peer,
+                    Some(AcceptEvent::Peer(peer)) => {
+                        if dialing.is_some() && !phone::is_phone_hello(&peer.hello) {
+                            // Both computers dialled at once. Each side keeps
+                            // the connection dialled by the lower key.
+                            if keep_own_dial(&local_fingerprint, &peer.fingerprint) {
+                                reject_peer(
+                                    *peer,
+                                    DUPLICATE_SESSION,
+                                    "both computers connected at once; keeping the other connection",
+                                    &log_path,
+                                );
+                                continue;
+                            }
+                            dialing = None;
+                        }
+                        *peer
+                    }
                     Some(AcceptEvent::Failed(message)) => {
                         if let Some(tray) = &tray {
                             tray.error(message).await;
@@ -2664,6 +2647,150 @@ async fn run_receiver(
                     }
                     None => anyhow::bail!("connection acceptor stopped"),
                 },
+                _ = sleep_until_due(dial_at), if may_dial => {
+                    dial_at = None;
+                    let paired = paired_computer_keys(&pins, &config);
+                    let paused = connector_pause.load(Ordering::Acquire);
+                    let (config, config_path, identity, log_path) =
+                        (&config, &config_path, &identity, &log_path);
+                    dialing = Some(Box::pin(async move {
+                        // Fresh from disk: accepting a session may have
+                        // updated the saved screen layout since startup.
+                        let config = AppConfig::load(config_path)
+                            .await
+                            .unwrap_or_else(|_| config.clone());
+                        connect_linux_peer(&config, identity, &paired, pairing_armed, paused, log_path)
+                            .await
+                    }));
+                    continue;
+                }
+                result = finish_dial(&mut dialing), if dialing.is_some() => {
+                    dialing = None;
+                    let endpoint = dial_endpoint.as_deref().unwrap_or_default();
+                    let connection = match result {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            let message = error.to_string();
+                            if last_dial_error.as_deref() != Some(message.as_str()) {
+                                append_portable_log(
+                                    &log_path,
+                                    format!("connecting to {endpoint} failed: {error:#}"),
+                                );
+                                last_dial_error = Some(message.clone());
+                            }
+                            dial_at = match dial_failure(&message) {
+                                DialFailure::Unreachable => {
+                                    Some(time::Instant::now() + DIAL_UNREACHABLE_RETRY)
+                                }
+                                DialFailure::Duplicate => None,
+                                DialFailure::UpgradeRequired => {
+                                    dial_blocked = true;
+                                    None
+                                }
+                                DialFailure::Other => None,
+                            };
+                            if matches!(
+                                dial_failure(&message),
+                                DialFailure::UpgradeRequired | DialFailure::Other
+                            ) && let Some(tray) = &tray
+                            {
+                                tray.error(message).await;
+                            }
+                            continue;
+                        }
+                    };
+                    last_dial_error = None;
+                    let peer_name = connection.peer_name.clone();
+                    let peer_fingerprint = connection.peer_fingerprint.clone();
+                    if let Some(hub) = notification_hub {
+                        hub.set_peer_name(&peer_fingerprint, &peer_name);
+                    }
+                    if connection.newly_paired {
+                        pins.pin(peer_name.clone(), peer_fingerprint.clone());
+                        pins.save(&pins_path).await?;
+                    }
+                    if let Ok(mut current) = connected_notification_peer.lock() {
+                        *current = Some(edge_ui::NotificationComputer { name: peer_name.clone(), fingerprint: peer_fingerprint.clone() });
+                    }
+                    pairing_armed = false;
+                    if let Some(tray) = &tray {
+                        tray.pairing_armed(false).await;
+                        tray.connected(peer_name.clone()).await;
+                    }
+                    let replaced = Notify::new();
+                    let exit = {
+                        let notification_link = notification_hub.and_then(|hub| hub.link(&connection.peer_fingerprint, connection.peer_supports_notifications).map(notification_hub::SessionLink::spawn));
+                        let session = run_linux_controller_session(
+                            connection,
+                            &config,
+                            &config_path,
+                            tray.as_ref(),
+                            &mut tray_commands,
+                            &connector_pause,
+                            &log_path,
+                            clipboard_hub.as_ref().map(ClipboardHub::subscribe),
+                            notification_link,
+                            &mut capture,
+                            &replaced,
+                        );
+                        tokio::pin!(session);
+                        let mut acceptor_open = true;
+                        loop {
+                            tokio::select! {
+                                exit = &mut session => break exit,
+                                request = phones.next_request() => {
+                                    phones.handle_request(request, &mut pins, &pins_path).await;
+                                }
+                                event = acceptor.recv(), if acceptor_open => match event {
+                                    Some(AcceptEvent::Peer(peer)) if phone::is_phone_hello(&peer.hello) => {
+                                        start_phone(&mut phones, *peer, &pins);
+                                    }
+                                    Some(AcceptEvent::Peer(peer))
+                                        if peer.fingerprint == peer_fingerprint
+                                            && !keep_own_dial(&local_fingerprint, &peer_fingerprint) =>
+                                    {
+                                        replaced.notify_one();
+                                        replacement = Some(*peer);
+                                    }
+                                    Some(AcceptEvent::Peer(peer)) => {
+                                        let (code, message) = if peer.fingerprint == peer_fingerprint {
+                                            (
+                                                DUPLICATE_SESSION,
+                                                "both computers connected at once; keeping the other connection",
+                                            )
+                                        } else {
+                                            ("receiver_busy", "this computer is already connected to another computer")
+                                        };
+                                        reject_peer(*peer, code, message, &log_path);
+                                    }
+                                    Some(AcceptEvent::Failed(_)) => {}
+                                    None => acceptor_open = false,
+                                },
+                            }
+                        }
+                    };
+                    match exit {
+                        Ok(ControllerSessionExit::QuitRequested) => break,
+                        Ok(ControllerSessionExit::Replaced) => {}
+                        Ok(ControllerSessionExit::DisconnectRequested) => {
+                            connection_enabled = false;
+                            dial_at = None;
+                            if let Some(tray) = &tray {
+                                tray.disconnected_by_user().await;
+                            }
+                        }
+                        Err(error) => {
+                            append_portable_log(
+                                &log_path,
+                                format!("session with {peer_name} ended: {error:#}"),
+                            );
+                            if let Some(tray) = &tray {
+                                tray.disconnected(Some(error.to_string())).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
         };
         // Phones are always accepted; the tray's Disconnect is about PC peers.
@@ -2719,7 +2846,15 @@ async fn run_receiver(
                     INPUT_TOGGLE_EXTENSION.to_string(),
                     PAIRING_CONFIRMATION_EXTENSION.to_string(),
                     AUDIO_ROUTE_EXTENSION.to_string(),
-                ],
+                ]
+                .into_iter()
+                .chain(
+                    config
+                        .notifications
+                        .enabled
+                        .then(|| edge_protocol::NOTIFICATION_SYNC_EXTENSION.to_string()),
+                )
+                .collect(),
                 node_capabilities: vec![
                     NodeCapability::InputCaptureV1,
                     NodeCapability::InputInjectV1,
@@ -2858,9 +2993,17 @@ async fn run_receiver(
             }
         }
 
+        if let Ok(mut current) = connected_notification_peer.lock() {
+            *current = Some(edge_ui::NotificationComputer {
+                name: hello.device_name.clone(),
+                fingerprint: peer_fingerprint.clone(),
+            });
+        }
+        if let Some(hub) = notification_hub {
+            hub.set_peer_name(&peer_fingerprint, &hello.device_name);
+        }
         if let Some(tray) = &tray {
-            tray.connected(format!("{} ({peer_fingerprint})", hello.device_name))
-                .await;
+            tray.connected(hello.device_name.clone()).await;
         }
         let controller_supports_audio_playback = hello
             .node_capabilities
@@ -2951,6 +3094,15 @@ async fn run_receiver(
                 &hello.device_name,
                 &replaced,
                 clipboard_hub.as_ref().map(ClipboardHub::subscribe),
+                notification_hub.and_then(|hub| {
+                    hub.link(
+                        &peer_fingerprint,
+                        hello.extensions.iter().any(|extension| {
+                            extension == edge_protocol::NOTIFICATION_SYNC_EXTENSION
+                        }),
+                    )
+                    .map(notification_hub::SessionLink::spawn)
+                }),
                 #[cfg(target_os = "linux")]
                 &mut capture,
             );
@@ -3107,42 +3259,67 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn open_receiver_settings(config_path: &Path, log_path: &Path) {
-    if SETTINGS_PROCESS_OPEN.swap(true, Ordering::AcqRel) {
+    let parent = std::process::id().to_string();
+    spawn_window_process(
+        &SETTINGS_PROCESS_OPEN,
+        "settings",
+        &[
+            "--settings".as_ref(),
+            "--settings-parent-pid".as_ref(),
+            parent.as_ref(),
+            "--config".as_ref(),
+            config_path.as_os_str(),
+        ],
+        log_path,
+    );
+}
+
+/// The phone pairing QR code, in a window of its own.
+fn open_phone_pairing(log_path: &Path) {
+    spawn_window_process(
+        &PHONE_PAIRING_PROCESS_OPEN,
+        "phone pairing",
+        &["--add-phone".as_ref()],
+        log_path,
+    );
+}
+
+/// Runs a window as a child process, at most one of each at a time.
+fn spawn_window_process(
+    open: &'static AtomicBool,
+    what: &str,
+    args: &[&std::ffi::OsStr],
+    log_path: &Path,
+) {
+    if open.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    append_portable_log(log_path, "opening settings window");
+    append_portable_log(log_path, format!("opening {what} window"));
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(err) => {
-            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
-            tracing::warn!(%err, "failed to locate receiver executable for settings window");
+            open.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to locate receiver executable for {what} window");
             append_portable_log(
                 log_path,
-                format!("failed to locate receiver executable for settings window: {err}"),
+                format!("failed to locate receiver executable for {what} window: {err}"),
             );
             return;
         }
     };
 
-    match Command::new(executable)
-        .arg("--settings")
-        .arg("--settings-parent-pid")
-        .arg(std::process::id().to_string())
-        .arg("--config")
-        .arg(config_path)
-        .spawn()
-    {
+    match Command::new(executable).args(args).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
                 let _ = child.wait();
-                SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
+                open.store(false, Ordering::Release);
             });
         }
         Err(err) => {
-            SETTINGS_PROCESS_OPEN.store(false, Ordering::Release);
-            tracing::warn!(%err, "failed to start settings process");
-            append_portable_log(log_path, format!("failed to start settings process: {err}"));
+            open.store(false, Ordering::Release);
+            tracing::warn!(%err, "failed to start {what} process");
+            append_portable_log(log_path, format!("failed to start {what} process: {err}"));
         }
     }
 }
@@ -3195,16 +3372,161 @@ enum ControllerSessionExit {
     Replaced,
 }
 
+/// Phone sessions, their control socket and desktop notifications. Both ends
+/// of a computer link accept phones, so this serves the waiting receiver and
+/// the connector alike.
+#[allow(clippy::too_many_arguments)]
+async fn start_phone_sessions(
+    config: &AppConfig,
+    identity: &IdentityKey,
+    listen_addr: std::net::SocketAddr,
+    clipboard_hub: Option<&ClipboardHub>,
+    tray: Option<&ReceiverTrayHandle>,
+    log_path: &Path,
+    notifications: notification_setup::NotificationControl,
+) -> (PhoneSessions, Option<AbortOnDropTask>) {
+    let mut phones = PhoneSessions::new(
+        LocalHello {
+            device_name: config.device_name.clone(),
+            role: config.preferred_role,
+            fingerprint: identity.fingerprint(),
+        },
+        listen_addr,
+        log_path.to_path_buf(),
+        clipboard_hub.map(|hub| phone::ClipboardSource {
+            config: Arc::new(config.clone()),
+            changes: hub.subscribe(),
+        }),
+    );
+    phones.set_notification_hub(notifications.hub.clone());
+    if notifications.hub.is_some()
+        && let Some(shell) = notification_setup::detect_shell()
+        && std::fs::read_to_string(&shell)
+            .is_ok_and(|text| text.contains("    EdgeNotificationBridge {"))
+        && !notification_setup::integration_installed(
+            &shell,
+            &edge_common::default_state_dir().join("notifications/bridge.sock"),
+        )
+        && let Err(error) = notification_setup::install_bridge(
+            &shell,
+            &edge_common::default_state_dir().join("notifications/bridge.sock"),
+        )
+    {
+        tracing::warn!(%error, "couldn't refresh the installed Quickshell notification bridge");
+    }
+    if let Some(tray) = tray {
+        phones.set_tray(tray.clone()).await;
+    }
+    let control =
+        control::spawn_server(phones.requests(), tray.cloned(), log_path, notifications).await;
+    match control::socket_path() {
+        Some(control) => {
+            let icons = control.with_file_name("phone-icons");
+            match notifications::FreedesktopNotifications::connect(icons).await {
+                Ok(desktop) => phones.set_desktop_notifications(desktop),
+                Err(error) => append_portable_log(
+                    log_path,
+                    format!("phone notifications unavailable: {error:#}"),
+                ),
+            }
+        }
+        None => append_portable_log(
+            log_path,
+            "no runtime directory; phone notifications unavailable",
+        ),
+    }
+    (phones, control)
+}
+
+/// A computer's own dial in progress.
+type DialAttempt<'a> = std::pin::Pin<Box<dyn Future<Output = Result<LinuxPeerConnection>> + 'a>>;
+
+/// Sent when both computers dial each other at once and this connection
+/// is the one dropped.
+const DUPLICATE_SESSION: &str = "duplicate_session";
+const DIAL_RETRY: Duration = Duration::from_secs(2);
+/// How much later a node dials a computer whose key sorts below its own, so
+/// that computer's dial usually arrives first and nothing has to be dropped.
+const DIAL_DEFER: Duration = Duration::from_secs(3);
+/// Slower retries while nothing answers at the address, which is normal
+/// when the other computer can only dial (the Windows app) or is off.
+const DIAL_UNREACHABLE_RETRY: Duration = Duration::from_secs(30);
+
+/// When both computers dial each other at once, each keeps the connection
+/// dialled by the computer with the lower key, so both keep the same one.
+fn keep_own_dial(local_fingerprint: &str, peer_fingerprint: &str) -> bool {
+    local_fingerprint < peer_fingerprint
+}
+
+fn dial_delay(local_fingerprint: &str, paired: &[String], base: Duration) -> Duration {
+    if paired
+        .iter()
+        .all(|peer| keep_own_dial(local_fingerprint, peer))
+    {
+        base
+    } else {
+        base + DIAL_DEFER
+    }
+}
+
+/// Keys of every paired computer: the pin store, plus the single peer that
+/// older dialling configs pinned in the config file.
+fn paired_computer_keys(pins: &PinStore, config: &AppConfig) -> Vec<String> {
+    let mut keys: Vec<String> = pins
+        .peers
+        .values()
+        .map(|pinned| pinned.fingerprint.clone())
+        .collect();
+    let legacy = &config.peer.pinned_fingerprint;
+    if !legacy.is_empty() && !keys.contains(legacy) {
+        keys.push(legacy.clone());
+    }
+    keys
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DialFailure {
+    /// Nothing answered; try again slowly.
+    Unreachable,
+    /// The other computer kept its own connection to this one.
+    Duplicate,
+    UpgradeRequired,
+    Other,
+}
+
+fn dial_failure(message: &str) -> DialFailure {
+    if message.contains("Upgrade the other computer") {
+        DialFailure::UpgradeRequired
+    } else if message.contains(DUPLICATE_SESSION) {
+        DialFailure::Duplicate
+    } else if message.starts_with("failed to connect to") || message.starts_with("connection to ") {
+        DialFailure::Unreachable
+    } else {
+        DialFailure::Other
+    }
+}
+
+async fn sleep_until_due(at: Option<time::Instant>) {
+    match at {
+        Some(at) => time::sleep_until(at).await,
+        None => future::pending().await,
+    }
+}
+
+async fn finish_dial(dialing: &mut Option<DialAttempt<'_>>) -> Result<LinuxPeerConnection> {
+    match dialing {
+        Some(attempt) => attempt.await,
+        None => future::pending().await,
+    }
+}
+
 fn start_phone(phones: &mut PhoneSessions, peer: IncomingPeer, pins: &PinStore) {
     phones.start(
         peer.session,
         peer.addr,
         peer.hello.device_name,
         peer.fingerprint,
-        peer.hello
-            .extensions
-            .iter()
-            .any(|extension| extension == CLIPBOARD_IMAGE_EXTENSION),
+        &peer.hello.extensions,
         pins,
     );
 }
@@ -3388,11 +3710,13 @@ async fn handle_controller(
     controller_name: &str,
     replaced: &Notify,
     clipboard_changes: Option<ClipboardChanges>,
+    mut notification_link: Option<notification_hub::SessionLink>,
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
 ) -> Result<ControllerSessionExit> {
     use edge_linux_input::{CaptureEvent, PortalCaptureBackend};
 
     let mut heartbeat_sequence = 0_u64;
+    let mut heartbeat_ping = HeartbeatPing::default();
     let liveness_config = LivenessConfig::default();
     let heartbeat = time::sleep(liveness_config.heartbeat_interval(false));
     tokio::pin!(heartbeat);
@@ -3640,7 +3964,11 @@ async fn handle_controller(
                     .await?;
                 }
                 heartbeat_sequence += 1;
-                write_secure_frame_writer(&mut writer, &Frame::Heartbeat(Heartbeat { sequence: heartbeat_sequence })).await?;
+                write_secure_frame_writer(
+                    &mut writer,
+                    &Frame::Heartbeat(heartbeat_ping.outgoing(heartbeat_sequence, std::time::Instant::now())),
+                )
+                .await?;
                 stats.heartbeats = stats.heartbeats.saturating_add(1);
                 let input_active = if local_is_controller {
                     capture_input_active
@@ -3740,6 +4068,9 @@ async fn handle_controller(
                 match command {
                     TrayCommandEvent::Command(TrayCommand::OpenSettings) => {
                         open_receiver_settings(config_path, log_path);
+                    }
+                    TrayCommandEvent::Command(TrayCommand::AddPhone) => {
+                        open_phone_pairing(log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                         tracing::debug!("ignored pairing request while connected");
@@ -3998,11 +4329,15 @@ async fn handle_controller(
                 )
                 .await?;
             }
+            event = notification_hub::next(&mut notification_link) => {
+                write_secure_frame_writer(&mut writer, &Frame::NotificationSync(event)).await?;
+            }
             frame = frame_rx.recv() => {
                 let frame = frame.context("controller frame reader ended")??;
                 controller_liveness.observe_authenticated_frame(tokio::time::Instant::now());
                 writer.record_received(&frame);
                 match frame {
+                    Frame::NotificationSync(event) => notification_hub::receive(&mut notification_link, event).await,
                     Frame::Input(input) => {
                         if input.role_epoch != role_epoch {
                             tracing::debug!(
@@ -4062,7 +4397,14 @@ async fn handle_controller(
                             }
                         }
                     }
-                    Frame::Heartbeat(_) => {}
+                    Frame::Heartbeat(heartbeat) => {
+                        if let Some(echo) = heartbeat_ping.incoming(&heartbeat, std::time::Instant::now()) {
+                            write_secure_frame_writer(&mut writer, &Frame::Heartbeat(echo)).await?;
+                        }
+                        if let Some(tray) = tray {
+                            tray.peer_round_trip(heartbeat_ping.round_trip());
+                        }
+                    }
                     Frame::Control(control) => {
                         if control.role_epoch != role_epoch {
                             tracing::debug!(
@@ -4492,6 +4834,7 @@ async fn handle_controller(
                             paused = state.paused,
                             "adopted connector-authoritative session state"
                         );
+                        remember_peer_position(config_path, state.listener_position).await;
                     }
                     Frame::Role(RoleEvent::Prepare(prepare)) => {
                         if session_paused || !role_switch_available {
@@ -5932,5 +6275,73 @@ max_image_bytes = 4194304
         assert!(!config.clipboard.images_enabled);
         assert!(!migrated.contains("text_only"));
         assert!(migrated.contains("images_enabled = false"));
+    }
+
+    #[test]
+    fn both_computers_keep_the_same_connection_when_both_dial() {
+        let (low, high) = ("aa:01", "bb:02");
+        // The lower key keeps its own dial; the higher drops its own.
+        assert!(keep_own_dial(low, high));
+        assert!(!keep_own_dial(high, low));
+    }
+
+    #[test]
+    fn the_lower_key_dials_first() {
+        let paired = ["bb:02".to_string()];
+        assert_eq!(dial_delay("aa:01", &paired, DIAL_RETRY), DIAL_RETRY);
+        assert_eq!(
+            dial_delay("cc:03", &paired, DIAL_RETRY),
+            DIAL_RETRY + DIAL_DEFER
+        );
+        assert_eq!(dial_delay("cc:03", &[], Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn dial_failures_are_sorted_by_what_to_do_next() {
+        assert_eq!(
+            dial_failure("failed to connect to 192.168.0.9:42420"),
+            DialFailure::Unreachable
+        );
+        assert_eq!(
+            dial_failure("connection to 192.168.0.9:42420 timed out"),
+            DialFailure::Unreachable
+        );
+        assert_eq!(
+            dial_failure("peer error: duplicate_session: both computers connected at once"),
+            DialFailure::Duplicate
+        );
+        assert_eq!(
+            dial_failure("Upgrade the other computer to protocol 2"),
+            DialFailure::UpgradeRequired
+        );
+        assert_eq!(
+            dial_failure("pairing needs approval on both computers"),
+            DialFailure::Other
+        );
+    }
+
+    #[test]
+    fn paired_computers_come_from_pins_and_the_old_config_pin() {
+        let mut pins = PinStore::default();
+        pins.pin("Tera", "bb:02");
+        let mut config = AppConfig::receiver_default();
+        assert_eq!(paired_computer_keys(&pins, &config), ["bb:02"]);
+        config.peer.pinned_fingerprint = "cc:03".to_string();
+        assert_eq!(paired_computer_keys(&pins, &config), ["bb:02", "cc:03"]);
+        config.peer.pinned_fingerprint = "bb:02".to_string();
+        assert_eq!(paired_computer_keys(&pins, &config), ["bb:02"]);
+    }
+
+    #[test]
+    fn the_accepting_side_saves_the_layout_from_its_own_side() {
+        // The dialler says this computer sits to its right, so the dialler
+        // sits to this computer's left.
+        assert_eq!(
+            edge_to_peer_position(opposite_edge(Edge::Right)),
+            edge_common::PeerPosition::Left
+        );
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            assert_eq!(peer_position_to_edge(edge_to_peer_position(edge)), edge);
+        }
     }
 }

@@ -272,3 +272,13 @@ injected into the Linux desktop. Then use either tray's named role choice to
 switch direction and verify Linux input reaches the Windows desktop. If no real
 Linux input backend can initialize, the node exits with an error instead of
 appearing healthy in log-only mode.
+
+## Shared notifications (initial Linux support)
+
+Opt-in shared desktop notifications use the existing Quickshell notification
+centres, with one configured coordinator and synchronized dismissals. See the
+[Quickshell setup and current limits](integrations/quickshell/README.md) and
+[implementation plan](docs/plans/shared-notifications.md). Both PCs need the
+updated binary and shell bridge. Paired phone notifications join that same history;
+dismissal on either PC removes them from both PC centres. The current phone
+protocol cannot dismiss the original Android notification from a PC.

@@ -201,6 +201,15 @@ pub fn record_tray_clipboard_event() {
 #[cfg(not(windows))]
 pub fn record_tray_clipboard_event() {}
 
+/// The latest heartbeat round trip to the peer, shown in the tray menu.
+#[cfg(windows)]
+pub fn set_tray_round_trip(round_trip: Option<std::time::Duration>) {
+    tray::set_round_trip(round_trip);
+}
+
+#[cfg(not(windows))]
+pub fn set_tray_round_trip(_round_trip: Option<std::time::Duration>) {}
+
 #[cfg(windows)]
 pub fn update_tray_status(status: &str) -> Result<()> {
     tray::update_status(status)
@@ -2583,6 +2592,7 @@ mod tray {
     static TRAY_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
     static TRAY_INJECTED_INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
     static TRAY_CLIPBOARD_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static TRAY_ROUND_TRIP_MS: AtomicU64 = AtomicU64::new(u64::MAX);
     static TRAY_ROLE: Mutex<TrayRole> = Mutex::new(TrayRole::new());
     static TRAY_CONTEXT: Mutex<TrayContext> = Mutex::new(TrayContext::new());
 
@@ -2914,212 +2924,72 @@ mod tray {
             return;
         }
 
-        let status = current_tray_status();
-        let status_text = wide_to_string(&status);
-        let status_label = to_wide(&format!("Status: {}", status_summary(&status_text)));
-        let audio_status = current_audio_status();
+        let status = wide_to_string(&current_tray_status());
         let context = TRAY_CONTEXT.lock().expect("tray context poisoned").clone();
-        let transport = to_wide(&format!("Transport: {}", context.transport));
-        let input_backend = to_wide(&format!("Input backend: {}", context.input_backend));
-        let pairing = to_wide(&format!(
-            "Pairing: {}",
-            if status_text.starts_with("Pairing") {
-                "waiting for confirmation"
-            } else {
-                "not armed"
-            }
-        ));
-        let settings = to_wide("Settings...");
-        let pair = to_wide("Pair or replace peer...");
-        let release = to_wide("Release control");
-        let connection = to_wide(if TRAY_CONNECTED.load(Ordering::Relaxed) {
-            "Disconnect"
-        } else {
-            "Reconnect"
-        });
-        let local_audio = to_wide(&format!(
-            "{} → {}",
-            if context.local_device_name.is_empty() {
-                "This computer"
-            } else {
-                &context.local_device_name
-            },
-            if context.peer_device_name.is_empty() {
-                "Peer"
-            } else {
-                &context.peer_device_name
-            },
-        ));
-        let peer_audio = to_wide(&format!(
-            "{} → {}",
-            if context.peer_device_name.is_empty() {
-                "Peer"
-            } else {
-                &context.peer_device_name
-            },
-            if context.local_device_name.is_empty() {
-                "this computer"
-            } else {
-                &context.local_device_name
-            },
-        ));
-        let audio_heading = to_wide("Audio routing");
-        let audio_off = to_wide("Audio off");
-        let input_forwarding = to_wide("Forward mouse and keyboard");
-        let quit = to_wide("Quit edge-kvm");
         let role = TRAY_ROLE.lock().expect("tray role poisoned").clone();
-        let peer_name = if role.peer_name.is_empty() {
-            &context.peer_device_name
+        let connected = TRAY_CONNECTED.load(Ordering::Relaxed);
+        let peer_name = [&role.peer_name, &context.peer_device_name]
+            .into_iter()
+            .find(|name| !name.is_empty())
+            .map_or("the other computer", String::as_str);
+        let summary = to_wide(&menu_summary(
+            &status,
+            connected,
+            peer_name,
+            role.local_is_controller,
+            tray_round_trip_ms(),
+        ));
+        let input_forwarding = to_wide("Share mouse and keyboard");
+        let control = to_wide(&if role.local_is_controller {
+            format!("Let {peer_name} control this computer")
         } else {
-            &role.peer_name
-        };
-        let peer = to_wide(&format!(
-            "Peer: {}",
-            if peer_name.is_empty() {
-                "none"
-            } else {
-                peer_name
-            }
-        ));
-        let connections = to_wide(&format!(
-            "Connections: {}",
-            TRAY_CONNECTIONS.load(Ordering::Relaxed)
-        ));
-        let input_events = to_wide(&format!(
-            "Input events: {}",
-            crate::capture_stats()
-                .input_events
-                .saturating_add(TRAY_INJECTED_INPUT_EVENTS.load(Ordering::Relaxed))
-        ));
-        let clipboard_events = to_wide(&format!(
-            "Clipboard events: {}",
-            TRAY_CLIPBOARD_EVENTS.load(Ordering::Relaxed)
-        ));
-        let last_error = to_wide(&format!(
-            "Last error: {}",
-            if context.last_error.is_empty() {
-                "None"
-            } else {
-                &context.last_error
-            }
-        ));
-        let local_controller = to_wide(&format!(
-            "{} controls {}",
-            if role.local_name.is_empty() {
-                if context.local_device_name.is_empty() {
-                    "This computer"
-                } else {
-                    &context.local_device_name
-                }
-            } else {
-                &role.local_name
-            },
-            if peer_name.is_empty() {
-                "Peer"
-            } else {
-                peer_name
-            }
-        ));
-        let peer_controller = to_wide(&format!(
-            "{} controls {}",
-            if peer_name.is_empty() {
-                "Peer"
-            } else {
-                peer_name
-            },
-            if role.local_name.is_empty() {
-                if context.local_device_name.is_empty() {
-                    "this computer"
-                } else {
-                    &context.local_device_name
-                }
-            } else {
-                &role.local_name
-            }
-        ));
-        let role_enabled =
-            role.available && !role.switching && TRAY_CONNECTED.load(Ordering::Relaxed);
-        let role_disabled_flag = if role_enabled { 0 } else { MF_DISABLED };
-        let local_role_flags = MF_STRING
-            | role_disabled_flag
-            | if role.local_is_controller {
-                MF_CHECKED
-            } else {
-                0
-            };
-        let peer_role_flags = MF_STRING
-            | role_disabled_flag
-            | if role.local_is_controller {
-                0
-            } else {
-                MF_CHECKED
-            };
-        let audio_choice = TRAY_AUDIO_CHOICE.load(Ordering::Relaxed);
-        let audio_off_flags = MF_STRING | if audio_choice == 0 { MF_CHECKED } else { 0 };
-        let audio_local_flags = MF_STRING
-            | if audio_choice == 1 { MF_CHECKED } else { 0 }
-            | if TRAY_AUDIO_LOCAL_AVAILABLE.load(Ordering::Relaxed)
-                && TRAY_CONNECTED.load(Ordering::Relaxed)
-            {
-                0
-            } else {
-                MF_DISABLED
-            };
-        let audio_peer_flags = MF_STRING
-            | if audio_choice == 2 { MF_CHECKED } else { 0 }
-            | if TRAY_AUDIO_PEER_AVAILABLE.load(Ordering::Relaxed)
-                && TRAY_CONNECTED.load(Ordering::Relaxed)
-            {
-                0
-            } else {
-                MF_DISABLED
-            };
-        let input_forwarding_flags = if TRAY_INPUT_FORWARDING_ENABLED.load(Ordering::Relaxed) {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let pair_flags = if TRAY_CONNECTED.load(Ordering::Relaxed) {
-            MF_STRING | MF_DISABLED
-        } else {
-            MF_STRING
-        };
+            format!("Control {peer_name} from here")
+        });
+        let release = to_wide("Release control");
+        let audio_heading = to_wide("Audio");
+        let local_audio = to_wide(&format!("Send to {peer_name}"));
+        let peer_audio = to_wide(&format!("Play from {peer_name}"));
+        let audio_off = to_wide("Off");
+        let pair = to_wide("Pair a computer…");
+        let connection = to_wide(if connected { "Disconnect" } else { "Reconnect" });
+        let settings = to_wide("Settings…");
+        let quit = to_wide("Quit");
 
+        let checked = |on: bool| if on { MF_CHECKED } else { 0 };
+        let enabled = |on: bool| if on { 0 } else { MF_DISABLED };
+        let role_available = role.available && !role.switching && connected;
+        let control_id = if role.local_is_controller {
+            ID_PEER_CONTROLLER
+        } else {
+            ID_LOCAL_CONTROLLER
+        };
+        let audio_choice = TRAY_AUDIO_CHOICE.load(Ordering::Relaxed);
+        let audio_local_flags = MF_STRING
+            | checked(audio_choice == 1)
+            | enabled(connected && TRAY_AUDIO_LOCAL_AVAILABLE.load(Ordering::Relaxed));
+        let audio_peer_flags = MF_STRING
+            | checked(audio_choice == 2)
+            | enabled(connected && TRAY_AUDIO_PEER_AVAILABLE.load(Ordering::Relaxed));
+        let audio_off_flags = MF_STRING | checked(audio_choice == 0);
+        let input_forwarding_flags =
+            MF_STRING | checked(TRAY_INPUT_FORWARDING_ENABLED.load(Ordering::Relaxed));
+
+        // Status first, then everyday actions; counters live in the log.
         unsafe {
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status_label.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, transport.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_backend.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, pairing.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, peer.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, connections.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, input_events.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, clipboard_events.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, last_error.as_ptr());
-            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_status.as_ptr());
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, summary.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-            AppendMenuW(menu, pair_flags, ID_PAIR, pair.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
-            AppendMenuW(
-                menu,
-                local_role_flags,
-                ID_LOCAL_CONTROLLER,
-                local_controller.as_ptr(),
-            );
-            AppendMenuW(
-                menu,
-                peer_role_flags,
-                ID_PEER_CONTROLLER,
-                peer_controller.as_ptr(),
-            );
             AppendMenuW(
                 menu,
                 input_forwarding_flags,
                 ID_INPUT_FORWARDING,
                 input_forwarding.as_ptr(),
             );
+            if role_available {
+                AppendMenuW(menu, MF_STRING, control_id, control.as_ptr());
+            }
+            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
             AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, audio_heading.as_ptr());
-            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
             AppendMenuW(
                 menu,
                 audio_local_flags,
@@ -3127,7 +2997,12 @@ mod tray {
                 local_audio.as_ptr(),
             );
             AppendMenuW(menu, audio_peer_flags, ID_AUDIO_PEER, peer_audio.as_ptr());
-            AppendMenuW(menu, MF_STRING, ID_RELEASE, release.as_ptr());
+            AppendMenuW(menu, audio_off_flags, ID_AUDIO_OFF, audio_off.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+            if !connected {
+                AppendMenuW(menu, MF_STRING, ID_PAIR, pair.as_ptr());
+            }
+            AppendMenuW(menu, MF_STRING, ID_CONNECTION, connection.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
 
@@ -3213,23 +3088,49 @@ mod tray {
         }
     }
 
-    fn current_audio_status() -> Vec<u16> {
-        let audio_status = TRAY_AUDIO_STATUS
-            .lock()
-            .expect("tray audio status poisoned");
-        if audio_status.is_empty() {
-            to_wide("Audio: Off")
-        } else {
-            audio_status.clone()
-        }
-    }
-
     fn wide_to_string(value: &[u16]) -> String {
         let length = value
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(value.len());
         String::from_utf16_lossy(&value[..length])
+    }
+
+    /// One line on what's going on, with the round trip while connected.
+    fn menu_summary(
+        status: &str,
+        connected: bool,
+        peer_name: &str,
+        local_is_controller: bool,
+        round_trip_ms: Option<u64>,
+    ) -> String {
+        if !connected {
+            return status_summary(status).to_string();
+        }
+        let summary = if local_is_controller {
+            format!("Controlling {peer_name}")
+        } else {
+            format!("{peer_name} is controlling this computer")
+        };
+        match round_trip_ms {
+            Some(0) => format!("{summary} · <1 ms"),
+            Some(ms) => format!("{summary} · {ms} ms"),
+            None => summary,
+        }
+    }
+
+    pub(super) fn set_round_trip(round_trip: Option<std::time::Duration>) {
+        let millis = round_trip.map_or(u64::MAX, |rtt| {
+            u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX - 1)
+        });
+        TRAY_ROUND_TRIP_MS.store(millis, Ordering::Relaxed);
+    }
+
+    fn tray_round_trip_ms() -> Option<u64> {
+        match TRAY_ROUND_TRIP_MS.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            millis => Some(millis),
+        }
     }
 
     fn status_summary(status: &str) -> &str {

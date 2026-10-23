@@ -1,17 +1,24 @@
+//! The edge-kvm windows: settings, phone pairing and pairing confirmation.
+
+mod phone;
+mod settings;
+mod widgets;
+
 use std::{
     fs::OpenOptions,
     io::Write,
     net::IpAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
-    time::SystemTime,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result};
-use edge_common::{
-    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
-    TransportMode, parse_listen_port, update_listen_port, validate_device_name, validate_host,
-    validate_port,
+use anyhow::Result;
+use edge_common::{AppConfig, Role};
+
+use crate::{
+    phone::{PairingAction, PhonePairing},
+    settings::SettingsApp,
 };
 
 static SETTINGS_WINDOW_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -19,9 +26,9 @@ static SETTINGS_CONTEXT: OnceLock<Mutex<Option<eframe::egui::Context>>> = OnceLo
 
 pub struct SettingsUiInput {
     pub role: Role,
-    /// The Linux node supports both connection directions. The Windows entry
-    /// point is currently connector-only, so it displays the mode read-only.
-    pub can_choose_transport: bool,
+    /// The Windows app can only dial, so it needs the other computer's
+    /// address. A Linux node also accepts computers that dial it.
+    pub connector_only: bool,
     /// Close the settings window after a successful save so the caller can
     /// restart the node with the new connection configuration.
     pub restart_on_save: bool,
@@ -29,6 +36,84 @@ pub struct SettingsUiInput {
     pub config: AppConfig,
     pub local_ip: Option<IpAddr>,
     pub pairing: PairingUiState,
+    /// The running node, for live status, phones and pairing. `None` hides
+    /// what needs it.
+    pub link: Option<Arc<dyn NodeLink>>,
+}
+
+/// What the windows can ask of the running node. The Linux receiver answers
+/// over its control socket. Calls block briefly, so implementations should
+/// time out quickly.
+pub trait NodeLink: Send + Sync {
+    /// Linux desktop sharing capabilities and current health. Older nodes return None.
+    fn notifications(&self) -> Option<NotificationSetup> {
+        None
+    }
+    fn install_notification_bridge(&self, _shell: &std::path::Path) -> Result<String> {
+        anyhow::bail!("Quickshell integration is unavailable on this platform")
+    }
+    /// Live status, or `None` if the node can't be reached.
+    fn status(&self) -> Option<NodeStatus>;
+    /// Paired phones, or `None` where phones aren't supported.
+    fn phones(&self) -> Option<Vec<PhoneEntry>>;
+    fn unpair_phone(&self, name: &str) -> Result<()>;
+    /// Arms two-sided pairing with another computer.
+    fn arm_pairing(&self) -> Result<()>;
+    /// Opens a phone pairing window. Events arrive until it closes.
+    fn pair_phone(&self) -> Result<mpsc::Receiver<PhonePairingEvent>>;
+    /// Whether the node starts at login, or `None` if that can't be set here.
+    fn autostart(&self) -> Option<bool>;
+    fn set_autostart(&self, enabled: bool) -> Result<()>;
+    fn open_log(&self) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NotificationSetup {
+    pub identity: String,
+    pub computers: Vec<NotificationComputer>,
+    pub status: String,
+    pub active: bool,
+    pub has_store: bool,
+    pub coordinator: String,
+    pub shell_path: Option<PathBuf>,
+    pub socket_path: PathBuf,
+    pub bridge_installed: bool,
+    #[serde(default)]
+    pub bridge_connected: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NotificationComputer {
+    pub name: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeStatus {
+    pub summary: String,
+    pub connected: bool,
+    pub peer: Option<String>,
+    pub round_trip_ms: Option<u64>,
+    pub diagnostics: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneEntry {
+    pub name: String,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhonePairingEvent {
+    /// Show this link as a QR code until it expires.
+    Offer {
+        uri: String,
+        expires_in: Duration,
+    },
+    Paired(String),
+    /// Expired or replaced by a newer pairing.
+    Closed,
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +264,8 @@ pub fn spawn_settings_window(input: SettingsUiInput) {
             .config_path
             .parent()
             .map(|parent| parent.join("state").join("settings.log"));
-        let window_result = std::panic::catch_unwind(|| run_settings_window(input));
+        let window_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_settings_window(input)));
         let error = match window_result {
             Ok(Ok(_)) => None,
             Ok(Err(err)) => Some(format!("{err:#}")),
@@ -221,15 +307,18 @@ pub fn run_settings_window(input: SettingsUiInput) -> Result<SettingsUiResult> {
     let mut options = eframe::NativeOptions {
         persist_window: false,
         persistence_path: None,
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([480.0, 660.0])
+            .with_min_inner_size([420.0, 420.0]),
         ..Default::default()
     };
     configure_event_loop(&mut options);
 
     eframe::run_native(
-        "edge-kvm Settings",
+        "edge-kvm settings",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            widgets::apply_style(&cc.egui_ctx);
             if let Ok(mut context) = SETTINGS_CONTEXT.get_or_init(|| Mutex::new(None)).lock() {
                 *context = Some(cc.egui_ctx.clone());
             }
@@ -243,6 +332,52 @@ pub fn run_settings_window(input: SettingsUiInput) -> Result<SettingsUiResult> {
         .map_err(|_| anyhow::anyhow!("settings result lock poisoned"))?
         .clone();
     Ok(result)
+}
+
+/// A small window that only pairs a phone, for the tray's "Add phone…".
+pub fn run_phone_pairing_window(link: Arc<dyn NodeLink>) -> Result<()> {
+    let mut options = eframe::NativeOptions {
+        persist_window: false,
+        persistence_path: None,
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([360.0, 470.0])
+            .with_resizable(false),
+        ..Default::default()
+    };
+    configure_event_loop(&mut options);
+
+    eframe::run_native(
+        "Add a phone",
+        options,
+        Box::new(move |cc| {
+            widgets::apply_style(&cc.egui_ctx);
+            let pairing = PhonePairing::start(link.as_ref());
+            Ok(Box::new(PhonePairingApp { link, pairing }))
+        }),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to run phone pairing window: {err}"))
+}
+
+struct PhonePairingApp {
+    link: Arc<dyn NodeLink>,
+    pairing: PhonePairing,
+}
+
+impl eframe::App for PhonePairingApp {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        eframe::egui::CentralPanel::default()
+            .frame(
+                eframe::egui::Frame::new()
+                    .fill(widgets::WINDOW)
+                    .inner_margin(eframe::egui::Margin::same(18)),
+            )
+            .show(ui, |ui| {
+                if self.pairing.ui(ui, self.link.as_ref()) == PairingAction::Close {
+                    ui.ctx()
+                        .send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                }
+            });
+    }
 }
 
 fn configure_event_loop(options: &mut eframe::NativeOptions) {
@@ -262,375 +397,5 @@ fn configure_event_loop(options: &mut eframe::NativeOptions) {
             EventLoopBuilderExtWayland::with_any_thread(builder, true);
             EventLoopBuilderExtX11::with_any_thread(builder, true);
         }));
-    }
-}
-
-struct SettingsApp {
-    role: Role,
-    config_path: PathBuf,
-    original: AppConfig,
-    local_ip: String,
-    pairing: PairingUiState,
-    device_name: String,
-    peer_host: String,
-    port: String,
-    transport: TransportMode,
-    can_choose_transport: bool,
-    restart_on_save: bool,
-    position: PeerPosition,
-    game_compatibility: GameCompatibilityMode,
-    clipboard_images_enabled: bool,
-    audio_route: AudioRoutePreference,
-    audio_play_local: bool,
-    save_message: Option<String>,
-    error_message: Option<String>,
-    result: Arc<Mutex<SettingsUiResult>>,
-}
-
-impl SettingsApp {
-    fn new(input: SettingsUiInput, result: Arc<Mutex<SettingsUiResult>>) -> Self {
-        let peer = input.config.peer.clone();
-        let port = match input.config.transport {
-            TransportMode::Connect => peer.port,
-            TransportMode::Listen => input
-                .config
-                .listen
-                .as_deref()
-                .and_then(|listen| parse_listen_port(listen).ok())
-                .unwrap_or(42_420),
-        };
-        Self {
-            role: input.role,
-            config_path: input.config_path,
-            local_ip: input
-                .local_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "Unknown".to_string()),
-            pairing: input.pairing,
-            device_name: input.config.device_name.clone(),
-            peer_host: peer.host,
-            port: port.to_string(),
-            transport: input.config.transport,
-            can_choose_transport: input.can_choose_transport,
-            restart_on_save: input.restart_on_save,
-            position: input.config.layout.listener_position,
-            game_compatibility: input.config.input.capture.game_compatibility,
-            clipboard_images_enabled: input.config.clipboard.images_enabled,
-            audio_route: input
-                .config
-                .audio
-                .route
-                .unwrap_or(if input.config.audio.enabled {
-                    AudioRoutePreference::PeerToLocal
-                } else {
-                    AudioRoutePreference::Disabled
-                }),
-            audio_play_local: input.config.audio.local_playback == AudioLocalPlayback::Mirror,
-            original: input.config,
-            save_message: None,
-            error_message: None,
-            result,
-        }
-    }
-
-    fn save(&mut self) -> bool {
-        self.error_message = None;
-        self.save_message = None;
-
-        match self.edited_config() {
-            Ok(config) => match config.save_blocking(&self.config_path) {
-                Ok(()) => {
-                    self.original = config.clone();
-                    self.save_message = Some(if self.restart_on_save {
-                        "Saved. Restarting edge-kvm...".to_string()
-                    } else {
-                        "Saved. Connection changes apply on reconnect.".to_string()
-                    });
-                    if let Ok(mut result) = self.result.lock() {
-                        *result = SettingsUiResult::Saved(Box::new(config));
-                    }
-                    true
-                }
-                Err(err) => {
-                    self.error_message = Some(err.to_string());
-                    false
-                }
-            },
-            Err(err) => {
-                self.error_message = Some(err.to_string());
-                false
-            }
-        }
-    }
-
-    fn edited_config(&self) -> Result<AppConfig> {
-        validate_device_name(&self.device_name)?;
-        let port = self
-            .port
-            .trim()
-            .parse::<u16>()
-            .context("port must be a number between 1 and 65535")?;
-        validate_port(port)?;
-
-        let mut config = self.original.clone();
-        config.device_name = self.device_name.trim().to_string();
-        config.transport = self.transport;
-        config.input.capture.game_compatibility = self.game_compatibility;
-        config.clipboard.images_enabled = self.clipboard_images_enabled;
-        config.audio.route = Some(self.audio_route);
-        config.audio.enabled = self.audio_route != AudioRoutePreference::Disabled;
-        config.audio.local_playback = if self.audio_play_local {
-            AudioLocalPlayback::Mirror
-        } else {
-            AudioLocalPlayback::Redirect
-        };
-
-        match self.transport {
-            TransportMode::Connect => {
-                validate_host(&self.peer_host)?;
-                config.peer.host = self.peer_host.trim().to_string();
-                config.peer.port = port;
-                config.layout.listener_position = self.position;
-            }
-            TransportMode::Listen => {
-                config.listen = Some(update_listen_port(config.listen.as_deref(), port));
-            }
-        }
-
-        Ok(config)
-    }
-}
-
-impl eframe::App for SettingsApp {
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
-        use eframe::egui::{self, Align, Layout};
-
-        #[cfg(windows)]
-        if ui.ctx().input(|input| input.viewport().close_requested()) {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            return;
-        }
-
-        ui.heading("edge-kvm Settings");
-        ui.add_space(8.0);
-
-        egui::Grid::new("settings_grid")
-            .num_columns(2)
-            .spacing([18.0, 10.0])
-            .striped(true)
-            .show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut self.device_name);
-                ui.end_row();
-
-                ui.label("Game compatibility");
-                if self.role == Role::Controller {
-                    egui::ComboBox::from_id_salt("game_compatibility")
-                        .selected_text(game_compatibility_label(self.game_compatibility))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.game_compatibility,
-                                GameCompatibilityMode::AlwaysEnabled,
-                                "Always enabled",
-                            );
-                            ui.selectable_value(
-                                &mut self.game_compatibility,
-                                GameCompatibilityMode::Borderless,
-                                "Borderless games",
-                            );
-                            ui.selectable_value(
-                                &mut self.game_compatibility,
-                                GameCompatibilityMode::Compatible,
-                                "Safe / compatible",
-                            );
-                        });
-                } else {
-                    let mut text = "Set on controller".to_string();
-                    ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
-                }
-                ui.end_row();
-
-                ui.label("Local IP");
-                ui.add_enabled(false, egui::TextEdit::singleline(&mut self.local_ip));
-                ui.end_row();
-
-                ui.label("Connection mode");
-                ui.add_enabled_ui(self.can_choose_transport, |ui| {
-                    egui::ComboBox::from_id_salt("connection_mode")
-                        .selected_text(transport_label(self.transport))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.transport,
-                                TransportMode::Connect,
-                                "Connect to the other computer",
-                            );
-                            ui.selectable_value(
-                                &mut self.transport,
-                                TransportMode::Listen,
-                                "Wait for the other computer",
-                            );
-                        });
-                });
-                ui.end_row();
-
-                ui.label("");
-                ui.small(match self.transport {
-                    TransportMode::Connect => {
-                        "This computer starts the connection. Enter the other computer's IP below."
-                    }
-                    TransportMode::Listen => {
-                        "This computer waits. Set the other computer to Connect."
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Peer IP");
-                if self.transport == TransportMode::Connect {
-                    ui.text_edit_singleline(&mut self.peer_host);
-                } else {
-                    let mut receiver_peer = "Not needed while waiting".to_string();
-                    ui.add_enabled(false, egui::TextEdit::singleline(&mut receiver_peer));
-                }
-                ui.end_row();
-
-                ui.label("Port");
-                ui.text_edit_singleline(&mut self.port);
-                ui.end_row();
-
-                ui.label("Screen location");
-                if self.transport == TransportMode::Connect {
-                    egui::ComboBox::from_id_salt("screen_location")
-                        .selected_text(position_label(self.position))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.position, PeerPosition::Left, "Left");
-                            ui.selectable_value(&mut self.position, PeerPosition::Right, "Right");
-                            ui.selectable_value(&mut self.position, PeerPosition::Top, "Top");
-                            ui.selectable_value(&mut self.position, PeerPosition::Bottom, "Bottom");
-                        });
-                } else {
-                    let mut text = "Set on connecting computer".to_string();
-                    ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
-                }
-                ui.end_row();
-
-                ui.label("Pairing status");
-                ui.label(pairing_text(&self.pairing));
-                ui.end_row();
-
-                ui.label("Clipboard images");
-                ui.checkbox(
-                    &mut self.clipboard_images_enabled,
-                    "Sync images on connection",
-                );
-                ui.end_row();
-
-                ui.label("Audio streaming");
-                egui::ComboBox::from_id_salt("audio_route")
-                    .selected_text(audio_route_label(
-                        self.audio_route,
-                        &self.device_name,
-                        &self.original.peer.name,
-                    ))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.audio_route,
-                            AudioRoutePreference::LocalToPeer,
-                            format!("{} → {}", self.device_name, self.original.peer.name),
-                        );
-                        ui.selectable_value(
-                            &mut self.audio_route,
-                            AudioRoutePreference::PeerToLocal,
-                            format!("{} → {}", self.original.peer.name, self.device_name),
-                        );
-                        ui.selectable_value(
-                            &mut self.audio_route,
-                            AudioRoutePreference::Disabled,
-                            "Audio off",
-                        );
-                    });
-                ui.end_row();
-
-                ui.label("Local playback");
-                ui.checkbox(&mut self.audio_play_local, "Keep playing locally");
-                ui.end_row();
-
-                ui.label("Playback output");
-                let mut output = "Follow system default".to_string();
-                ui.add_enabled(false, egui::TextEdit::singleline(&mut output));
-                ui.end_row();
-            });
-
-        ui.add_space(12.0);
-        if let Some(message) = &self.error_message {
-            ui.colored_label(egui::Color32::from_rgb(248, 113, 113), message);
-        }
-        if let Some(message) = &self.save_message {
-            ui.colored_label(egui::Color32::from_rgb(34, 197, 94), message);
-        }
-
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let save_label = if self.restart_on_save {
-                "Save and restart"
-            } else {
-                "Save"
-            };
-            if ui.button(save_label).clicked() && self.save() && self.restart_on_save {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    }
-}
-
-fn position_label(position: PeerPosition) -> &'static str {
-    match position {
-        PeerPosition::Left => "Left",
-        PeerPosition::Right => "Right",
-        PeerPosition::Top => "Top",
-        PeerPosition::Bottom => "Bottom",
-    }
-}
-
-fn transport_label(transport: TransportMode) -> &'static str {
-    match transport {
-        TransportMode::Connect => "Connect to the other computer",
-        TransportMode::Listen => "Wait for the other computer",
-    }
-}
-
-fn audio_route_label(route: AudioRoutePreference, local_name: &str, peer_name: &str) -> String {
-    match route {
-        AudioRoutePreference::LocalToPeer => format!("{local_name} → {peer_name}"),
-        AudioRoutePreference::PeerToLocal => format!("{peer_name} → {local_name}"),
-        AudioRoutePreference::Disabled => "Audio off".to_string(),
-    }
-}
-
-fn game_compatibility_label(mode: GameCompatibilityMode) -> &'static str {
-    match mode {
-        GameCompatibilityMode::AlwaysEnabled => "Always enabled",
-        GameCompatibilityMode::Borderless => "Borderless games",
-        GameCompatibilityMode::Compatible => "Safe / compatible",
-    }
-}
-
-fn pairing_text(pairing: &PairingUiState) -> String {
-    match pairing {
-        PairingUiState::Idle => "No pending pairing".to_string(),
-        PairingUiState::PendingIncoming(pairing) => {
-            format!("Incoming request from {}", pairing.peer_name)
-        }
-        PairingUiState::PendingOutgoing(pairing) => {
-            format!("Waiting for {}", pairing.peer_name)
-        }
-        PairingUiState::Paired {
-            peer_name,
-            peer_fingerprint,
-        } => {
-            format!("Paired with {peer_name} ({peer_fingerprint})")
-        }
-        PairingUiState::Error(error) => error.clone(),
     }
 }
