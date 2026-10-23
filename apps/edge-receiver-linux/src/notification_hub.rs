@@ -1033,7 +1033,7 @@ struct ByteBudget {
 impl ByteBudget {
     fn reserve(&mut self, bytes: usize) -> Result<()> {
         self.shared
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= MAX_STORE_BYTES)
             })
