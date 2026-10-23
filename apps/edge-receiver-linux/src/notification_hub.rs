@@ -139,6 +139,20 @@ impl Store {
         }
         Ok(true)
     }
+    fn record(&self, key: &NotificationKey) -> Option<NotificationRecord> {
+        let current = self.records.iter().find(|record| &record.key == key);
+        let Some(operation) = self.pending.iter().find(|operation| &operation.key == key) else {
+            return current.cloned();
+        };
+        // Apply the accepted optimistic operation to this key alone. Phone
+        // reconciliation must not clone the entire icon-bearing history per key.
+        let mut overlay = Store {
+            records: current.cloned().into_iter().collect(),
+            ..Store::default()
+        };
+        let _ = overlay.apply(&self.local_identity, operation);
+        overlay.records.pop()
+    }
     fn view(&self) -> Vec<NotificationRecord> {
         let mut overlay = self.clone();
         for operation in &self.pending {
@@ -833,7 +847,7 @@ impl NotificationHub {
                         }
                         BridgeMessage::Copy { id, key, content } => {
                             // Only a known committed entry can be registered as a copy.
-                            let record = self.0.state.lock().await.view().into_iter().find(|r| r.key == key);
+                            let record = self.0.state.lock().await.record(&key);
                             if let Some(record) = record {
                                 if let Some(canonical) = &record.content {
                                     // Phone delivery and bridge reconciliation share one ID.
@@ -885,7 +899,7 @@ impl NotificationHub {
                     // Read current content while holding state before the ID-cache
                     // lock; a stale bridge iteration cannot overwrite a fresh post.
                     let state = self.0.state.lock().await;
-                    let current = state.view().into_iter().find(|r| r.key == record.key);
+                    let current = state.record(&record.key);
                     if let Some(current) = current {
                         self.0
                             .phone_projections
@@ -1954,6 +1968,7 @@ mod tests {
             content: None,
         });
         assert!(store.view()[0].content.is_none());
+        assert_eq!(store.record(&key()), Some(store.view()[0].clone()));
         let recovered: Store =
             serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
         assert!(recovered.view()[0].content.is_none());
