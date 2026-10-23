@@ -14,8 +14,8 @@ use cpal::{
 use edge_audio::{FRAME_MS, SAMPLE_RATE, SAMPLES_PER_CHANNEL};
 
 use crate::{
-    AudioRing, OUTPUT_PREBUFFER_MS, OUTPUT_QUEUE_LIMIT_MS, OUTPUT_TARGET_MS, OutputConverter,
-    PlaybackStats, PlayoutState, QueueAverage, clock_correction, duration_samples,
+    AudioProducer, OUTPUT_PREBUFFER_MS, OUTPUT_QUEUE_LIMIT_MS, OUTPUT_TARGET_MS, OutputConverter,
+    PlaybackStats, PlayoutState, QueueAverage, audio_ring, clock_correction, duration_samples,
 };
 
 /// Overrides CPAL's host choice, for example `ALSA` or `PipeWire`.
@@ -23,7 +23,7 @@ pub const AUDIO_HOST_ENV: &str = "EDGE_KVM_AUDIO_HOST";
 
 /// Plays 48 kHz stereo PCM on the default output device.
 pub struct AudioPlayer {
-    ring: Arc<AudioRing>,
+    ring: AudioProducer,
     converter: OutputConverter,
     stats: Arc<PlaybackStats>,
     target_queue_samples: usize,
@@ -33,7 +33,7 @@ pub struct AudioPlayer {
 }
 
 struct OpenedStream {
-    ring: Arc<AudioRing>,
+    ring: AudioProducer,
     output_name: String,
     host_name: &'static str,
     output_rate: u32,
@@ -190,11 +190,11 @@ fn open_stream(
     let config: StreamConfig = supported.into();
     let output_rate = config.sample_rate;
     let output_channels = config.channels as usize;
-    let ring = Arc::new(AudioRing::new(duration_samples(
+    let (ring, consumer) = audio_ring(duration_samples(
         output_rate,
         output_channels,
         queue_limit_ms,
-    )));
+    ));
     stats.output_samples_per_ms.store(
         duration_samples(output_rate, output_channels, 1).max(1),
         Ordering::Relaxed,
@@ -204,7 +204,7 @@ fn open_stream(
         Ordering::Relaxed,
     );
     let playout = PlayoutState::new(
-        ring.clone(),
+        consumer,
         stats,
         output_channels,
         duration_samples(output_rate, output_channels, OUTPUT_PREBUFFER_MS),

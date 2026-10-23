@@ -45,17 +45,50 @@ const FADE_FRAMES: usize = 48;
 pub const AUDIO_LOSS_WARNING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Single-producer, single-consumer ring of interleaved output samples.
-pub struct AudioRing {
+struct AudioRing {
     samples: Box<[UnsafeCell<f32>]>,
     capacity: usize,
     read: AtomicUsize,
     write: AtomicUsize,
 }
 
-// AudioRing has exactly one producer and one consumer. The producer writes
+// The private ring is accessible only through the unique, non-cloneable
+// producer and consumer handles below. Their mutation requires &mut self,
+// so safe callers cannot create concurrent producers or consumers. The producer writes
 // only slots outside the consumer's readable range and publishes them with
 // Release; the callback reads only published slots after an Acquire load.
 unsafe impl Sync for AudioRing {}
+
+/// Unique writer for the single-producer audio ring.
+struct AudioProducer(Arc<AudioRing>);
+
+/// Unique reader for the single-consumer audio ring.
+struct AudioConsumer(Arc<AudioRing>);
+
+fn audio_ring(capacity: usize) -> (AudioProducer, AudioConsumer) {
+    let ring = Arc::new(AudioRing::new(capacity));
+    (AudioProducer(ring.clone()), AudioConsumer(ring))
+}
+
+impl AudioProducer {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn push_slice_aligned(&mut self, input: &[f32], alignment: usize) -> usize {
+        self.0.push_slice_aligned(input, alignment)
+    }
+}
+
+impl AudioConsumer {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn pop(&mut self) -> Option<f32> {
+        self.0.pop()
+    }
+}
 
 impl AudioRing {
     pub fn new(capacity: usize) -> Self {
@@ -77,10 +110,6 @@ impl AudioRing {
             .load(Ordering::Acquire)
             .wrapping_sub(self.read.load(Ordering::Acquire))
             .min(self.capacity)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Pushes whole frames of `alignment` samples and returns how many samples
@@ -312,8 +341,8 @@ impl QueueAverage {
 
 /// Output-callback state: prebuffering, underrun detection, and short fades so
 /// starting, stopping, and running dry never produce a hard step.
-pub struct PlayoutState {
-    ring: Arc<AudioRing>,
+struct PlayoutState {
+    ring: AudioConsumer,
     stats: Arc<PlaybackStats>,
     channels: usize,
     prebuffer_samples: usize,
@@ -324,7 +353,7 @@ pub struct PlayoutState {
 
 impl PlayoutState {
     pub fn new(
-        ring: Arc<AudioRing>,
+        ring: AudioConsumer,
         stats: Arc<PlaybackStats>,
         channels: usize,
         prebuffer_samples: usize,
@@ -394,22 +423,45 @@ mod tests {
 
     #[test]
     fn audio_ring_is_bounded_and_preserves_order() {
-        let ring = AudioRing::new(4);
-        assert_eq!(ring.push_slice_aligned(&[1.0, 2.0, 3.0], 1), 3);
-        assert_eq!(ring.pop(), Some(1.0));
-        assert_eq!(ring.push_slice_aligned(&[4.0, 5.0, 6.0], 1), 2);
-        assert_eq!(ring.len(), 4);
-        assert_eq!(ring.pop(), Some(2.0));
-        assert_eq!(ring.pop(), Some(3.0));
-        assert_eq!(ring.pop(), Some(4.0));
-        assert_eq!(ring.pop(), Some(5.0));
-        assert_eq!(ring.pop(), None);
+        let (mut producer, mut consumer) = audio_ring(4);
+        assert_eq!(producer.push_slice_aligned(&[1.0, 2.0, 3.0], 1), 3);
+        assert_eq!(consumer.pop(), Some(1.0));
+        assert_eq!(producer.push_slice_aligned(&[4.0, 5.0, 6.0], 1), 2);
+        assert_eq!(consumer.len(), 4);
+        assert_eq!(consumer.pop(), Some(2.0));
+        assert_eq!(consumer.pop(), Some(3.0));
+        assert_eq!(consumer.pop(), Some(4.0));
+        assert_eq!(consumer.pop(), Some(5.0));
+        assert_eq!(consumer.pop(), None);
 
-        let frame_ring = AudioRing::new(5);
+        let (mut frame_producer, _) = audio_ring(5);
         assert_eq!(
-            frame_ring.push_slice_aligned(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2),
+            frame_producer.push_slice_aligned(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2),
             4
         );
+    }
+
+    #[test]
+    fn audio_ring_preserves_order_across_threads_and_wraps() {
+        let (mut producer, mut consumer) = audio_ring(257);
+        let writer = std::thread::spawn(move || {
+            for value in 0..20_000 {
+                while producer.push_slice_aligned(&[value as f32], 1) == 0 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        for expected in 0..20_000 {
+            let sample = loop {
+                if let Some(sample) = consumer.pop() {
+                    break sample;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(sample, expected as f32);
+        }
+        writer.join().unwrap();
+        assert_eq!(consumer.pop(), None);
     }
 
     #[test]
@@ -497,9 +549,9 @@ mod tests {
 
     #[test]
     fn playout_prebuffers_fades_in_and_fades_out_on_underrun() {
-        let ring = Arc::new(AudioRing::new(4_096));
+        let (mut producer, consumer) = audio_ring(4_096);
         let stats = Arc::new(PlaybackStats::default());
-        let mut playout = PlayoutState::new(ring.clone(), stats.clone(), 2, 200);
+        let mut playout = PlayoutState::new(consumer, stats.clone(), 2, 200);
 
         let mut output = vec![1.0; 40];
         playout.render(&mut output);
@@ -508,7 +560,7 @@ mod tests {
             "silent before prebuffer"
         );
 
-        ring.push_slice_aligned(&vec![0.5; 400], 2);
+        producer.push_slice_aligned(&vec![0.5; 400], 2);
         let mut output = vec![0.0; 400];
         playout.render(&mut output);
         assert!(
