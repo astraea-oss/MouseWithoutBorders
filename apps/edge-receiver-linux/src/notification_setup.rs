@@ -273,10 +273,8 @@ pub(crate) fn install_bridge(shell: &Path, socket: &Path) -> Result<String> {
         ));
         std::fs::write(&refresh, BRIDGE)?;
         std::fs::rename(refresh, parent.join("EdgeNotificationBridge.qml"))?;
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&shell)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        let file = std::fs::OpenOptions::new().write(true).open(&shell)?;
+        file.set_modified(SystemTime::now())?;
         return Ok("Requested Quickshell bridge reload; check connection status".into());
     }
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -375,6 +373,23 @@ mod tests {
         let count = std::fs::read_dir(temp.path()).unwrap().count();
         install_bridge(&shell, Path::new("/tmp/edge-test.sock")).unwrap();
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), count);
+    }
+
+    #[test]
+    fn reload_preserves_shell_bytes_and_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("checkout.qml");
+        let shell = dir.path().join("shell.qml");
+        let socket = Path::new("/tmp/edge-reload-test.sock");
+        let expected = patch_shell(SHELL, socket).unwrap();
+        std::fs::write(&target, &expected).unwrap();
+        std::os::unix::fs::symlink(&target, &shell).unwrap();
+        std::fs::write(dir.path().join("EdgeNotificationBridge.qml"), BRIDGE).unwrap();
+        for _ in 0..3 {
+            install_bridge(&shell, socket).unwrap();
+        }
+        assert!(shell.is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), expected);
     }
 
     #[test]

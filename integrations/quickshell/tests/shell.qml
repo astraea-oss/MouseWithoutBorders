@@ -7,6 +7,7 @@ import Quickshell.Services.Notifications
 ShellRoot {
     id: root
     property bool dnd: false
+    property int popupCount: 0
     readonly property var notificationTimes: JSON.parse(notificationState.times)
     PersistentProperties {
         id: notificationState
@@ -26,6 +27,7 @@ ShellRoot {
             if (notification.transient) notification.tracked = true;
             else root.retainNotification(notification, Number(notification.hints["x-edge-kvm-posted-ms"]) || Date.now());
             if (root.dnd || notification.hints["x-edge-kvm-replay"]) return;
+            root.popupCount++;
         }
     }
     EdgeNotificationBridge {
@@ -38,8 +40,11 @@ ShellRoot {
     IpcHandler {
         target: "test"
         function entries(): string {
-            return JSON.stringify(notificationServer.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, label: typeof edgeNotificationBridge === "undefined" ? n.appName : edgeNotificationBridge.appLabel(n), key: n.hints["x-edge-kvm-key"] || "" })));
+            return JSON.stringify(notificationServer.trackedNotifications.values.map(n => ({ id: n.id, title: n.summary, replay: !!n.hints["x-edge-kvm-replay"], label: typeof edgeNotificationBridge === "undefined" ? n.appName : edgeNotificationBridge.appLabel(n), key: n.hints["x-edge-kvm-key"] || "" })));
         }
+        function popups(): int { return root.popupCount; }
+        function quiet(): void { root.dnd = true; }
+        function loud(): void { root.dnd = false; }
         function dismiss(id: int): void {
             const entry = notificationServer.trackedNotifications.values.find(n => n.id === id);
             if (entry) entry.dismiss();

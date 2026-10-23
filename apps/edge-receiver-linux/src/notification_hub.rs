@@ -232,6 +232,7 @@ struct Inner {
     links: Arc<AtomicUsize>,
     error: std::sync::Mutex<Option<String>>,
     bridge_error: std::sync::Mutex<Option<String>>,
+    phone_projections: Mutex<crate::phone_projection::PhoneProjections>,
 }
 pub struct NotificationService {
     pub hub: NotificationHub,
@@ -245,25 +246,54 @@ pub(crate) struct PhoneNotificationSource {
     prefix: String,
     name: String,
     resent: Option<HashSet<String>>,
+    snapshot_failed: bool,
 }
 
 impl PhoneNotificationSource {
     pub async fn apply(&mut self, event: edge_protocol::NotificationEvent) -> Result<()> {
-        let result = self.apply_inner(event).await;
+        self.apply_with_desktop(event, None).await
+    }
+
+    pub async fn apply_and_deliver(
+        &mut self,
+        event: edge_protocol::NotificationEvent,
+        desktop: &FreedesktopNotifications,
+    ) -> Result<()> {
+        self.apply_with_desktop(event, Some(desktop)).await
+    }
+
+    async fn apply_with_desktop(
+        &mut self,
+        event: edge_protocol::NotificationEvent,
+        desktop: Option<&FreedesktopNotifications>,
+    ) -> Result<()> {
+        let result = self.apply_inner(event, desktop).await;
         if let Err(error) = &result {
+            if self.resent.is_some() {
+                self.snapshot_failed = true;
+            }
             self.hub
                 .record_error(&format!("Phone notification history: {error}"));
         }
         result
     }
 
-    async fn apply_inner(&mut self, event: edge_protocol::NotificationEvent) -> Result<()> {
+    async fn apply_inner(
+        &mut self,
+        event: edge_protocol::NotificationEvent,
+        desktop: Option<&FreedesktopNotifications>,
+    ) -> Result<()> {
         use edge_protocol::NotificationEvent;
         if matches!(event, NotificationEvent::SnapshotStart) {
             ensure!(self.resent.is_none(), "nested phone notification snapshot");
             self.resent = Some(HashSet::new());
+            self.snapshot_failed = false;
             return Ok(());
         }
+        let fresh = self.resent.is_none() && matches!(event, NotificationEvent::Posted(_));
+        let snapshot_present = self.resent.clone();
+        let withdrawal = matches!(event, NotificationEvent::Removed { .. });
+        let snapshot_end = matches!(event, NotificationEvent::SnapshotEnd);
         let mut state = self.hub.0.state.lock().await;
         let mut next = state.clone();
         let mut changed = false;
@@ -286,6 +316,26 @@ impl PhoneNotificationSource {
                     .get(&id)
                     .is_some_and(|entry| entry.present)
                 {
+                    let cached = if let Some(desktop) = desktop {
+                        let mut cache = self.hub.0.phone_projections.lock().await;
+                        cache
+                            .load(desktop, &self.hub.phone_projection_path())
+                            .await?;
+                        if next.phone_instances.len() >= MAX_RECORDS {
+                            next.phone_instances.retain(|known, entry| {
+                                known == &id
+                                    || entry.present
+                                    || cache.instance(&format!("{known}/")).is_some()
+                            });
+                        }
+                        if next.phone_instances.contains_key(&id) {
+                            None
+                        } else {
+                            cache.instance(&format!("{id}/"))
+                        }
+                    } else {
+                        None
+                    };
                     ensure!(
                         next.phone_instances.contains_key(&id)
                             || next.phone_instances.len() < MAX_RECORDS,
@@ -294,7 +344,7 @@ impl PhoneNotificationSource {
                     next.phone_instances.insert(
                         id.clone(),
                         PhoneInstance {
-                            instance: format!("{id}/{}", new_epoch()?),
+                            instance: cached.unwrap_or(format!("{id}/{}", new_epoch()?)),
                             present: true,
                         },
                     );
@@ -324,6 +374,14 @@ impl PhoneNotificationSource {
                     entry.present = false;
                     changed = true;
                     operations.push((entry.instance.clone(), None));
+                } else if let Some(desktop) = desktop {
+                    let mut cache = self.hub.0.phone_projections.lock().await;
+                    cache
+                        .load(desktop, &self.hub.phone_projection_path())
+                        .await?;
+                    if let Some(instance) = cache.instance(&format!("{}{id}/", self.prefix)) {
+                        operations.push((instance, None));
+                    }
                 }
             }
             NotificationEvent::SnapshotEnd => {
@@ -331,7 +389,8 @@ impl PhoneNotificationSource {
                     .resent
                     .take()
                     .context("phone notification snapshot end without start")?;
-                if !self.name.is_empty()
+                if !self.snapshot_failed
+                    && !self.name.is_empty()
                     && next.imported_phones.get(&self.prefix) != Some(&self.name)
                 {
                     ensure!(
@@ -353,23 +412,79 @@ impl PhoneNotificationSource {
             }
             NotificationEvent::SnapshotStart => unreachable!(),
         }
-        for (instance, content) in operations {
-            changed |= next.queue_local(
-                NotificationKey {
-                    origin: self.hub.0.identity.clone(),
-                    instance,
-                },
-                content,
-                self.hub.is_coordinator(),
-            )?;
+        if let Some(desktop) = desktop {
+            let mut cache = self.hub.0.phone_projections.lock().await;
+            cache
+                .load(desktop, &self.hub.phone_projection_path())
+                .await?;
+            for (instance, content) in &mut operations {
+                if cache.dismissed(instance) {
+                    *content = None;
+                }
+            }
         }
-        if changed {
-            // Commit phone lifetime metadata and its shared operations together.
-            self.hub.persist(&next).await?;
-            *state = next;
-            drop(state);
+        let committed: Result<()> = async {
+            ensure!(!(snapshot_end && self.snapshot_failed),
+                "Phone snapshot was not fully imported; local delivery continues, history needs attention");
+            for (instance, content) in &operations {
+                changed |= next.queue_local(
+                    NotificationKey {
+                        origin: self.hub.0.identity.clone(),
+                        instance: instance.clone(),
+                    },
+                    content.clone(),
+                    self.hub.is_coordinator(),
+                )?;
+            }
+            if changed {
+                // Commit phone lifetime metadata and shared operations together.
+                self.hub.persist(&next).await?;
+                *state = next;
+            }
+            Ok(())
+        }
+        .await;
+        // Delivery is independent of bridge connectivity and store capacity. A
+        // single daemon-scoped ID cache also serves the bridge's reconciliation.
+        let delivered: Result<()> = async {
+            if let Some(desktop) = desktop {
+                let view = state.view();
+                let path = self.hub.phone_projection_path();
+                let mut cache = self.hub.0.phone_projections.lock().await;
+                for (instance, content) in &operations {
+                    let key = NotificationKey {
+                        origin: self.hub.0.identity.clone(),
+                        instance: instance.clone(),
+                    };
+                    let terminal = view.iter().any(|r| r.key == key && r.content.is_none());
+                    cache
+                        .show(
+                            desktop,
+                            &path,
+                            &key,
+                            if terminal { None } else { content.as_ref() },
+                            fresh,
+                        )
+                        .await?;
+                    if withdrawal {
+                        cache.withdraw(desktop, &path, instance).await?;
+                    }
+                }
+                if snapshot_end && let Some(present) = snapshot_present {
+                    for instance in cache.missing(&self.prefix, &present) {
+                        cache.withdraw(desktop, &path, &instance).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        drop(state);
+        if changed && committed.is_ok() {
             self.hub.publish();
         }
+        committed?;
+        delivered?;
         Ok(())
     }
 }
@@ -381,6 +496,7 @@ impl NotificationHub {
             prefix: format!("phone/{}/", fingerprint.replace(':', "")),
             name: name.into(),
             resent: None,
+            snapshot_failed: false,
         }
     }
 
@@ -513,6 +629,7 @@ impl NotificationHub {
             links: Arc::default(),
             error: std::sync::Mutex::new(None),
             bridge_error: std::sync::Mutex::new(None),
+            phone_projections: Mutex::default(),
         }));
         hub.persist(&*hub.0.state.lock().await).await?;
         let worker = hub.clone();
@@ -645,6 +762,19 @@ impl NotificationHub {
         self.publish();
         Ok(())
     }
+    fn phone_projection_path(&self) -> PathBuf {
+        self.0.path.with_file_name("phone-projections.json")
+    }
+    fn local_phone(&self, key: &NotificationKey) -> bool {
+        key.origin == self.0.identity && key.instance.starts_with("phone/")
+    }
+    async fn local_from_bridge(&self, key: NotificationKey, content: Option<SharedNotification>) {
+        if let Err(error) = self.local(key, content).await {
+            self.record_error(&format!(
+                "Notification history: {error}; local delivery continues"
+            ));
+        }
+    }
     pub fn link(&self, peer: &str, supported: bool) -> Option<NotificationLink> {
         if !supported
             || !self.enrolled(peer)
@@ -699,36 +829,40 @@ impl NotificationHub {
                             let key = NotificationKey { origin: self.0.identity.clone(), instance };
                             native.insert(key.clone(), id);
                             if let Some(keys) = &mut inventory { keys.push(key.clone()); }
-                            self.local(key, Some(content)).await?;
+                            self.local_from_bridge(key, Some(content)).await;
                         }
                         BridgeMessage::Copy { id, key, content } => {
                             // Only a known committed entry can be registered as a copy.
                             let record = self.0.state.lock().await.view().into_iter().find(|r| r.key == key);
                             if let Some(record) = record {
-                                if record.content.is_none() {
-                                    desktop.close_shared(id).await?;
-                                } else {
-                                    // Inventory may be stale, so reconcile once using
-                                    // its displayed fields. Later callbacks cannot
-                                    // overwrite our canonical projection with text
-                                    // truncation or missing icon bytes and loop.
+                                if let Some(canonical) = &record.content {
+                                    // Phone delivery and bridge reconciliation share one ID.
+                                    if self.local_phone(&key) {
+                                        self.0.phone_projections.lock().await.adopt(&desktop, &self.phone_projection_path(), &key, id, canonical).await?;
+                                    }
+                                    // QML cannot echo icon bytes or untruncated text.
                                     projections.entry(key).or_insert((id, content));
+                                } else {
+                                    desktop.close_shared(id).await?;
                                 }
                             }
                         }
                         BridgeMessage::Closed { id, reason, instance, key } => {
+                            if let Some(key) = &key && self.local_phone(key) {
+                                self.0.phone_projections.lock().await.closed(&self.phone_projection_path(), &key.instance, id, reason).await?;
+                            }
                             if let Some(key) = native.iter().find(|(_, value)| **value == id).map(|(k, _)| k.clone()) {
                                 native.remove(&key);
-                                if (1..=3).contains(&reason) { self.local(key, None).await?; }
+                                if (1..=3).contains(&reason) { self.local_from_bridge(key, None).await; }
                             } else if let Some(key) = projections.iter().find(|(_, (value, _))| *value == id).map(|(k, _)| k.clone()) {
                                 projections.remove(&key);
-                                if reason == 2 { self.local(key, None).await?; }
+                                if reason == 2 { self.local_from_bridge(key, None).await; }
                             } else if (1..=3).contains(&reason) {
                                 // Recover a closure queued while the local backend was down.
                                 let candidate = key.or_else(|| instance.map(|instance| NotificationKey { origin: self.0.identity.clone(), instance }));
                                 if let Some(key) = candidate {
                                     let known = self.0.state.lock().await.view().iter().any(|r| r.key == key);
-                                    if known && (key.origin == self.0.identity || reason == 2) { self.local(key, None).await?; }
+                                    if known && (key.origin == self.0.identity || reason == 2) { self.local_from_bridge(key, None).await; }
                                 }
                             }
                         }
@@ -747,6 +881,27 @@ impl NotificationHub {
             }
             let records = self.0.state.lock().await.view();
             for record in &records {
+                if self.local_phone(&record.key) {
+                    // Read current content while holding state before the ID-cache
+                    // lock; a stale bridge iteration cannot overwrite a fresh post.
+                    let state = self.0.state.lock().await;
+                    let current = state.view().into_iter().find(|r| r.key == record.key);
+                    if let Some(current) = current {
+                        self.0
+                            .phone_projections
+                            .lock()
+                            .await
+                            .show(
+                                &desktop,
+                                &self.phone_projection_path(),
+                                &current.key,
+                                current.content.as_ref(),
+                                false,
+                            )
+                            .await?;
+                    }
+                    continue;
+                }
                 match &record.content {
                     None => {
                         if let Some(id) = native.remove(&record.key) {
@@ -766,7 +921,7 @@ impl NotificationHub {
                         // Every reconciliation is silent. Fresh source posts receive a popup
                         // only on their originating device in the first milestone.
                         let id = desktop
-                            .show_shared(&record.key, content, replaces, &self.0.name)
+                            .show_shared(&record.key, content, replaces, &self.0.name, true)
                             .await?;
                         projections.insert(record.key.clone(), (id, content.clone()));
                     }
@@ -1098,7 +1253,11 @@ impl SessionLink {
                     + record.key.instance.len()
                     + 256
                     + record.content.as_ref().map_or(0, |c| {
-                        c.app_name.len() + c.title.len() + c.body.len() + c.icon.len()
+                        c.app_name.len()
+                            + c.title.len()
+                            + c.body.len()
+                            + c.icon.len()
+                            + c.icon_png.as_ref().map_or(0, Vec::len)
                     });
                 snapshot.budget.reserve(bytes)?;
                 snapshot.records.push(record);
@@ -1199,6 +1358,57 @@ pub async fn receive(link: &mut Option<SessionLink>, event: NotificationSync) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn snapshot_staging_budget_includes_phone_icons() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = edge_crypto::fingerprint(&[1; 32]);
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: a.clone(),
+                peers: vec![a.clone()],
+            },
+            &b,
+            "Lua",
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut session = SessionLink::spawn(service.hub.link(&a, true).unwrap());
+        session
+            .enqueue(NotificationSync::SnapshotStart {
+                epoch: "1".repeat(32),
+            })
+            .unwrap();
+        let budget = session.buffered_bytes.clone();
+        let mut icon = content();
+        icon.icon_png = Some(vec![0; edge_protocol::PhoneNotification::MAX_ICON_BYTES]);
+        for i in 0..MAX_RECORDS {
+            let record = NotificationRecord {
+                key: NotificationKey {
+                    origin: a.clone(),
+                    instance: format!("icon/{i}"),
+                },
+                source_sequence: i as u64 + 1,
+                content: Some(icon.clone()),
+            };
+            if session.enqueue(NotificationSync::Record(record)).is_err() {
+                break;
+            }
+        }
+        let staged = session.staged.as_ref().unwrap();
+        assert!(staged.records.len() < MAX_RECORDS);
+        assert!(
+            staged.records.len() * edge_protocol::PhoneNotification::MAX_ICON_BYTES
+                <= MAX_STORE_BYTES
+        );
+        assert!(budget.load(Ordering::Relaxed) <= MAX_STORE_BYTES);
+        drop(session);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn snapshots_larger_than_the_worker_queue_survive_a_burst_while_storage_is_busy() {
         let dir = tempfile::tempdir().unwrap();
@@ -2333,6 +2543,313 @@ mod tests {
                 .any(|r| r.key == phone_key && r.content.is_none())
         );
         assert_eq!(entries(root, &environment).await.unwrap().len(), 1);
+        // A fresh phone post remains visible without a bridge. Snapshot replay
+        // and a backend/cache reload reuse its ID and do not replay a popup.
+        let installed = tokio::fs::read_to_string(root.join("shell.qml"))
+            .await
+            .unwrap();
+        let socket_binding = format!(
+            "socketPath: {}",
+            serde_json::to_string(&root.join("state/bridge.sock").display().to_string()).unwrap()
+        );
+        assert!(installed.contains(&socket_binding));
+        tokio::fs::write(
+            root.join("shell.qml"),
+            installed.replace(&socket_binding, "socketPath: \"\""),
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if !service.hub.bridge_connected() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!service.hub.bridge_connected());
+        let fresh_phone = edge_protocol::PhoneNotification {
+            id: 81,
+            app_name: "Chat".into(),
+            title: "Fresh without bridge".into(),
+            body: "hello".into(),
+            icon_png: None,
+            posted_ms: 81,
+        };
+        source
+            .apply_and_deliver(
+                edge_protocol::NotificationEvent::Posted(fresh_phone.clone()),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        let list = entries(root, &environment).await.unwrap();
+        let fresh_copy = list
+            .iter()
+            .find(|e| e["title"] == fresh_phone.title)
+            .unwrap()
+            .clone();
+        assert_eq!(fresh_copy["replay"], false);
+        // Restoring the ID cache (as on a backend restart) cannot duplicate it.
+        *service.hub.0.phone_projections.lock().await = Default::default();
+        source
+            .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotStart, &desktop)
+            .await
+            .unwrap();
+        source
+            .apply_and_deliver(
+                edge_protocol::NotificationEvent::Posted(fresh_phone.clone()),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        source
+            .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotEnd, &desktop)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries(root, &environment)
+                .await
+                .unwrap()
+                .iter()
+                .find(|e| e["title"] == fresh_phone.title)
+                .unwrap()["id"],
+            fresh_copy["id"]
+        );
+        tokio::fs::write(root.join("shell.qml"), &installed)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if service.hub.bridge_connected() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(service.hub.bridge_connected());
+        assert_eq!(
+            entries(root, &environment)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e["title"] == fresh_phone.title)
+                .count(),
+            1
+        );
+
+        async fn test_ipc(root: &Path, env: &BTreeMap<String, String>, method: &str) -> String {
+            let output = tokio::process::Command::new("quickshell")
+                .arg("-p")
+                .arg(root)
+                .args(["ipc", "--any-display", "call", "test", method])
+                .envs(env)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().into()
+        }
+        test_ipc(root, &environment, "quiet").await;
+        let count = test_ipc(root, &environment, "popups").await;
+        let quiet_phone = edge_protocol::PhoneNotification {
+            id: 83,
+            title: "DND phone".into(),
+            ..fresh_phone.clone()
+        };
+        source
+            .apply_and_deliver(
+                edge_protocol::NotificationEvent::Posted(quiet_phone.clone()),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entries(root, &environment)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e["title"] == quiet_phone.title)
+        );
+        assert_eq!(test_ipc(root, &environment, "popups").await, count);
+        test_ipc(root, &environment, "loud").await;
+        let replay_phone = edge_protocol::PhoneNotification {
+            id: 84,
+            title: "Snapshot phone".into(),
+            ..fresh_phone.clone()
+        };
+        source
+            .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotStart, &desktop)
+            .await
+            .unwrap();
+        source
+            .apply_and_deliver(
+                edge_protocol::NotificationEvent::Posted(replay_phone.clone()),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        source
+            .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotEnd, &desktop)
+            .await
+            .unwrap();
+        assert_eq!(test_ipc(root, &environment, "popups").await, count);
+        assert_eq!(
+            entries(root, &environment)
+                .await
+                .unwrap()
+                .iter()
+                .find(|e| e["title"] == replay_phone.title)
+                .unwrap()["replay"],
+            true
+        );
+
+        // At the lifetime history limit, native delivery/bridge and phone
+        // delivery still work. Errors must not retire a partial phone import.
+        {
+            let mut state = service.hub.0.state.lock().await;
+            while state.records.len() < MAX_RECORDS {
+                let i = state.records.len();
+                state.records.push(NotificationRecord {
+                    key: NotificationKey {
+                        origin: a.clone(),
+                        instance: format!("retired/{i}"),
+                    },
+                    source_sequence: i as u64 + 1,
+                    content: None,
+                });
+            }
+        }
+        notify(&connection, 0, "Native at capacity").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            service.hub.bridge_connected(),
+            "capacity disconnected bridge"
+        );
+        assert!(service.hub.status().await.contains("full"));
+        let overflow = edge_protocol::PhoneNotification {
+            id: 82,
+            title: "Phone at capacity".into(),
+            ..fresh_phone.clone()
+        };
+        assert!(
+            source
+                .apply_and_deliver(
+                    edge_protocol::NotificationEvent::Posted(overflow.clone()),
+                    &desktop
+                )
+                .await
+                .is_err()
+        );
+        let list = entries(root, &environment).await.unwrap();
+        let overflow_copy = list
+            .iter()
+            .find(|e| e["title"] == overflow.title)
+            .unwrap()
+            .clone();
+        assert_eq!(overflow_copy["replay"], false);
+        source
+            .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotStart, &desktop)
+            .await
+            .unwrap();
+        assert!(
+            source
+                .apply_and_deliver(
+                    edge_protocol::NotificationEvent::Posted(overflow.clone()),
+                    &desktop
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            source
+                .apply_and_deliver(edge_protocol::NotificationEvent::SnapshotEnd, &desktop)
+                .await
+                .is_err()
+        );
+        let list = entries(root, &environment).await.unwrap();
+        assert_eq!(
+            list.iter().filter(|e| e["title"] == overflow.title).count(),
+            1
+        );
+        assert_eq!(
+            list.iter().find(|e| e["title"] == overflow.title).unwrap()["id"],
+            overflow_copy["id"]
+        );
+        assert!(service.hub.bridge_connected());
+        let overflow_key: NotificationKey =
+            serde_json::from_str(overflow_copy["key"].as_str().unwrap()).unwrap();
+        let output = tokio::process::Command::new("quickshell")
+            .arg("-p")
+            .arg(root)
+            .args([
+                "ipc",
+                "--any-display",
+                "call",
+                "test",
+                "dismiss",
+                &overflow_copy["id"].to_string(),
+            ])
+            .envs(&environment)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        for _ in 0..100 {
+            if service
+                .hub
+                .0
+                .phone_projections
+                .lock()
+                .await
+                .dismissed(&overflow_key.instance)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            service
+                .hub
+                .0
+                .phone_projections
+                .lock()
+                .await
+                .dismissed(&overflow_key.instance)
+        );
+        crate::phone::assert_history_failure_keeps_phone_connected(
+            service.hub.clone(),
+            Arc::new(
+                FreedesktopNotifications::connect(root.join("session-icons"))
+                    .await
+                    .unwrap(),
+            ),
+            root.join("session-state"),
+        )
+        .await;
+        // Admission later succeeds, but a dismissal made during overflow remains terminal.
+        service
+            .hub
+            .0
+            .state
+            .lock()
+            .await
+            .records
+            .retain(|r| !r.key.instance.starts_with("retired/"));
+        source
+            .apply_and_deliver(
+                edge_protocol::NotificationEvent::Posted(overflow.clone()),
+                &desktop,
+            )
+            .await
+            .unwrap();
+        assert!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .records
+                .iter()
+                .any(|r| r.key == overflow_key && r.content.is_none())
+        );
         child.kill().await.unwrap();
     }
 }
