@@ -91,12 +91,12 @@ impl PhoneProjections {
     ) -> Result<()> {
         self.load(desktop, path).await?;
         let Some(content) = content else {
-            if let Some(entry) = self.entries.get_mut(&key.instance) {
-                if !entry.dismissed {
-                    desktop.close(entry.id, &self.owner).await?;
-                    entry.dismissed = true;
-                    self.save(path).await?;
-                }
+            if let Some(entry) = self.entries.get_mut(&key.instance)
+                && !entry.dismissed
+            {
+                desktop.close(entry.id, &self.owner).await?;
+                entry.dismissed = true;
+                self.save(path).await?;
             }
             return Ok(());
         };
