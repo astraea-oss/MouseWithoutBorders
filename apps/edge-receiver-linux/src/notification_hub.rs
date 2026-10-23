@@ -849,10 +849,11 @@ impl NotificationHub {
                             // Only a known committed entry can be registered as a copy.
                             let record = self.0.state.lock().await.record(&key);
                             if let Some(record) = record {
-                                if let Some(canonical) = &record.content {
-                                    // Phone delivery and bridge reconciliation share one ID.
+                                if record.content.is_some() {
+                                    // Adopt the actual displayed content on first inventory;
+                                    // reconciliation replaces it once if canonical data differs.
                                     if self.local_phone(&key) {
-                                        self.0.phone_projections.lock().await.adopt(&desktop, &self.phone_projection_path(), &key, id, canonical).await?;
+                                        self.0.phone_projections.lock().await.adopt(&desktop, &self.phone_projection_path(), &key, id, &content).await?;
                                     }
                                     // QML cannot echo icon bytes or untruncated text.
                                     projections.entry(key).or_insert((id, content));
@@ -2629,6 +2630,17 @@ mod tests {
                 .unwrap()["id"],
             fresh_copy["id"]
         );
+        // Upgrade/recovery may have a stale retained copy but no ID-cache file.
+        let mut corrected = fresh_phone.clone();
+        corrected.title = "Canonical correction during bridge outage".into();
+        source
+            .apply(edge_protocol::NotificationEvent::Posted(corrected.clone()))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(service.hub.phone_projection_path())
+            .await
+            .unwrap();
+        *service.hub.0.phone_projections.lock().await = Default::default();
         tokio::fs::write(root.join("shell.qml"), &installed)
             .await
             .unwrap();
@@ -2639,15 +2651,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(service.hub.bridge_connected());
-        assert_eq!(
-            entries(root, &environment)
+        for _ in 0..100 {
+            if entries(root, &environment)
                 .await
                 .unwrap()
                 .iter()
-                .filter(|e| e["title"] == fresh_phone.title)
-                .count(),
-            1
-        );
+                .any(|e| e["title"] == corrected.title)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let list = entries(root, &environment).await.unwrap();
+        let restored: Vec<_> = list
+            .iter()
+            .filter(|e| e["key"] == fresh_copy["key"])
+            .collect();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0]["title"], corrected.title);
+        assert_eq!(restored[0]["id"], fresh_copy["id"]);
 
         async fn test_ipc(root: &Path, env: &BTreeMap<String, String>, method: &str) -> String {
             let output = tokio::process::Command::new("quickshell")
