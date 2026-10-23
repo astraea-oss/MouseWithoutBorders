@@ -1516,8 +1516,10 @@ async fn run_linux_controller_session(
                         || session_paused
                         || !input_epoch.accepts_input()
                     {
+                        return_watcher.retry_release();
                         continue;
                     }
+                    return_watcher.disarm();
                     tracing::info!(?control, "real cursor reached return edge");
                     input_epoch.suspend();
                     injector.all_keys_up().await.ok();
@@ -4313,8 +4315,10 @@ async fn handle_controller(
                     || session_paused
                     || !input_epoch.accepts_input()
                 {
+                    return_watcher.retry_release();
                     continue;
                 }
+                return_watcher.disarm();
                 stats.return_releases = stats.return_releases.saturating_add(1);
                 tracing::info!(?control, "real cursor reached return edge");
                 append_portable_log(
@@ -5693,6 +5697,14 @@ impl RemoteReturnWatcher {
         }
     }
 
+    fn retry_release(&mut self) {
+        if let Some(edge) = self.edge {
+            // A gated session must get a fresh confirmation after it resumes,
+            // rather than applying a cached cursor position or losing the arm.
+            self.arm(edge);
+        }
+    }
+
     /// Resolves with the release control once the poller confirms the edge.
     /// Receiving from the channel is cancellation-safe inside `select!`.
     async fn next_release(&mut self) -> ControlEvent {
@@ -5701,7 +5713,6 @@ impl RemoteReturnWatcher {
                 return future::pending().await;
             };
             if generation == self.generation && self.edge.is_some() {
-                self.disarm();
                 return control;
             }
         }
@@ -6022,6 +6033,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn gated_return_release_is_rearmed_and_requires_a_fresh_confirmation() {
+        let mut watcher = RemoteReturnWatcher::new(None);
+        watcher.arm(Edge::Left);
+        let old_generation = watcher.generation;
+        let control = ControlEvent::LeaveRemote {
+            edge: Edge::Left,
+            normalized_position: 0.5,
+        };
+        watcher
+            .release_tx
+            .send((old_generation, control.clone()))
+            .unwrap();
+        assert_eq!(watcher.next_release().await, control);
+        // Both session loops retry when paused, suspended, or no longer receivers.
+        watcher.retry_release();
+        assert_eq!(watcher.edge, Some(Edge::Left));
+        assert_ne!(watcher.generation, old_generation);
+        watcher
+            .release_tx
+            .send((old_generation, control.clone()))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), watcher.next_release())
+                .await
+                .is_err()
+        );
+        watcher
+            .release_tx
+            .send((watcher.generation, control.clone()))
+            .unwrap();
+        assert_eq!(watcher.next_release().await, control);
+        watcher.disarm();
+        assert!(watcher.edge.is_none());
+    }
+
+    #[tokio::test]
     async fn return_watcher_ignores_results_from_an_earlier_arming() {
         let mut watcher = RemoteReturnWatcher::new(None);
         watcher.record_control(&ControlEvent::EnterRemote {
@@ -6052,6 +6099,8 @@ mod tests {
                 normalized_position: 0.9,
             }
         );
+        assert_eq!(watcher.edge, Some(Edge::Left));
+        watcher.disarm();
         assert!(watcher.edge.is_none());
 
         watcher
