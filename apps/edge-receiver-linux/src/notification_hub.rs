@@ -852,8 +852,9 @@ impl NotificationHub {
                                 if record.content.is_some() {
                                     // Adopt the actual displayed content on first inventory;
                                     // reconciliation replaces it once if canonical data differs.
-                                    if self.local_phone(&key) {
-                                        self.0.phone_projections.lock().await.adopt(&desktop, &self.phone_projection_path(), &key, id, &content).await?;
+                                    if self.local_phone(&key)
+                                        && let Err(error) = self.0.phone_projections.lock().await.adopt(&desktop, &self.phone_projection_path(), &key, id, &content).await {
+                                        self.record_error(&format!("Phone notification cache: {error}; bridge remains connected"));
                                     }
                                     // QML cannot echo icon bytes or untruncated text.
                                     projections.entry(key).or_insert((id, content));
@@ -863,8 +864,9 @@ impl NotificationHub {
                             }
                         }
                         BridgeMessage::Closed { id, reason, instance, key } => {
-                            if let Some(key) = &key && self.local_phone(key) {
-                                self.0.phone_projections.lock().await.closed(&self.phone_projection_path(), &key.instance, id, reason).await?;
+                            if let Some(key) = &key && self.local_phone(key)
+                                && let Err(error) = self.0.phone_projections.lock().await.closed(&self.phone_projection_path(), &key.instance, id, reason).await {
+                                self.record_error(&format!("Phone notification cache: {error}; bridge remains connected"));
                             }
                             if let Some(key) = native.iter().find(|(_, value)| **value == id).map(|(k, _)| k.clone()) {
                                 native.remove(&key);
@@ -901,8 +903,9 @@ impl NotificationHub {
                     // lock; a stale bridge iteration cannot overwrite a fresh post.
                     let state = self.0.state.lock().await;
                     let current = state.record(&record.key);
-                    if let Some(current) = current {
-                        self.0
+                    if let Some(current) = current
+                        && let Err(error) = self
+                            .0
                             .phone_projections
                             .lock()
                             .await
@@ -913,7 +916,11 @@ impl NotificationHub {
                                 current.content.as_ref(),
                                 false,
                             )
-                            .await?;
+                            .await
+                    {
+                        self.record_error(&format!(
+                            "Phone notification cache: {error}; bridge remains connected"
+                        ));
                     }
                     continue;
                 }
@@ -2641,6 +2648,13 @@ mod tests {
             .await
             .unwrap();
         *service.hub.0.phone_projections.lock().await = Default::default();
+        // A blocked cache write must not disconnect during adoption, content
+        // reconciliation, or dismissal. The store itself remains writable.
+        let blocked_cache = service
+            .hub
+            .phone_projection_path()
+            .with_extension("pending");
+        tokio::fs::create_dir(&blocked_cache).await.unwrap();
         tokio::fs::write(root.join("shell.qml"), &installed)
             .await
             .unwrap();
@@ -2670,6 +2684,61 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0]["title"], corrected.title);
         assert_eq!(restored[0]["id"], fresh_copy["id"]);
+        assert!(
+            service
+                .hub
+                .status()
+                .await
+                .contains("Phone notification cache:")
+        );
+        assert!(service.hub.0.bridge_error.lock().unwrap().is_none());
+        let corrected_key: NotificationKey =
+            serde_json::from_str(fresh_copy["key"].as_str().unwrap()).unwrap();
+        let output = tokio::process::Command::new("quickshell")
+            .arg("-p")
+            .arg(root)
+            .args([
+                "ipc",
+                "--any-display",
+                "call",
+                "test",
+                "dismiss",
+                &fresh_copy["id"].to_string(),
+            ])
+            .envs(&environment)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        for _ in 0..100 {
+            if service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .record(&corrected_key)
+                .is_some_and(|r| r.content.is_none())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            service
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .record(&corrected_key)
+                .is_some_and(|r| r.content.is_none()),
+            "cache write failure lost dismissal"
+        );
+        assert!(service.hub.bridge_connected());
+        assert!(service.hub.0.bridge_error.lock().unwrap().is_none());
+        tokio::fs::remove_dir(blocked_cache).await.unwrap();
+        service.hub.clear_error();
 
         async fn test_ipc(root: &Path, env: &BTreeMap<String, String>, method: &str) -> String {
             let output = tokio::process::Command::new("quickshell")
