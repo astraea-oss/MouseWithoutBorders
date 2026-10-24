@@ -12,5 +12,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-cpal.workspace = true
+edge-audio-output = { path = "../edge-audio-output" }
 wasapi.workspace = true

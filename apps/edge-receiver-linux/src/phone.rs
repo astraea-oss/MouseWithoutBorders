@@ -25,6 +25,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use edge_clipboard::ClipboardPeerFeatures;
 use edge_common::{AppConfig, Role};
 use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
@@ -297,7 +298,12 @@ struct PhoneClipboard {
 
 impl PhoneClipboard {
     async fn start(source: ClipboardSource, images: bool) -> Result<Self> {
-        let state = ReceiverClipboardState::new(&source.config, images)
+        // Phones don't take chunked text, and their hello doesn't offer it.
+        let peer = ClipboardPeerFeatures {
+            images,
+            text_chunks: false,
+        };
+        let state = ReceiverClipboardState::new(&source.config, peer)
             .await?
             .for_phone(source.changes.phone_origin());
         Ok(Self {
