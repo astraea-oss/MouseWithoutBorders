@@ -45,6 +45,13 @@ pub struct SettingsUiInput {
 /// over its control socket. Calls block briefly, so implementations should
 /// time out quickly.
 pub trait NodeLink: Send + Sync {
+    /// Linux desktop sharing capabilities and current health. Older nodes return None.
+    fn notifications(&self) -> Option<NotificationSetup> {
+        None
+    }
+    fn install_notification_bridge(&self, _shell: &std::path::Path) -> Result<String> {
+        anyhow::bail!("Quickshell integration is unavailable on this platform")
+    }
     /// Live status, or `None` if the node can't be reached.
     fn status(&self) -> Option<NodeStatus>;
     /// Paired phones, or `None` where phones aren't supported.
@@ -58,6 +65,27 @@ pub trait NodeLink: Send + Sync {
     fn autostart(&self) -> Option<bool>;
     fn set_autostart(&self, enabled: bool) -> Result<()>;
     fn open_log(&self) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NotificationSetup {
+    pub identity: String,
+    pub computers: Vec<NotificationComputer>,
+    pub status: String,
+    pub active: bool,
+    pub has_store: bool,
+    pub coordinator: String,
+    pub shell_path: Option<PathBuf>,
+    pub socket_path: PathBuf,
+    pub bridge_installed: bool,
+    #[serde(default)]
+    pub bridge_connected: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NotificationComputer {
+    pub name: String,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

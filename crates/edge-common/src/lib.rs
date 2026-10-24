@@ -83,6 +83,23 @@ pub struct AppConfig {
     /// Omitted from saved files while it's all defaults.
     #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
     pub phone: PhoneConfig,
+    #[serde(default, skip_serializing_if = "NotificationConfig::is_default")]
+    pub notifications: NotificationConfig,
+}
+
+/// Explicit membership in a single-coordinator notification set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub coordinator_fingerprint: String,
+    pub peers: Vec<String>,
+}
+
+impl NotificationConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// HyprMobile phones paired with this receiver.
@@ -313,6 +330,8 @@ struct ConfigFile {
     audio: Option<AudioConfig>,
     #[serde(default)]
     phone: PhoneConfig,
+    #[serde(default)]
+    notifications: NotificationConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -452,6 +471,7 @@ impl ConfigFile {
             clipboard: self.clipboard,
             audio,
             phone: self.phone,
+            notifications: self.notifications,
         }
     }
 }
@@ -488,6 +508,7 @@ impl AppConfig {
                 ..AudioConfig::default()
             },
             phone: PhoneConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 
@@ -510,6 +531,7 @@ impl AppConfig {
             clipboard: ClipboardConfig::default(),
             audio: AudioConfig::default(),
             phone: PhoneConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 
@@ -946,5 +968,18 @@ backend = "auto"
         text.push_str("\n[phone]\nforward_clipboard_to_pcs = false\n");
         let loaded: AppConfig = toml::from_str(&text).unwrap();
         assert!(!loaded.phone.forward_clipboard_to_pcs);
+    }
+    #[test]
+    fn explicit_notification_membership_survives_config_roundtrip() {
+        let mut config = AppConfig::receiver_default();
+        config.notifications = NotificationConfig {
+            enabled: true,
+            coordinator_fingerprint: "main-fingerprint".into(),
+            peers: vec!["laptop-fingerprint".into()],
+        };
+        let text = toml::to_string(&config).unwrap();
+        let restored: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored.notifications, config.notifications);
+        assert!(!AppConfig::receiver_default().notifications.enabled);
     }
 }

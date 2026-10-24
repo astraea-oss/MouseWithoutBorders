@@ -61,6 +61,7 @@ pub(crate) async fn spawn_server(
     requests: mpsc::UnboundedSender<PhoneRequest>,
     tray: Option<ReceiverTrayHandle>,
     log_path: &Path,
+    notifications: crate::notification_setup::NotificationControl,
 ) -> Option<AbortOnDropTask> {
     let Some(path) = socket_path() else {
         append_portable_log(
@@ -73,7 +74,11 @@ pub(crate) async fn spawn_server(
         Ok(listener) => {
             let log_path = log_path.to_path_buf();
             Some(AbortOnDropTask(tokio::spawn(serve(
-                listener, requests, tray, log_path,
+                listener,
+                requests,
+                tray,
+                log_path,
+                notifications,
             ))))
         }
         Err(error) => {
@@ -106,6 +111,7 @@ async fn serve(
     requests: mpsc::UnboundedSender<PhoneRequest>,
     tray: Option<ReceiverTrayHandle>,
     log_path: PathBuf,
+    notifications: crate::notification_setup::NotificationControl,
 ) {
     loop {
         let stream = match listener.accept().await {
@@ -121,8 +127,9 @@ async fn serve(
         };
         let requests = requests.clone();
         let tray = tray.clone();
+        let notifications = notifications.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, requests, tray).await {
+            if let Err(error) = handle_client(stream, requests, tray, Some(notifications)).await {
                 tracing::debug!(%error, "control client ended");
             }
         });
@@ -133,6 +140,7 @@ async fn handle_client(
     stream: UnixStream,
     requests: mpsc::UnboundedSender<PhoneRequest>,
     tray: Option<ReceiverTrayHandle>,
+    notifications: Option<crate::notification_setup::NotificationControl>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut line = String::new();
@@ -182,6 +190,13 @@ async fn handle_client(
             }
             response + "end\n"
         }
+        (Some("notification-setup"), _) => match &notifications {
+            Some(notifications) => match notifications.setup().await {
+                Ok(setup) => format!("notifications {}\n", serde_json::to_string(&setup)?),
+                Err(error) => format!("error {error:#}\n"),
+            },
+            None => "error notification settings unavailable\n".into(),
+        },
         (Some("status"), _) => match &tray {
             Some(tray) => status_reply(&tray.status().borrow()),
             None => "summary Running\nend\n".to_string(),
@@ -292,7 +307,7 @@ mod tests {
     async fn pair_phone_reports_the_link_and_the_paired_phone() {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx, None));
+        tokio::spawn(handle_client(server, requests_tx, None, None));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"pair-phone\n").await.unwrap();
 
@@ -335,7 +350,7 @@ mod tests {
     async fn unknown_commands_are_refused() {
         let (requests_tx, _requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx, None));
+        tokio::spawn(handle_client(server, requests_tx, None, None));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"format-disk\n").await.unwrap();
         let mut lines = BufReader::new(reader).lines();

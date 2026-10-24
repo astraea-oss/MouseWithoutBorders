@@ -16,6 +16,8 @@ pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
 /// A phone that mirrors its notifications; the receiver echoes it back when it
 /// shows them.
 pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
+/// Shared desktop notification state; independent of KVM input roles.
+pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
 /// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
 /// it to start a stream.
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
@@ -50,6 +52,53 @@ pub enum Frame {
     Phone(PhoneEvent),
     /// Phone → receiver, only with `notifications-v1`.
     Notification(NotificationEvent),
+    /// Only exchanged by explicitly enrolled PCs advertising notification-sync-v2.
+    NotificationSync(NotificationSync),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NotificationKey {
+    pub origin: String,
+    pub instance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedNotification {
+    pub app_name: String,
+    pub title: String,
+    pub body: String,
+    /// Theme icon name only, never a remote filesystem path.
+    pub icon: String,
+    /// Bounded phone icon bytes; receivers create their own local cache path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_png: Option<Vec<u8>>,
+    pub posted_ms: u64,
+    pub urgency: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationOperation {
+    pub sequence: u64,
+    pub key: NotificationKey,
+    /// None is a terminal removal. A removed instance cannot be posted again.
+    pub content: Option<SharedNotification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRecord {
+    pub key: NotificationKey,
+    pub source_sequence: u64,
+    pub content: Option<SharedNotification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationSync {
+    Submit(NotificationOperation),
+    Ack { sequence: u64 },
+    SnapshotStart { epoch: String },
+    Record(NotificationRecord),
+    SnapshotEnd,
+    Settings { coordinator: String },
 }
 
 impl Frame {
@@ -1005,6 +1054,38 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.len() + 16 <= 65_535, "{} bytes", encoded.len());
         assert_eq!(decode_frame(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn shared_notification_snapshots_fit_secure_frames_with_unicode() {
+        let key = NotificationKey {
+            origin: "01234567:89abcdef:01234567:89abcdef".into(),
+            instance: "epoch/42".into(),
+        };
+        for event in [
+            NotificationSync::SnapshotStart {
+                epoch: "0".repeat(32),
+            },
+            NotificationSync::Record(NotificationRecord {
+                key,
+                source_sequence: u64::MAX,
+                content: Some(SharedNotification {
+                    app_name: "😀".repeat(64),
+                    title: "😀".repeat(256),
+                    body: "a".repeat(4096),
+                    icon: "mail-unread".into(),
+                    icon_png: Some(vec![0xff; PhoneNotification::MAX_ICON_BYTES]),
+                    posted_ms: u64::MAX,
+                    urgency: 2,
+                }),
+            }),
+            NotificationSync::SnapshotEnd,
+        ] {
+            let frame = Frame::NotificationSync(event);
+            let encoded = encode_frame(&frame).unwrap();
+            assert!(encoded.len() + 16 <= 65_535);
+            assert_eq!(decode_frame(&encoded).unwrap(), frame);
+        }
     }
 
     #[test]

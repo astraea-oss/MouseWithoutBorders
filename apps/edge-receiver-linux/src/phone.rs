@@ -143,6 +143,7 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Error(_) => PhoneFrame::Error,
         Frame::Clipboard(_) => PhoneFrame::Clipboard,
         Frame::Notification(_) => PhoneFrame::Notification,
+        Frame::NotificationSync(_) => PhoneFrame::NotAllowed("NotificationSync"),
         Frame::Phone(PhoneEvent::PairRequest { token }) => PhoneFrame::PairRequest(token.clone()),
         Frame::Phone(PhoneEvent::Unpair) => PhoneFrame::Unpair,
         Frame::Phone(PhoneEvent::PairAccepted) => PhoneFrame::NotAllowed("PairAccepted"),
@@ -199,6 +200,7 @@ impl LocalHello {
 struct SessionNotifications {
     desktop: Arc<FreedesktopNotifications>,
     mirror: Arc<tokio::sync::Mutex<NotificationMirror>>,
+    hub: Option<crate::notification_hub::NotificationHub>,
 }
 
 /// Work for the receiver loop, which owns the pin store, so pin changes
@@ -327,6 +329,7 @@ pub(crate) struct PhoneSessions {
     log_path: PathBuf,
     clipboard: Option<ClipboardSource>,
     desktop: Option<Arc<FreedesktopNotifications>>,
+    notification_hub: Option<crate::notification_hub::NotificationHub>,
     /// Per phone key, kept across reconnects.
     mirrors: HashMap<String, Arc<tokio::sync::Mutex<NotificationMirror>>>,
     timings: PhoneTimings,
@@ -352,6 +355,7 @@ impl PhoneSessions {
             log_path,
             clipboard,
             desktop: None,
+            notification_hub: None,
             mirrors: HashMap::new(),
             timings: PhoneTimings::DEFAULT,
             sessions: HashMap::new(),
@@ -372,6 +376,10 @@ impl PhoneSessions {
     /// Enables showing phone notifications on the desktop.
     pub fn set_desktop_notifications(&mut self, desktop: FreedesktopNotifications) {
         self.desktop = Some(Arc::new(desktop));
+    }
+
+    pub fn set_notification_hub(&mut self, hub: Option<crate::notification_hub::NotificationHub>) {
+        self.notification_hub = hub;
     }
 
     /// For the control socket, which sends requests from its own tasks.
@@ -459,6 +467,7 @@ impl PhoneSessions {
         let notifications = self.desktop.clone().map(|desktop| SessionNotifications {
             desktop,
             mirror: Arc::clone(self.mirrors.entry(fingerprint.clone()).or_default()),
+            hub: self.notification_hub.clone(),
         });
         let log_path = self.log_path.clone();
         let timings = self.timings;
@@ -659,14 +668,35 @@ impl PhoneSessions {
         }
         // Dropping the session aborts it and closes its socket.
         self.sessions.remove(&removed.fingerprint);
+        let shared_removal = match &self.notification_hub {
+            Some(hub) => hub.remove_phone(&removed.fingerprint).await,
+            None => Ok(()),
+        };
         if let Some(tray) = &self.tray {
             tray.phone_disconnected(removed.fingerprint.clone()).await;
         }
-        if let (Some(desktop), Some(mirror)) =
-            (&self.desktop, self.mirrors.remove(&removed.fingerprint))
-        {
-            mirror.lock().await.close_all(desktop.as_ref()).await;
+        let cache = edge_common::default_state_dir()
+            .join("phone-notifications")
+            .join(format!("{}.json", removed.fingerprint.replace(':', "")));
+        if let Some(desktop) = &self.desktop {
+            let mirror = self
+                .mirrors
+                .remove(&removed.fingerprint)
+                .unwrap_or_default();
+            let mut mirror = mirror.lock().await;
+            if let Err(error) = mirror.restore(desktop.as_ref(), &cache).await {
+                tracing::warn!(%error, "couldn't restore phone notification identities for removal");
+            }
+            mirror.close_all(desktop.as_ref()).await;
         }
+        match tokio::fs::remove_file(cache).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "couldn't remove unpaired phone notification cache")
+            }
+        }
+        shared_removal.context("phone unpaired, but shared notification removal failed")?;
         Ok(true)
     }
 
@@ -789,6 +819,25 @@ async fn run_phone_session(
             .allowed_features
             .contains(&PhoneFeature::Notifications)
     });
+    if let Some(notifications) = &notifications {
+        let path = context
+            .state_dir
+            .join("phone-notifications")
+            .join(format!("{}.json", context.fingerprint.replace(':', "")));
+        if let Err(error) = notifications
+            .mirror
+            .lock()
+            .await
+            .restore(notifications.desktop.as_ref(), &path)
+            .await
+        {
+            tracing::warn!(%error, phone = %context.name, "couldn't restore phone notification identities");
+        }
+    }
+    let mut shared_phone = notifications
+        .as_ref()
+        .and_then(|n| n.hub.as_ref())
+        .map(|hub| hub.phone_source(&context.fingerprint, &context.name));
     let mut clipboard = match context.clipboard {
         Some(source) if clipboard_allowed => {
             match PhoneClipboard::start(source, context.clipboard_images).await {
@@ -920,9 +969,25 @@ async fn run_phone_session(
                             tracing::debug!(phone = %context.name, "ignored notification from a phone without notification access");
                             continue;
                         };
-                        let mut mirror = notifications.mirror.lock().await;
-                        if let Err(error) = mirror.apply(event, notifications.desktop.as_ref(), &context.name).await {
-                            tracing::warn!(%error, phone = %context.name, "couldn't show phone notification");
+                        if let Some(source) = &mut shared_phone {
+                            let snapshot_end = matches!(event, edge_protocol::NotificationEvent::SnapshotEnd);
+                            // History failure must not tear down phone clipboard/audio.
+                            let imported = match source.apply_and_deliver(event, notifications.desktop.as_ref()).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(%error, phone = %context.name, "phone notification history needs attention");
+                                    false
+                                }
+                            };
+                            if snapshot_end && imported {
+                                // Retire legacy local copies only after successful import.
+                                notifications.mirror.lock().await.close_all(notifications.desktop.as_ref()).await;
+                            }
+                        } else {
+                            let mut mirror = notifications.mirror.lock().await;
+                            if let Err(error) = mirror.apply(event, notifications.desktop.as_ref(), &context.name).await {
+                                tracing::warn!(%error, phone = %context.name, "couldn't show phone notification");
+                            }
                         }
                     }
                     PhoneFrame::Clipboard => {
@@ -1016,6 +1081,106 @@ fn io_error<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<&'a std:
         | (_, _, _, Some(ProtocolError::Io(io))) => Some(io),
         _ => None,
     }
+}
+
+/// Exercises the actual encrypted phone loop on the private notification test bus.
+#[cfg(test)]
+pub(crate) async fn assert_history_failure_keeps_phone_connected(
+    hub: crate::notification_hub::NotificationHub,
+    desktop: Arc<FreedesktopNotifications>,
+    state_dir: PathBuf,
+) {
+    use edge_crypto::{IdentityKey, accept_noise_session, initiate_noise_session};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = IdentityKey::generate().unwrap();
+    let phone_identity = IdentityKey::generate().unwrap();
+    let (requests, _requests_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (session, _) = accept_noise_session(stream, &identity).await.unwrap();
+        let fingerprint = edge_crypto::fingerprint(&[8; 32]);
+        let hello = LocalHello {
+            device_name: "Test gateway".into(),
+            role: Role::Receiver,
+            fingerprint: identity.fingerprint(),
+        }
+        .frame(false, true);
+        let context = SessionContext {
+            name: "Overflow phone".into(),
+            fingerprint: fingerprint.clone(),
+            ip: "127.0.0.1".parse().unwrap(),
+            requests,
+            clipboard: None,
+            clipboard_images: false,
+            notifications: Some(SessionNotifications {
+                desktop,
+                mirror: Arc::default(),
+                hub: Some(hub),
+            }),
+            state_dir,
+            accepts_audio_invite: false,
+            tray: None,
+        };
+        let (_commands, commands) = mpsc::unbounded_channel();
+        let _ = run_phone_session(
+            session,
+            hello,
+            Entry::Pinned(PinnedPhone {
+                fingerprint,
+                allowed_features: PhoneFeature::all(),
+            }),
+            context,
+            PhoneTimings::DEFAULT,
+            commands,
+        )
+        .await;
+    });
+    let _task = AbortOnDropTask(task);
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut phone, _) = initiate_noise_session(stream, &phone_identity, None)
+        .await
+        .unwrap();
+    let _hello = phone.read_packet().await.unwrap();
+    phone
+        .write_packet(
+            &edge_protocol::encode_frame(&Frame::Notification(
+                edge_protocol::NotificationEvent::Posted(edge_protocol::PhoneNotification {
+                    id: 91,
+                    app_name: "Chat".into(),
+                    title: "Session survives full history".into(),
+                    body: "test".into(),
+                    icon_png: None,
+                    posted_ms: 91,
+                }),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    phone
+        .write_packet(
+            &edge_protocol::encode_frame(&Frame::Heartbeat(Heartbeat { sequence: 246 })).unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = edge_protocol::decode_frame(&phone.read_packet().await.unwrap()).unwrap();
+            if frame == Frame::Heartbeat(Heartbeat { sequence: 246 }) {
+                break;
+            }
+            if let Frame::Heartbeat(beat) = frame {
+                phone
+                    .write_packet(&edge_protocol::encode_frame(&Frame::Heartbeat(beat)).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("notification overflow must not disconnect the phone session");
 }
 
 #[cfg(test)]
