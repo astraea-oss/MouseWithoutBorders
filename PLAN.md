@@ -1,511 +1,179 @@
-# Windows-to-Hyprland LAN KVM Plan
-
-## Summary
-
-Build a focused personal software KVM from scratch in Rust:
-
-- **Controller:** Windows 11 PC with the physical keyboard/mouse.
-- **Target:** this CachyOS/Hyprland laptop on Wayland.
-- **Direction:** Windows controls the laptop; the laptop does not capture physical input.
-- **Input backend:** Linux uses `libei` first for Wayland input emulation.
-- **Clipboard:** bidirectional text and bounded static-image clipboard sync.
-- **Security:** pinned-key encrypted pairing.
-- **Safety:** global Windows release hotkey, timeout release, and stuck-key cleanup.
-
-This deliberately avoids a general cross-platform product. The first goal is "my Windows PC controls my Hyprland laptop reliably."
-
-## Confirmed Environment
-
-- Laptop OS: CachyOS, Arch-like.
-- Laptop session: Hyprland 0.55.4 on Wayland.
-- Laptop monitor: `eDP-1`, `1920x1080`, scale `1.0`, 144 Hz.
-- Rust installed: `rustc 1.96.0`, `cargo 1.96.0`.
-- Linux libraries available: `libei 1.6.0`, `libevdev`, `wayland-client`, `xkbcommon`, `gtk4`, `libadwaita`.
-- Clipboard tools available: `wl-copy`, `wl-paste`.
-- `/dev/uinput` is root-only, so it is not the first backend.
-
-## Project Layout
-
-Create a Rust workspace at:
-
-```text
-/home/lua/Desktop/edge-kvm
-```
-
-Workspace crates:
-
-```text
-edge-kvm/
-  Cargo.toml
-  crates/
-    edge-common/
-    edge-protocol/
-    edge-crypto/
-    edge-geometry/
-    edge-keymap/
-    edge-linux-input/
-    edge-windows-input/
-  apps/
-    edge-controller-win/
-    edge-receiver-linux/
-```
-
-Responsibilities:
-
-- `edge-common`: shared config structs, errors, logging setup.
-- `edge-protocol`: network frame types and serialization.
-- `edge-crypto`: pinned identity keys and encrypted session setup.
-- `edge-geometry`: screen layout, edge transition, coordinate mapping.
-- `edge-keymap`: Windows scancode to Linux evdev keycode mapping.
-- `edge-linux-input`: Linux `libei` input injection and clipboard integration.
-- `edge-windows-input`: Windows Raw Input, hooks, clipboard listener, tray helpers.
-- `edge-controller-win`: Windows tray app/controller.
-- `edge-receiver-linux`: Linux receiver daemon.
-
-## External APIs And Libraries
-
-Use Rust dependencies:
-
-```text
-tokio
-serde
-toml
-rmp-serde
-bytes
-thiserror
-tracing
-tracing-subscriber
-snow
-ed25519-dalek or x25519-dalek as needed by Noise setup
-windows
-tray-icon
-arboard, Windows clipboard APIs, or direct Win32 clipboard APIs
-bindgen
-pkg-config
-```
-
-Linux input:
-
-- First backend: `libei` through generated FFI bindings using `bindgen` and `pkg-config`.
-- Fallback 1 if `libei` fails on Hyprland: wlroots virtual pointer/keyboard protocols.
-- Fallback 2 if compositor protocols fail: `uinput` with a udev rule, not root runtime.
-
-References used for design constraints:
-
-- Microsoft `SetWindowsHookEx`: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowshookexa
-- Microsoft `SendInput`: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput
-- libei docs: https://libinput.pages.freedesktop.org/libei/
-
-## Runtime Model
-
-Windows has two control states:
-
-```text
-LocalActive
-RemoteActive(peer = laptop)
-```
-
-`LocalActive`:
-
-- Windows mouse and keyboard behave normally.
-- App watches cursor position.
-- If cursor exits the configured edge, switch to `RemoteActive`.
-
-`RemoteActive`:
-
-- Windows captures physical mouse deltas using Raw Input.
-- Windows suppresses local keyboard/mouse delivery using low-level hooks.
-- Windows sends input events to Linux over the encrypted LAN session.
-- Windows maintains a virtual laptop cursor position.
-- If virtual cursor exits the opposite edge, return to `LocalActive`.
-
-This avoids the Lan Mouse-style trap where the laptop also captures and has to return control. The laptop only receives and injects.
-
-Default layout:
-
-```text
-Laptop is left of Windows.
-Windows exits left edge -> laptop.
-Laptop exits right edge -> Windows.
-```
-
-## Network Protocol
-
-Use a single persistent TCP connection from Windows to Linux.
-
-Default port:
-
-```text
-42420/tcp
-```
-
-Serialization:
-
-- Length-prefixed MessagePack using `rmp-serde`.
-- Each frame: `u32_be length` + encoded payload.
-
-Transport security:
-
-- Use `snow` with a Noise XX-style handshake.
-- Each device has a persistent identity key.
-- First pairing pins the peer public key.
-- Later connections reject changed peer keys unless explicitly re-paired.
-
-Protocol frames:
-
-```rust
-enum Frame {
-    Hello(Hello),
-    ScreenInfo(ScreenInfo),
-    Input(InputEvent),
-    Clipboard(ClipboardEvent),
-    Control(ControlEvent),
-    Heartbeat(Heartbeat),
-    Error(RemoteError),
-}
-```
-
-Core types:
-
-```rust
-struct Hello {
-    protocol_version: u16,
-    device_name: String,
-    role: Role,
-    public_key_fingerprint: String,
-}
-
-struct ScreenInfo {
-    outputs: Vec<OutputInfo>,
-    primary_output: String,
-}
-
-struct OutputInfo {
-    name: String,
-    width: u32,
-    height: u32,
-    scale: f32,
-    x: i32,
-    y: i32,
-}
-
-enum InputEvent {
-    PointerMotion { dx: f64, dy: f64 },
-    PointerButton { button: MouseButton, down: bool },
-    PointerWheel { x: f64, y: f64 },
-    Key { evdev_code: u16, down: bool },
-    AllKeysUp,
-}
-
-enum ClipboardEvent {
-    TextOffer { sequence: u64, text: String },
-    TextRequest,
-}
-
-enum ControlEvent {
-    EnterRemote { edge: Edge, normalized_y: f32 },
-    LeaveRemote { edge: Edge, normalized_y: f32 },
-    ReleaseToLocal { reason: ReleaseReason },
-}
-```
-
-## Config Files
-
-Windows config:
-
-```toml
-device_name = "Main PC"
-role = "controller"
-release_hotkey = "Ctrl+Alt+Pause"
-
-[peer.laptop]
-host = "192.168.0.11"
-port = 42420
-position = "left"
-pinned_fingerprint = ""
-
-[clipboard]
-enabled = true
-images_enabled = true
-max_bytes = 1048576
-max_image_bytes = 4194304
-```
-
-Linux config:
-
-```toml
-device_name = "Lua"
-role = "receiver"
-listen = "0.0.0.0:42420"
-allow_pairing = false
-monitor = "eDP-1"
-
-[input]
-backend = "libei"
-
-[clipboard]
-enabled = true
-images_enabled = true
-max_bytes = 1048576
-max_image_bytes = 4194304
-```
-
-Pairing mode:
-
-```bash
-edge-receiver-linux --pair
-```
-
-This temporarily allows one untrusted Windows controller to pair, then stores its fingerprint and disables pairing again.
-
-## Windows Controller Details
-
-Input capture:
-
-- Use Raw Input for relative mouse movement.
-- Use `WH_KEYBOARD_LL` for keyboard capture/suppression.
-- Use `WH_MOUSE_LL` for button/wheel suppression and edge observation.
-- Keep a message loop alive permanently.
-
-Remote activation:
-
-- On edge crossing, switch to `RemoteActive`.
-- Store the local Windows cursor restore position.
-- Clip local cursor to a tiny safe area or suppress local motion.
-- Send `EnterRemote`.
-- Begin forwarding deltas/buttons/keys.
-
-Release behavior:
-
-- `Ctrl+Alt+Pause` always releases to `LocalActive`.
-- On release, send `AllKeysUp`.
-- Unclip cursor.
-- Restore Windows cursor to the appropriate edge.
-- Clear all tracked pressed keys/buttons.
-
-Windows tray app:
-
-- Tray icon states: disconnected, connected-local, remote-active, error.
-- Menu items:
-  - Connect/disconnect
-  - Release control
-  - Pair/re-pair laptop
-  - Open config
-  - Quit
-- Logs written to a file under `%LOCALAPPDATA%\edge-kvm\logs`.
-
-Clipboard:
-
-- Use Windows clipboard listener APIs.
-- Only sync Unicode text.
-- Debounce changes for 150 ms.
-- Ignore clipboard changes caused by remote sync using sequence IDs.
-
-## Linux Receiver Details
-
-Startup:
-
-- Load config.
-- Create/load persistent identity key.
-- Listen on `0.0.0.0:42420`.
-- Report Hyprland monitor geometry using `hyprctl monitors -j`.
-- Initialize `libei` input session.
-
-Input injection:
-
-- Pointer motion: inject relative movement through `libei`.
-- Buttons: map left/right/middle/back/forward to Linux button codes.
-- Wheel: inject vertical/horizontal scroll.
-- Keyboard: receive Linux evdev keycodes and inject key up/down.
-- On disconnect or release: inject `AllKeysUp`.
-
-Clipboard:
-
-- Read local text clipboard with `wl-paste`.
-- Write remote text clipboard with `wl-copy`.
-- Implement polling first at 500 ms interval.
-- Later improvement can use `wl-paste --watch`.
-
-## Edge Geometry
-
-For the default layout:
-
-```text
-Windows screen: controller local space.
-Laptop screen: virtual remote space 1920x1080.
-```
-
-Entry from Windows to laptop:
-
-- Cursor crosses Windows left edge.
-- Compute normalized Y:
-
-```text
-normalized_y = windows_cursor_y / windows_screen_height
-```
-
-- Laptop virtual cursor starts at:
-
-```text
-x = laptop_width - 2
-y = normalized_y * laptop_height
-```
-
-Return from laptop:
-
-- If laptop virtual cursor `x >= laptop_width - 1`, switch back to Windows local.
-- Restore Windows cursor to:
-
-```text
-x = 1
-y = normalized_y * windows_screen_height
-```
-
-Clamp all coordinates to screen bounds.
-
-## Keyboard Mapping
-
-Implement a fixed mapping table:
-
-```text
-Windows scan code + extended flag -> Linux evdev code
-```
-
-MVP coverage:
-
-- Letters A-Z
-- Numbers 0-9
-- Enter, Escape, Backspace, Tab, Space
-- Shift, Ctrl, Alt, Super
-- Arrow keys
-- Function keys F1-F12
-- Common punctuation keys
-- Delete, Home, End, PageUp, PageDown
-- Mouse buttons and wheel
-
-Out of scope for MVP:
-
-- Media keys
-- IME-specific behavior
-- Multiple keyboard layouts
-- UAC/admin desktop control
-- macOS
-- GNOME/KDE support
-
-## Failure Handling
-
-Hard requirements:
-
-- If TCP disconnects during `RemoteActive`, immediately release Windows back to `LocalActive`.
-- If heartbeat is missed for more than 750 ms, release locally.
-- Send `AllKeysUp` on release, disconnect, error, and process shutdown.
-- Never require killing the app to recover the mouse.
-- Release hotkey must work even when remote is active.
-- If Linux input backend fails, Windows must refuse remote activation and show an error.
-
-Heartbeat:
-
-```text
-Send every 250 ms.
-Timeout after 750 ms.
-```
-
-Latency target:
-
-```text
-Average input event delivery under 20 ms on LAN.
-No visible cursor stutter under normal Wi-Fi conditions.
-```
-
-## Implementation Phases
-
-1. Scaffold workspace and shared protocol/config crates.
-2. Build Linux `libei` proof-of-life:
-   - Start receiver.
-   - Inject test pointer movement.
-   - Inject test click.
-   - Inject test key.
-3. Build Windows Raw Input and hook prototype:
-   - Detect edge crossing.
-   - Capture mouse deltas.
-   - Capture/suppress keyboard while remote-active.
-   - Implement release hotkey.
-4. Add encrypted TCP session and pairing.
-5. Connect Windows input stream to Linux injection.
-6. Add geometry and deterministic enter/return behavior.
-7. Add text clipboard sync.
-8. Add Windows tray app state/menu.
-9. Add logging, config files, and useful error messages.
-10. Package/run scripts:
-    - Windows debug binary.
-    - Linux receiver binary.
-    - Optional user service later.
-
-## Test Cases
-
-Unit tests:
-
-- Config parse/defaults.
-- Protocol encode/decode round trip.
-- Noise pairing rejects unknown changed fingerprints.
-- Geometry entry/exit mapping.
-- Coordinate clamping.
-- Key mapping table correctness for MVP keys.
-- Clipboard sequence loop prevention.
-
-Linux local tests:
-
-- `edge-receiver-linux --test-input pointer`
-- `edge-receiver-linux --test-input click`
-- `edge-receiver-linux --test-input key`
-- `edge-receiver-linux --test-clipboard`
-
-Windows local tests:
-
-- Edge detection without network.
-- Release hotkey from remote-active state.
-- Hook suppression only while remote-active.
-- Clipboard listener receives text changes.
-- Tray menu release works.
-
-End-to-end tests:
-
-- Windows cursor exits left edge and appears on laptop.
-- Laptop virtual cursor exits right edge and returns to Windows.
-- Left/right/middle click works on laptop.
-- Typing normal text works on laptop.
-- Ctrl+C/Ctrl+V style shortcuts work on laptop.
-- Text copied on Windows appears on laptop.
-- Text copied on laptop appears on Windows.
-- Pull network cable/disable Wi-Fi while remote-active: Windows releases locally within 750 ms.
-- Kill Linux receiver while remote-active: Windows releases locally and no keys remain stuck.
-- Press/release hotkey repeatedly: never traps cursor.
-
-## Acceptance Criteria
-
-The first version is accepted when:
-
-- Windows controls the Hyprland laptop with mouse and keyboard.
-- Cursor can enter and leave using the configured screen edge.
-- The mouse cannot remain trapped after disconnect or backend failure.
-- `Ctrl+Alt+Pause` always returns control to Windows.
-- Text clipboard sync works both ways.
-- Pairing persists across restarts.
-- Changed peer key is rejected until re-paired.
-- Logs clearly explain connection, pairing, backend, and firewall errors.
-
-## Explicit Assumptions And Defaults
-
-- Build language: Rust.
-- Project path: `/home/lua/Desktop/edge-kvm`.
-- Windows version: Windows 11.
-- Laptop position: left of Windows.
-- Linux target: this Hyprland laptop only.
-- Linux input backend: `libei` first.
-- Clipboard scope: text plus in-memory static images; file lists remain excluded.
-- Port: `42420/tcp`.
-- Security: pinned encrypted pairing.
-- UI: Windows tray app plus Linux background receiver.
-- Emergency release hotkey: `Ctrl+Alt+Pause`.
-- No UAC/admin desktop support in MVP.
-- No multi-monitor support in MVP beyond using the primary Windows monitor and laptop `eDP-1`.
+# edge-kvm Project Plan
+
+Last reviewed: 2026-10-27 against `main` at `33efae2`.
+
+## Purpose and current scope
+
+Build a portable Rust LAN software KVM that shares mouse, keyboard, clipboard,
+audio, and selected device integrations. Either computer can control the other;
+input direction is independent of audio direction and who opened the connection.
+
+The implemented baseline is a pair of computers: Windows/Linux or Linux/Linux.
+Linux nodes also support multiple paired phones. A fleet of several computers is
+planned, not implemented. This plan replaces the original one-way
+Windows-to-Hyprland MVP plan.
+
+## Implemented on main
+
+- **Input:** Windows and Linux capture/injection, edge switching, runtime control
+  handover, forwarding toggles, emergency release, liveness checks, and held-input
+  cleanup. Linux capture uses the InputCapture portal; injection supports uinput
+  on Niri and the available libei/Hyprland paths.
+- **Linux nodes:** every Linux computer accepts computer and phone connections
+  and can dial its configured computer. Simultaneous dialing is deduplicated using
+  device fingerprints. Settings exposes an optional other-computer address rather
+  than a connect/wait role choice. Windows still initiates connections only.
+- **Pairing and protocol:** persistent identities, pinned peer fingerprints,
+  encrypted sessions, and two-sided pairing confirmation. Protocol v2 includes
+  role-neutral configuration migration with adjacent v1 backups; both computers
+  must run the same protocol generation.
+- **Clipboard:** bidirectional text and bounded static images, loop prevention,
+  and chunked large text with capability negotiation. Arbitrary file transfer is
+  outside the current scope.
+- **Audio:** routes in either direction independently of input control, Windows
+  WASAPI capture, Linux capture, and clock-paced Linux playback with drift
+  correction, buffering, diagnostics, and ALSA fallback.
+- **Desktop controls:** one-page settings, tray menus, named control/audio choices,
+  connection status, and Linux service installation while retaining portable use.
+- **Phones on Linux:** multiple paired phones, QR pairing, clipboard,
+  notifications, and audio. This repository's PC implementation does not imply
+  feature parity on Windows or every capability in the separate phone app.
+- **Shared Linux notifications:** opt-in Quickshell integration, one configured
+  history owner, source labels, durable state and queued operations, offline
+  reconciliation, synchronized dismissals, and phone ingestion into shared history.
+  Setup uses the existing settings window and supported notification centres.
+
+Recent merged milestones:
+
+- [#20: One-page settings and phone pairing](https://github.com/astraea-oss/MouseWithoutBorders/pull/20)
+- [#22: Universal Linux nodes](https://github.com/astraea-oss/MouseWithoutBorders/pull/22)
+- [#24: Shared Linux notifications](https://github.com/astraea-oss/MouseWithoutBorders/pull/24)
+- [#19: Input latency, clock-driven audio, and large clipboard text](https://github.com/astraea-oss/MouseWithoutBorders/pull/19)
+
+## Verification status
+
+The [latest main CI run](https://github.com/astraea-oss/MouseWithoutBorders/actions/runs/40053194426)
+on 2026-10-24 passed workspace tests, lint, and release builds on Windows and
+Linux for `33efae2`. No pull requests were open when this plan was reviewed.
+These are historical CI results, not a new physical-device acceptance run.
+
+Live development testing has exercised Linux/Linux capture, handover, emergency
+release, reconnect, and audio. The complete acceptance matrix still needs a
+recorded run, especially both Windows/Linux control directions and shared
+notifications on the physical Linux PCs. Implementation and automated test
+coverage should not be treated as completed hardware acceptance.
+
+## Next milestones
+
+### 1. Validate the merged two-computer baseline
+
+Deploy matching builds to the physical computers while preserving existing
+configuration, device identities, and pairings. Use the
+[Windows/Linux baseline](docs/testing/windows-linux-baseline.md) and
+[Quickshell setup and limits](integrations/quickshell/README.md).
+
+- Verify Windows/Linux control in both directions and Linux/Linux control,
+  handover, forwarding toggles, and all configured screen edges.
+- Check held keys/buttons, the emergency release shortcut, process failure,
+  network loss, reconnect, and clean shutdown without trapped input.
+- Exercise text, Unicode, images, oversized clipboard content, and audio in both
+  directions, including route changes and a sustained playback session.
+- Check Linux simultaneous dialing settles on one session, and phone features
+  remain available regardless of which Linux computer opened the PC connection.
+- On both Linux PCs, verify notification setup, native and phone entries,
+  dismiss/Clear, offline recovery, shell reload/restart, and daemon restart.
+- Record commit, OS/compositor, display geometry/scales, network, test results,
+  and remaining defects. Fix regressions before expanding topology.
+
+Completion means the recorded checks pass or remaining limitations are explicitly
+accepted and documented. This milestone is still pending.
+
+### 2. Finish neutral naming and migration
+
+Continue [issue #21](https://github.com/astraea-oss/MouseWithoutBorders/issues/21).
+Its Linux node loop and simplified address setting have landed; naming and fleet
+support remain follow-up work.
+
+- Introduce role-neutral `edge-kvm` / `edge-kvm.exe` entry points,
+  `edge-kvm.service`, and neutral configuration/log names.
+- Keep legacy executable names as aliases for one release and document the
+  deprecation window. Migrate existing service installations without enabling
+  duplicate daemons or discarding configuration, identity, pins, or state.
+- Verify fresh portable use, existing portable upgrades, service upgrades, and
+  compatibility aliases. Update installation instructions and diagnostics.
+- Reconcile older design documents and examples with the implemented node model;
+  some still describe the earlier fixed connector/listener architecture.
+
+Completion means new and existing installations work with a documented migration
+path and unchanged trust relationships.
+
+### 3. Add multi-computer fleet support
+
+Keep this separate from naming changes. Start with an explicit fleet design and
+migration plan before extending the working two-computer runtime.
+
+- Add multiple configured computer peers, per-peer pairing/session state, and
+  per-peer screen-edge layout, preserving existing single-peer configuration.
+- Define control ownership and handover across several computers, with one input
+  destination at a time and release behavior for destination failure.
+- Route edge crossings to the intended peer and keep connection deduplication
+  stable when several nodes dial concurrently.
+- Specify clipboard propagation and loop prevention across the fleet, and define
+  audio routing alongside concurrent PC and phone sessions.
+- Extend settings/status for several peers without exposing transport plumbing.
+- Add meaningful multi-peer tests and validate at least three physical computers
+  before claiming fleet support.
+
+Completion means a documented, tested three-computer workflow with safe recovery
+and no regression to existing pairs. LAN discovery and Internet relays remain
+outside this milestone.
+
+### 4. Extend integrations after the baseline is stable
+
+These are follow-up candidates rather than committed prerequisites for fleet work:
+
+- Windows phone support and native Windows notification integration.
+- PC-to-Android dismissal, requiring a corresponding mobile protocol command.
+- Notification incremental replay and safe terminal-marker compaction.
+- Coordinator migration/reset and clearer history maintenance/recovery tooling.
+- Remote notification popups, actions/replies, and richer image payloads.
+
+Keep each extension separately scoped with protocol compatibility, recovery, and
+acceptance criteria agreed before implementation.
+
+## Current limits and safety requirements
+
+- The shipped PC topology remains two computers; multiple phones are supported
+  on Linux. Windows is not yet a symmetric listening node.
+- Windows injection does not bypass elevated-process restrictions or support the
+  UAC secure desktop. macOS, automatic LAN discovery, and Internet relays are not
+  part of this plan.
+- Shared notifications initially require supported Linux Quickshell centres and
+  one explicitly configured owner. Remote copies are silent; DND stays local.
+- PC dismissals synchronize the PC copies of phone notifications; they do not
+  dismiss the original Android notification with the current phone protocol.
+- Notification storage/queues are bounded. Automatic terminal-marker compaction,
+  leader election, and coordinator migration/reset are not implemented. Follow
+  the integration guide for capacity and recovery limits.
+- Preserve pinned trust, bounded payloads/queues, clipboard loop prevention,
+  emergency release, and held-input cleanup through every milestone. Notification
+  or audio failures must not trap input or take down unrelated features.
+
+## Validation and supporting documents
+
+For runtime changes, use the platform-specific test, lint, and release-build
+commands in [the baseline checklist](docs/testing/windows-linux-baseline.md).
+For notification changes, also run the focused tests and optional offscreen
+Quickshell bridge test in [the integration guide](integrations/quickshell/README.md).
+Record physical-device acceptance separately from automated checks.
+
+- [README: current operation and configuration](README.md)
+- [Universal control design and implementation notes](docs/plans/universal-controller-receiver.md)
+- [Shared notifications design and deferred work](docs/plans/shared-notifications.md)
+- [Linux audio streaming](docs/plans/linux-audio-streaming.md)
+- [Bidirectional clipboard](docs/plans/bidirectional-clipboard.md)
+- [Clipboard images](docs/plans/clipboard-images.md)
+
+The linked design plans retain historical architecture and target behavior.
+Use their implementation-status notes, the current README, and the integration
+guide to distinguish shipped behavior from proposals.
