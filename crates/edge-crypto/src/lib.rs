@@ -120,7 +120,7 @@ pub struct PinnedPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedPhone {
     pub fingerprint: String,
-    #[serde(default = "PhoneFeature::all")]
+    #[serde(default = "PhoneFeature::legacy")]
     pub allowed_features: BTreeSet<PhoneFeature>,
 }
 
@@ -128,14 +128,23 @@ pub struct PinnedPhone {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PhoneFeature {
+    /// Window identity/geometry only; separate from input or screen capture.
+    WindowFocus,
     Clipboard,
     Notifications,
     Audio,
 }
 
 impl PhoneFeature {
-    pub fn all() -> BTreeSet<Self> {
+    /// Preserve the grants of phone pins written before focused-window support.
+    pub fn legacy() -> BTreeSet<Self> {
         BTreeSet::from([Self::Clipboard, Self::Notifications, Self::Audio])
+    }
+
+    pub fn all() -> BTreeSet<Self> {
+        let mut features = Self::legacy();
+        features.insert(Self::WindowFocus);
+        features
     }
 }
 
@@ -654,12 +663,12 @@ mod tests {
     }
 
     #[test]
-    fn phone_pins_without_features_allow_everything() {
+    fn legacy_phone_pins_do_not_gain_window_focus() {
         let store: PinStore =
             toml::from_str("[phones.Pixel]\nfingerprint = \"phone-key\"\n").unwrap();
         assert_eq!(
             store.phone("Pixel").unwrap().allowed_features,
-            PhoneFeature::all()
+            PhoneFeature::legacy()
         );
     }
 

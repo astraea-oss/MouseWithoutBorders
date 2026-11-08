@@ -31,7 +31,7 @@ use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
     HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
-    PROTOCOL_VERSION, PhoneEvent, RemoteError,
+    PHONE_WINDOW_FOCUS_EXTENSION, PROTOCOL_VERSION, PhoneEvent, RemoteError, WindowFocusState,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -133,6 +133,7 @@ enum PhoneFrame {
     Notification,
     AudioRequest(Option<AudioDirection>, u16),
     AudioStopped,
+    WindowFocusSubscribe(bool),
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -155,6 +156,12 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Phone(PhoneEvent::AudioStopped { .. }) => PhoneFrame::AudioStopped,
         Frame::Phone(PhoneEvent::AudioStart { .. }) => PhoneFrame::NotAllowed("AudioStart"),
         Frame::Phone(PhoneEvent::AudioInvite { .. }) => PhoneFrame::NotAllowed("AudioInvite"),
+        Frame::Phone(PhoneEvent::WindowFocusSubscribe { enabled }) => {
+            PhoneFrame::WindowFocusSubscribe(*enabled)
+        }
+        Frame::Phone(PhoneEvent::WindowFocusUpdate { .. }) => {
+            PhoneFrame::NotAllowed("WindowFocusUpdate")
+        }
         Frame::Hello(_) => PhoneFrame::NotAllowed("Hello"),
         Frame::ScreenInfo(_) => PhoneFrame::NotAllowed("ScreenInfo"),
         Frame::Input(_) => PhoneFrame::NotAllowed("Input"),
@@ -176,7 +183,10 @@ impl LocalHello {
     /// Advertises showing phone notifications and taking clipboard images
     /// when this receiver does.
     fn frame(&self, notifications: bool, images: bool) -> Frame {
-        let mut extensions = vec![HYPR_PHONE_EXTENSION.to_string()];
+        let mut extensions = vec![
+            HYPR_PHONE_EXTENSION.to_string(),
+            PHONE_WINDOW_FOCUS_EXTENSION.to_string(),
+        ];
         if notifications {
             extensions.push(NOTIFICATIONS_EXTENSION.to_string());
         }
@@ -270,6 +280,7 @@ struct SessionContext {
     state_dir: PathBuf,
     /// The phone takes `AudioInvite`, so the tray can start streams.
     accepts_audio_invite: bool,
+    accepts_window_focus: bool,
     tray: Option<ReceiverTrayHandle>,
 }
 
@@ -487,6 +498,7 @@ impl PhoneSessions {
             notifications,
             state_dir: edge_common::default_state_dir(),
             accepts_audio_invite: advertises(PHONE_AUDIO_INVITE_EXTENSION),
+            accepts_window_focus: advertises(PHONE_WINDOW_FOCUS_EXTENSION),
             tray: self.tray.clone(),
         };
         let (commands, commands_rx) = mpsc::unbounded_channel();
@@ -812,6 +824,9 @@ async fn run_phone_session(
         )
         .await;
     }
+    let focus_allowed = phone.allowed_features.contains(&PhoneFeature::WindowFocus);
+    let mut focus = None;
+    let mut focus_sequence = 0_u64;
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
     let mut image_pace = time::interval(Duration::from_millis(2));
     image_pace.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -901,6 +916,14 @@ async fn run_phone_session(
                     }
                 }
             },
+            Some(sample) = crate::phone_window_focus::changed(&mut focus) => {
+                focus_sequence += 1;
+                send(&mut writer, &Frame::Phone(PhoneEvent::WindowFocusUpdate {
+                    sequence: focus_sequence,
+                    sampled_at_ms: sample.sampled_at_ms,
+                    state: sample.state,
+                })).await?;
+            }
             Some((generation, reason)) = audio_stopped.recv() => {
                 if audio.as_ref().is_some_and(|running| running.generation == generation) {
                     audio = None;
@@ -1034,6 +1057,25 @@ async fn run_phone_session(
                         tracing::info!(phone = %context.name, ?direction, "phone audio starting");
                         audio = Some(running);
                     }
+                    PhoneFrame::WindowFocusSubscribe(enabled) => {
+                        // Never send an unfamiliar variant to an old phone.
+                        anyhow::ensure!(context.accepts_window_focus, "window focus was not negotiated");
+                        if !enabled {
+                            focus = None;
+                            focus_sequence = 0;
+                        } else if !focus_allowed {
+                            send(&mut writer, &Frame::Phone(PhoneEvent::WindowFocusUpdate {
+                                sequence: 1,
+                                sampled_at_ms: 0,
+                                state: WindowFocusState::Unavailable {
+                                    reason: "Window focus is not allowed for this phone; pair again to grant it".into(),
+                                },
+                            })).await?;
+                        } else if focus.is_none() {
+                            focus_sequence = 0;
+                            focus = Some(crate::phone_window_focus::Tracker::start());
+                        }
+                    }
                     PhoneFrame::AudioStopped => audio = None,
                     PhoneFrame::Unpair => {
                         context
@@ -1127,6 +1169,7 @@ pub(crate) async fn assert_history_failure_keeps_phone_connected(
             }),
             state_dir,
             accepts_audio_invite: false,
+            accepts_window_focus: false,
             tray: None,
         };
         let (_commands, commands) = mpsc::unbounded_channel();
@@ -1319,6 +1362,14 @@ mod tests {
     }
 
     async fn start_session_as(timings: PhoneTimings, entry: Entry) -> Harness {
+        start_session_with_focus(timings, entry, false).await
+    }
+
+    async fn start_session_with_focus(
+        timings: PhoneTimings,
+        entry: Entry,
+        accepts_window_focus: bool,
+    ) -> Harness {
         let (requests_tx, requests) = mpsc::unbounded_channel();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1346,6 +1397,7 @@ mod tests {
                 notifications: None,
                 state_dir: std::env::temp_dir(),
                 accepts_audio_invite: false,
+                accepts_window_focus,
                 tray: None,
             };
             let (_commands, commands) = mpsc::unbounded_channel();
@@ -1816,5 +1868,96 @@ mod tests {
             }
             other => panic!("expected AudioStopped, got {other:?}"),
         }
+    }
+    #[tokio::test]
+    async fn window_focus_requires_negotiation_and_permission() {
+        let request = Frame::Phone(PhoneEvent::WindowFocusSubscribe { enabled: true });
+        let mut old = start_session(FAST).await;
+        write_secure_frame(&mut old.phone, &request).await.unwrap();
+        assert!(
+            ended(old)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not negotiated")
+        );
+
+        let mut denied = start_session_with_focus(FAST, pinned(), true).await;
+        write_secure_frame(&mut denied.phone, &request)
+            .await
+            .unwrap();
+        match next_frame(&mut denied.phone).await {
+            Frame::Phone(PhoneEvent::WindowFocusUpdate {
+                state: WindowFocusState::Unavailable { reason },
+                ..
+            }) => {
+                assert!(reason.contains("not allowed"));
+            }
+            other => panic!("expected permission refusal, got {other:?}"),
+        }
+        // Metadata permission never admits input or receiver-only focus updates.
+        assert!(matches!(
+            classify_phone_frame(&Frame::Phone(PhoneEvent::WindowFocusUpdate {
+                sequence: 1,
+                sampled_at_ms: 0,
+                state: WindowFocusState::NoWindow,
+            })),
+            PhoneFrame::NotAllowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn window_focus_subscription_sends_snapshot_and_stops() {
+        let mut harness = start_session_with_focus(
+            PhoneTimings::DEFAULT,
+            Entry::Pinned(PinnedPhone {
+                fingerprint: "phone".into(),
+                allowed_features: BTreeSet::from([PhoneFeature::WindowFocus]),
+            }),
+            true,
+        )
+        .await;
+        // Advertising support alone must not start a feed.
+        assert!(
+            time::timeout(
+                Duration::from_millis(100),
+                read_secure_frame(&mut harness.phone)
+            )
+            .await
+            .is_err()
+        );
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Phone(PhoneEvent::WindowFocusSubscribe { enabled: true }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_frame(&mut harness.phone).await,
+            Frame::Phone(PhoneEvent::WindowFocusUpdate { sequence: 1, .. })
+        ));
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Phone(PhoneEvent::WindowFocusSubscribe { enabled: false }),
+        )
+        .await
+        .unwrap();
+        // Barrier: processing this echo also means the unsubscribe was processed.
+        write_secure_frame(
+            &mut harness.phone,
+            &Frame::Heartbeat(Heartbeat { sequence: 17 }),
+        )
+        .await
+        .unwrap();
+        while next_frame(&mut harness.phone).await != Frame::Heartbeat(Heartbeat { sequence: 17 }) {
+        }
+        assert!(
+            time::timeout(
+                Duration::from_millis(300),
+                read_secure_frame(&mut harness.phone)
+            )
+            .await
+            .is_err()
+        );
     }
 }

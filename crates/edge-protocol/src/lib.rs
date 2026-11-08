@@ -27,6 +27,8 @@ pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
 /// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
 /// it to start a stream.
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
+/// Opt-in focused-window metadata. Does not grant capture or input access.
+pub const PHONE_WINDOW_FOCUS_EXTENSION: &str = "phone-window-focus-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -174,6 +176,58 @@ pub enum PhoneEvent {
     /// `AudioRequest`, which keeps the phone's firewall path working. Only
     /// sent to phones advertising [`PHONE_AUDIO_INVITE_EXTENSION`].
     AudioInvite { direction: AudioDirection },
+    /// Phone → receiver. Only with phone-window-focus-v1; off by default.
+    WindowFocusSubscribe { enabled: bool },
+    /// Receiver → phone. Sent on subscription and when the sampled state changes.
+    /// Sequence starts at 1 for each subscription. No screenshots or input.
+    WindowFocusUpdate {
+        sequence: u64,
+        sampled_at_ms: u64,
+        state: WindowFocusState,
+    },
+}
+
+/// Desktop logical coordinates, NOT encoded-video pixels. Negative origins are valid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusMonitor {
+    pub id: i32,
+    pub name: String,
+    /// Native, untransformed output dimensions.
+    pub width_px: u32,
+    pub height_px: u32,
+    /// Output scale multiplied by 1000.
+    pub scale_milli: u32,
+    /// Wayland output transform (0..7).
+    pub transform: u8,
+    pub logical_bounds: FocusRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusedWindow {
+    pub address: String,
+    pub app_id: String,
+    pub title: String,
+    pub workspace_id: i32,
+    pub bounds: FocusRect,
+    /// Intersection with its monitor. None means outside the visible output.
+    pub visible_bounds: Option<FocusRect>,
+    pub monitor: FocusMonitor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WindowFocusState {
+    Focused { window: FocusedWindow },
+    NoWindow,
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1208,6 +1262,19 @@ mod tests {
             },
             PhoneEvent::PairAccepted,
             PhoneEvent::Unpair,
+            PhoneEvent::WindowFocusSubscribe { enabled: true },
+            PhoneEvent::WindowFocusUpdate {
+                sequence: 1,
+                sampled_at_ms: 123,
+                state: WindowFocusState::NoWindow,
+            },
+            PhoneEvent::WindowFocusUpdate {
+                sequence: 2,
+                sampled_at_ms: 124,
+                state: WindowFocusState::Unavailable {
+                    reason: "not running".into(),
+                },
+            },
             PhoneEvent::AudioRequest {
                 direction: Some(AudioDirection::FromPhone),
                 udp_port: 40_000,
@@ -1229,6 +1296,51 @@ mod tests {
             let frame = Frame::Phone(event);
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn focused_window_metadata_round_trips_with_negative_coordinates_and_unicode() {
+        let frame = Frame::Phone(PhoneEvent::WindowFocusUpdate {
+            sequence: 4,
+            sampled_at_ms: 1234,
+            state: WindowFocusState::Focused {
+                window: FocusedWindow {
+                    address: "0x123".into(),
+                    app_id: "browser".into(),
+                    title: "日本語 · café".into(),
+                    workspace_id: -99,
+                    bounds: FocusRect {
+                        x: -900,
+                        y: 10,
+                        width: 800,
+                        height: 1000,
+                    },
+                    visible_bounds: Some(FocusRect {
+                        x: -900,
+                        y: 10,
+                        width: 800,
+                        height: 1000,
+                    }),
+                    monitor: FocusMonitor {
+                        id: 1,
+                        name: "DP-1".into(),
+                        width_px: 2560,
+                        height_px: 1440,
+                        scale_milli: 1500,
+                        transform: 3,
+                        logical_bounds: FocusRect {
+                            x: -960,
+                            y: 0,
+                            width: 960,
+                            height: 1707,
+                        },
+                    },
+                },
+            },
+        });
+        let encoded = encode_frame(&frame).unwrap();
+        assert!(encoded.len() < MAX_SECURE_FRAME_BYTES);
+        assert_eq!(decode_frame(&encoded).unwrap(), frame);
     }
 
     #[test]

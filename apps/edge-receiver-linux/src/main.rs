@@ -97,6 +97,7 @@ mod phone_audio;
 mod phone_pairing;
 #[cfg(target_os = "linux")]
 mod phone_projection;
+mod phone_window_focus;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
