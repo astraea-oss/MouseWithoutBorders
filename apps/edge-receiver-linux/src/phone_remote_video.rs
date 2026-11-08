@@ -1,58 +1,105 @@
-//! Video remote view (experimental, `phone-window-video-v1`): raw window
-//! captures encoded to HEVC on NVENC through GStreamer. One access unit
-//! (Annex B, parameter sets repeated on every keyframe) comes out per frame in,
-//! so frames keep the JPEG view's frame-scoped metadata and input rules.
-use anyhow::{Context, Result, bail, ensure};
+//! Video remote view (experimental, `phone-window-video-v1`): the selected
+//! window's region is captured with wlr-screencopy into shared memory and
+//! encoded to HEVC on NVENC through GStreamer. NVENC takes the captured BGRx
+//! directly, so there is no software conversion. One access unit (Annex B,
+//! parameter sets repeated on every keyframe) comes out per frame in, so
+//! frames keep the JPEG view's frame-scoped metadata and input rules.
+//!
+//! Capture waits for damage: a still window produces a frame only every
+//! [`KEEPALIVE`], which keeps the phone's view fresh enough to tap.
+use anyhow::{Context, Result, ensure};
+use edge_linux_input::{CapturedRegion, ScreenCopy};
+use edge_protocol::{FocusRect, FocusedWindow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
-/// Whether this computer can encode the stream: GStreamer with NVENC HEVC.
+/// A still window still gets a frame this often.
+pub(crate) const KEEPALIVE: Duration = Duration::from_millis(500);
+
+/// Whether this computer can stream video: wlr-screencopy, and GStreamer with
+/// NVENC HEVC.
 pub(crate) fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         gst::init().is_ok()
-            && [
-                "nvh265enc",
-                "h265parse",
-                "videoconvert",
-                "appsrc",
-                "appsink",
-            ]
-            .iter()
-            .all(|name| gst::ElementFactory::find(name).is_some())
+            && ["nvh265enc", "h265parse", "appsrc", "appsink"]
+                .iter()
+                .all(|name| gst::ElementFactory::find(name).is_some())
+            && ScreenCopy::connect().is_ok()
     })
 }
 
-/// One NVENC session for a fixed frame size. A new size, or a broken decoding
-/// chain on the phone, gets a new encoder, whose first frame is a keyframe.
+/// Text favours sharp still content; Media favours motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Mode {
+    #[default]
+    Text,
+    Media,
+}
+
+impl Mode {
+    /// The shortest time between frames.
+    pub fn interval(self) -> Duration {
+        match self {
+            Self::Text => Duration::from_millis(100),
+            Self::Media => Duration::from_millis(16),
+        }
+    }
+
+    /// Frames sent but not yet acked: one for Text, a few for Media, so the
+    /// round trip doesn't cap the frame rate.
+    pub fn in_flight(self) -> usize {
+        match self {
+            Self::Text => 1,
+            Self::Media => 3,
+        }
+    }
+
+    fn encoder_settings(self) -> &'static str {
+        match self {
+            Self::Text => "preset=p4 tune=low-latency rc-mode=vbr const-quality=20",
+            Self::Media => {
+                "preset=p1 tune=ultra-low-latency rc-mode=vbr const-quality=26 max-bitrate=20000"
+            }
+        }
+    }
+}
+
+/// One NVENC session for a fixed size, pixel format and mode. Any change, or a
+/// broken decoding chain on the phone, gets a new encoder, whose first frame is
+/// a keyframe.
 pub(crate) struct Encoder {
     pipeline: gst::Pipeline,
     src: gst_app::AppSrc,
     sink: gst_app::AppSink,
-    pub width: u32,
-    pub height: u32,
+    key: (u32, u32, &'static str, Mode),
     frames: u64,
 }
 
 impl Encoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
-        ensure!(available(), "This computer can't encode HEVC video");
+    pub fn new(width: u32, height: u32, format: &'static str, mode: Mode) -> Result<Self> {
+        ensure!(available(), "This computer can't stream video");
         ensure!(
-            width >= 16 && height >= 16 && width.is_multiple_of(2) && height.is_multiple_of(2),
-            "Invalid video size {width}x{height}"
+            width >= 144 && height >= 48,
+            "The window is too small to stream ({width}x{height})"
         );
-        // Text mode: constant quality, low latency, no reordering, one long GOP.
+        ensure!(
+            matches!(format, "BGRx" | "BGRA" | "RGBx" | "RGBA"),
+            "Unsupported capture format {format}"
+        );
         let description = format!(
             "appsrc name=src is-live=true format=time do-timestamp=false \
-               caps=video/x-raw,format=RGB,width={width},height={height},framerate=0/1 \
-             ! videoconvert ! video/x-raw,format=NV12 \
-             ! nvh265enc preset=p4 tune=low-latency zerolatency=true bframes=0 gop-size=-1 \
-               rc-mode=vbr const-quality=20 repeat-sequence-header=true \
+               caps=video/x-raw,format={format},width={width},height={height},framerate=0/1 \
+             ! nvh265enc {settings} zerolatency=true bframes=0 gop-size=-1 \
+               repeat-sequence-header=true \
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false max-buffers=2"
+             ! appsink name=sink sync=false max-buffers=2",
+            settings = mode.encoder_settings(),
         );
         let pipeline = gst::parse::launch(&description)
             .context("Could not build the video encoder")?
@@ -73,24 +120,24 @@ impl Encoder {
             pipeline,
             src,
             sink,
-            width,
-            height,
+            key: (width, height, format, mode),
             frames: 0,
         })
     }
 
-    /// Encodes one RGB frame. Blocking; returns the access unit, whether it is
-    /// a keyframe, and the WebCodecs codec string.
-    pub fn encode(&mut self, rgb: Vec<u8>) -> Result<(Vec<u8>, bool, String)> {
+    /// Encodes one tightly packed 4-byte-per-pixel frame. Blocking; returns the
+    /// access unit, whether it is a keyframe, and the WebCodecs codec string.
+    pub fn encode(&mut self, pixels: Vec<u8>) -> Result<(Vec<u8>, bool, String)> {
+        let (width, height, ..) = self.key;
         ensure!(
-            rgb.len() == self.width as usize * self.height as usize * 3,
+            pixels.len() == width as usize * height as usize * 4,
             "Frame does not match the encoder size"
         );
-        let mut buffer = gst::Buffer::from_mut_slice(padded_rows(rgb, self.width, self.height));
+        let mut buffer = gst::Buffer::from_mut_slice(pixels);
         {
             let buffer = buffer.get_mut().context("Frame buffer is shared")?;
             // Timestamps only order frames; the stream itself is not timed.
-            buffer.set_pts(gst::ClockTime::from_mseconds(self.frames * 100));
+            buffer.set_pts(gst::ClockTime::from_mseconds(self.frames * 16));
         }
         self.frames += 1;
         self.src
@@ -117,22 +164,6 @@ impl Drop for Encoder {
     }
 }
 
-/// GStreamer's default `video/x-raw` layout pads every row to a multiple of 4
-/// bytes. Tightly packed RGB of a width that isn't a multiple of 4 would be
-/// the wrong size and encode as garbage, so pad those rows.
-fn padded_rows(rgb: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
-    let row = width as usize * 3;
-    let stride = row.next_multiple_of(4);
-    if stride == row {
-        return rgb;
-    }
-    let mut padded = vec![0; stride * height as usize];
-    for (from, to) in rgb.chunks_exact(row).zip(padded.chunks_exact_mut(stride)) {
-        to[..row].copy_from_slice(from);
-    }
-    padded
-}
-
 /// `hev1.<profile>.<compat>.<tier><level>.<constraints>` for WebCodecs, from
 /// h265parse's caps. Main profile; the level follows the frame size.
 fn codec_string(caps: Option<&gst::CapsRef>) -> String {
@@ -145,137 +176,265 @@ fn codec_string(caps: Option<&gst::CapsRef>) -> String {
     format!("hev1.1.6.L{level}.B0")
 }
 
-/// A binary PPM (`P6`, 8-bit) from grim, cropped to even dimensions for
-/// 4:2:0 encoding. Returns width, height and RGB bytes.
-pub(crate) fn rgb_from_ppm(ppm: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let mut fields = Vec::new();
-    let mut at = 0;
-    while fields.len() < 4 {
-        while at < ppm.len() && ppm[at].is_ascii_whitespace() {
-            at += 1;
+/// What the view's worker controls while the source runs.
+#[derive(Debug, Default)]
+pub(crate) struct SourceControl {
+    pub mode: Mode,
+    /// Start the next frame with a new encoder (a keyframe).
+    pub restart: bool,
+}
+
+/// One encoded frame and what it shows.
+pub(crate) struct Encoded {
+    pub window: FocusedWindow,
+    pub crop: FocusRect,
+    pub data: Vec<u8>,
+    pub keyframe: bool,
+    pub codec: String,
+    pub width: u16,
+    pub height: u16,
+    pub capture: Duration,
+    pub encode: Duration,
+}
+
+/// The window's region on its monitor, in that monitor's logical coordinates.
+fn region(window: &FocusedWindow, crop: &FocusRect) -> (i32, i32, i32, i32) {
+    let monitor = &window.monitor.logical_bounds;
+    (
+        crop.x - monitor.x,
+        crop.y - monitor.y,
+        crop.width as i32,
+        crop.height as i32,
+    )
+}
+
+type Job = (Vec<u8>, bool, String, u32, u32, Duration, Duration);
+
+/// Captures and encodes the selected window until `frames` closes, at most
+/// one frame per [`Mode::interval`] and only when the region changed (or a
+/// [`KEEPALIVE`] is due). The one-slot channel is the backpressure: nothing is
+/// captured while the worker can't send.
+pub(crate) async fn source(
+    control: Arc<Mutex<SourceControl>>,
+    frames: mpsc::Sender<Result<Encoded>>,
+) {
+    let mut copier: Option<ScreenCopy> = None;
+    let mut encoder: Option<Encoder> = None;
+    let mut last_sent = Instant::now() - KEEPALIVE;
+    let mut last_window: Option<FocusedWindow> = None;
+    let mut unlocked_at: Option<Instant> = None;
+    loop {
+        let started = Instant::now();
+        let (mode, restart) = {
+            let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
+            (control.mode, std::mem::take(&mut control.restart))
+        };
+        // The lock check is a separate request, so it runs every KEEPALIVE;
+        // the window is sampled for every frame.
+        let check_lock = unlocked_at.is_none_or(|at| at.elapsed() > KEEPALIVE);
+        let window = async {
+            if check_lock {
+                crate::phone_remote_view::ensure_unlocked().await?;
+            }
+            crate::phone_remote_view::sample_window().await
         }
-        let start = at;
-        while at < ppm.len() && !ppm[at].is_ascii_whitespace() {
-            at += 1;
+        .await;
+        let before = match window {
+            Ok(window) => {
+                if check_lock {
+                    unlocked_at = Some(Instant::now());
+                }
+                window
+            }
+            Err(error) => {
+                unlocked_at = None;
+                if frames.send(Err(error)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(KEEPALIVE).await;
+                continue;
+            }
+        };
+        let Some(crop) = before.visible_bounds.clone() else {
+            if frames
+                .send(Err(anyhow::anyhow!(
+                    "Selected window is outside the visible monitor"
+                )))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(KEEPALIVE).await;
+            continue;
+        };
+        // A new window, a restart or a due keepalive copies at once; otherwise
+        // wait (up to one interval) for something to change.
+        let moved = last_window
+            .as_ref()
+            .is_none_or(|w| !crate::phone_remote_view::same_target(w, &before));
+        let wait_for_damage = !(moved || restart || last_sent.elapsed() >= KEEPALIVE);
+        let output = before.monitor.name.clone();
+        let rect = region(&before, &crop);
+        let wait = mode.interval();
+        let mut job_copier = copier.take();
+        let mut job_encoder = encoder.take();
+        let job = tokio::task::spawn_blocking(move || {
+            let result: Result<Option<Job>> = (|| {
+                if job_copier.is_none() {
+                    job_copier = Some(ScreenCopy::connect().context("Screen capture unavailable")?);
+                }
+                let capture_started = Instant::now();
+                let captured =
+                    match job_copier
+                        .as_mut()
+                        .unwrap()
+                        .capture(&output, rect, wait_for_damage, wait)
+                    {
+                        Ok(captured) => captured,
+                        Err(error) => {
+                            job_copier = None;
+                            return Err(anyhow::anyhow!(error.to_string()));
+                        }
+                    };
+                let capture = capture_started.elapsed();
+                let Some(CapturedRegion {
+                    width,
+                    height,
+                    format,
+                    data,
+                }) = captured
+                else {
+                    return Ok(None);
+                };
+                let encode_started = Instant::now();
+                let key = (width, height, format, mode);
+                if restart || job_encoder.as_ref().is_none_or(|e| e.key != key) {
+                    job_encoder = None;
+                    job_encoder = Some(Encoder::new(width, height, format, mode)?);
+                }
+                let (data, keyframe, codec) = job_encoder.as_mut().unwrap().encode(data)?;
+                Ok(Some((
+                    data,
+                    keyframe,
+                    codec,
+                    width,
+                    height,
+                    capture,
+                    encode_started.elapsed(),
+                )))
+            })();
+            (job_copier, job_encoder, result)
+        });
+        let Ok((kept_copier, kept_encoder, result)) = job.await else {
+            return;
+        };
+        copier = kept_copier;
+        encoder = kept_encoder;
+        let (data, keyframe, codec, width, height, capture, encode) = match result {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => continue,
+            Err(error) => {
+                encoder = None;
+                if frames.send(Err(error)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(KEEPALIVE).await;
+                continue;
+            }
+        };
+        // Only send what is still the selected window, where it was.
+        let after = crate::phone_remote_view::sample_window().await;
+        if !after
+            .as_ref()
+            .is_ok_and(|a| crate::phone_remote_view::same_target(&before, a))
+        {
+            last_window = None;
+            continue;
         }
-        ensure!(at > start && at < ppm.len(), "Truncated capture header");
-        fields.push(std::str::from_utf8(&ppm[start..at])?);
+        last_window = Some(before.clone());
+        last_sent = Instant::now();
+        let frame = Encoded {
+            window: before,
+            crop,
+            data,
+            keyframe,
+            codec,
+            width: width as u16,
+            height: height as u16,
+            capture,
+            encode,
+        };
+        if frames.send(Ok(frame)).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(mode.interval().saturating_sub(started.elapsed())).await;
     }
-    at += 1; // The single whitespace byte before the pixels.
-    ensure!(
-        fields[0] == "P6" && fields[3] == "255",
-        "Unexpected capture format"
-    );
-    let width: u32 = fields[1].parse()?;
-    let height: u32 = fields[2].parse()?;
-    let row = width as usize * 3;
-    let pixels = &ppm[at..];
-    if pixels.len() != row * height as usize {
-        bail!(
-            "Capture is {} bytes, expected {}",
-            pixels.len(),
-            row * height as usize
-        );
-    }
-    let (even_width, even_height) = (width & !1, height & !1);
-    ensure!(
-        even_width >= 16 && even_height >= 16,
-        "Window is too small to stream"
-    );
-    if even_width == width && even_height == height {
-        return Ok((width, height, pixels.to_vec()));
-    }
-    let even_row = even_width as usize * 3;
-    let mut rgb = Vec::with_capacity(even_row * even_height as usize);
-    for line in pixels.chunks_exact(row).take(even_height as usize) {
-        rgb.extend_from_slice(&line[..even_row]);
-    }
-    Ok((even_width, even_height, rgb))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ppm(width: u32, height: u32) -> Vec<u8> {
-        let mut data = format!("P6\n{width} {height}\n255\n").into_bytes();
-        for y in 0..height {
-            for x in 0..width {
-                data.extend([x as u8, y as u8, 7]);
+    #[test]
+    fn modes_trade_sharpness_for_frame_rate() {
+        assert_eq!(Mode::default(), Mode::Text);
+        assert!(Mode::Media.interval() < Mode::Text.interval());
+        assert!(Mode::Media.in_flight() > Mode::Text.in_flight());
+        assert!(Mode::Media.interval() <= Duration::from_millis(17));
+    }
+
+    /// The real capture → encode loop on the focused window, per mode.
+    #[tokio::test]
+    #[ignore = "requires Hyprland, screencopy and NVENC"]
+    async fn source_streams_the_focused_window_in_both_modes() {
+        for mode in [Mode::Text, Mode::Media] {
+            let control = Arc::new(Mutex::new(SourceControl { mode, restart: false }));
+            let (tx, mut rx) = mpsc::channel(1);
+            let task = tokio::spawn(source(control, tx));
+            let started = Instant::now();
+            let (mut frames, mut keyframes, mut bytes) = (0, 0, 0);
+            let (mut capture, mut encode) = (Duration::ZERO, Duration::ZERO);
+            while started.elapsed() < Duration::from_secs(4) {
+                let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await else { break };
+                let frame = frame.unwrap();
+                frames += 1;
+                keyframes += u32::from(frame.keyframe);
+                bytes += frame.data.len();
+                capture += frame.capture;
+                encode += frame.encode;
             }
+            task.abort();
+            println!(
+                "{mode:?}: {frames} frames in 4 s ({:.1} fps), {keyframes} keyframes, {} KB/s, capture {:.1} ms, encode {:.1} ms per frame",
+                f64::from(frames) / 4.0,
+                bytes / 4 / 1024,
+                capture.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+                encode.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+            );
+            assert!(frames >= 8, "at least the keepalive rate");
+            assert_eq!(keyframes, 1);
         }
-        data
-    }
-
-    #[test]
-    fn rgb_rows_are_padded_to_gstreamer_strides() {
-        let rgb: Vec<u8> = (0..18 * 2 * 3).map(|i| i as u8).collect();
-        let padded = padded_rows(rgb.clone(), 18, 2);
-        // 18 × 3 = 54 bytes per row, padded to 56.
-        assert_eq!(padded.len(), 112);
-        assert_eq!(&padded[..54], &rgb[..54]);
-        assert_eq!(&padded[56..110], &rgb[54..]);
-        assert_eq!(padded_rows(vec![1; 16 * 2 * 3], 16, 2), vec![1; 96]);
-    }
-
-    #[test]
-    fn ppm_is_cropped_to_even_dimensions() {
-        let (w, h, rgb) = rgb_from_ppm(&ppm(17, 19)).unwrap();
-        assert_eq!((w, h, rgb.len()), (16, 18, 16 * 18 * 3));
-        // Row 1 starts with pixel (0, 1): the dropped column doesn't shift rows.
-        assert_eq!(&rgb[16 * 3..16 * 3 + 3], &[0, 1, 7]);
-        let (w, h, rgb) = rgb_from_ppm(&ppm(16, 16)).unwrap();
-        assert_eq!((w, h, rgb.len()), (16, 16, 768));
-        assert!(rgb_from_ppm(&ppm(16, 16)[..20]).is_err());
-        assert!(rgb_from_ppm(b"P5\n16 16\n255\n").is_err());
-    }
-
-    /// Writes an encoded real capture to $HYPR_VIDEO_DUMP for inspection.
-    #[test]
-    #[ignore = "requires Hyprland, grim and NVENC"]
-    fn dump_encoded_capture() {
-        let Ok(path) = std::env::var("HYPR_VIDEO_DUMP") else {
-            return;
-        };
-        let mut grim = std::process::Command::new("grim");
-        grim.args(["-t", "ppm"]);
-        if let Ok(geometry) = std::env::var("HYPR_VIDEO_GEOMETRY") {
-            grim.args(["-g", &geometry]);
-        }
-        let output = grim.arg("-").output().unwrap();
-        let (w, h, rgb) = rgb_from_ppm(&output.stdout).unwrap();
-        let nonzero = rgb.iter().filter(|b| **b != 0).count();
-        println!(
-            "capture {w}x{h}, {} of {} bytes nonzero",
-            nonzero,
-            rgb.len()
-        );
-        let mut encoder = Encoder::new(w, h).unwrap();
-        let mut stream = Vec::new();
-        for _ in 0..3 {
-            let (au, key, codec) = encoder.encode(rgb.clone()).unwrap();
-            println!("access unit {} bytes, keyframe {key}, {codec}", au.len());
-            stream.extend(au);
-        }
-        std::fs::write(path, stream).unwrap();
     }
 
     #[test]
     #[ignore = "requires GStreamer with NVENC"]
     fn encodes_one_access_unit_per_frame_starting_with_a_keyframe() {
-        let mut encoder = Encoder::new(874, 1428).unwrap();
-        let started = std::time::Instant::now();
-        let (first, key, codec) = encoder.encode(vec![40; 874 * 1428 * 3]).unwrap();
-        assert!(key && first.starts_with(&[0, 0, 0, 1]));
-        assert!(codec.starts_with("hev1.1.6.L"), "{codec}");
-        for i in 0..5 {
-            let (delta, key, _) = encoder.encode(vec![40 + i; 874 * 1428 * 3]).unwrap();
-            assert!(!key && !delta.is_empty());
+        for mode in [Mode::Text, Mode::Media] {
+            let mut encoder = Encoder::new(874, 1428, "BGRx", mode).unwrap();
+            let started = Instant::now();
+            let (first, key, codec) = encoder.encode(vec![40; 874 * 1428 * 4]).unwrap();
+            assert!(key && first.starts_with(&[0, 0, 0, 1]));
+            assert!(codec.starts_with("hev1.1.6.L"), "{codec}");
+            for i in 0..5 {
+                let (delta, key, _) = encoder.encode(vec![40 + i; 874 * 1428 * 4]).unwrap();
+                assert!(!key && !delta.is_empty());
+            }
+            println!(
+                "{mode:?}: 6 frames in {:?}; keyframe {} bytes, {codec}",
+                started.elapsed(),
+                first.len()
+            );
         }
-        println!(
-            "6 frames in {:?}; keyframe {} bytes, codec {codec}",
-            started.elapsed(),
-            first.len()
-        );
     }
 }

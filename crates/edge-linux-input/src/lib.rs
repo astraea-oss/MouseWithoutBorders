@@ -23,6 +23,8 @@ mod portal_capture;
 #[cfg(target_os = "linux")]
 mod uinput;
 #[cfg(target_os = "linux")]
+mod wayland_screencopy;
+#[cfg(target_os = "linux")]
 mod wayland_virtual_input;
 
 pub const LIBEI_PKG_CONFIG: &str = "libei-1.0";
@@ -70,6 +72,8 @@ pub type Result<T> = std::result::Result<T, LinuxInputError>;
 pub use portal_capture::{CaptureEvent, PortalCaptureBackend};
 #[cfg(target_os = "linux")]
 pub use uinput::UinputBackend;
+#[cfg(target_os = "linux")]
+pub use wayland_screencopy::{CapturedRegion, ScreenCopy};
 #[cfg(target_os = "linux")]
 pub use wayland_virtual_input::HyprlandVirtualInputBackend;
 

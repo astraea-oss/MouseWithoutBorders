@@ -44,11 +44,18 @@ gesture yet; the arrow keys provide basic navigation.
   with an empty `jpeg`. Measured on a 1154×1428 window: about 115 KB per frame,
   about 235 KB/s at 2 fps, about 2% of one CPU core on the desktop.
 - With `phone-window-video-v1` as well (experimental; advertised only when
-  GStreamer has `nvh265enc`), the view is an HEVC stream instead: raw grim
-  captures (`-t ppm`, cropped to even sizes, rows padded to GStreamer's 4-byte
-  stride) are encoded by NVENC at up to 10 fps with constant quality, one
-  access unit per frame, sent as `RemoteVideoFrame` (chunked when large) with
-  the same metadata and input rules. The phone can ask for a keyframe with
+  wlr-screencopy works and GStreamer has `nvh265enc`), the view is an HEVC
+  stream instead. The window's region is copied with wlr-screencopy into a
+  reused shared-memory buffer, and NVENC takes the BGRx directly, with no
+  screenshot tool, image file or software conversion. Capture waits for
+  damage, so a still window sends one frame every 500 ms (which keeps taps
+  valid). One access unit per frame is sent as `RemoteVideoFrame` (chunked
+  when large) with the same metadata and input rules. With
+  `phone-window-video-modes-v1`, `RemoteVideoMode` switches between Text mode
+  (up to 10 fps, constant quality 20, one frame in flight) and Media mode (up
+  to 60 fps, ultra-low-latency, quality 26 capped at 20 Mbit/s, three frames
+  in flight). Media mode measured 45–55 fps at 16–22 Mbit/s, with about 6 ms
+  capture, 2–3 ms encode and 8% of one CPU core. The phone can ask for a keyframe with
   `RemoteVideoKeyframe`. Measured on an 874×1428 text window: a 325 KB first
   frame, then about 1 KB per frame; about 24 KB/s at 9 fps, about 9% of one
   CPU core. Each view logs its fps, data rate, capture/encode time and ack

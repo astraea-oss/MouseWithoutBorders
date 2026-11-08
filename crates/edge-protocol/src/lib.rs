@@ -50,6 +50,9 @@ pub const REMOTE_VIEW_MAX_CHUNKED_EDGE: u16 = 4096;
 /// an HEVC stream ([`PhoneEvent::RemoteVideoFrame`]) instead of JPEG frames.
 /// Experimental; see the phone's docs/video-pipeline.md.
 pub const PHONE_WINDOW_VIDEO_EXTENSION: &str = "phone-window-video-v1";
+/// Both peers, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: the phone can switch a
+/// video view between Text and Media mode ([`PhoneEvent::RemoteVideoMode`]).
+pub const PHONE_WINDOW_VIDEO_MODES_EXTENSION: &str = "phone-window-video-modes-v1";
 /// One encoded video frame, after reassembly (a keyframe of a large window).
 pub const REMOTE_VIDEO_MAX_FRAME: usize = 2 * 1024 * 1024;
 
@@ -273,6 +276,13 @@ pub enum PhoneEvent {
     /// chain broke; start the next frame with a keyframe.
     RemoteVideoKeyframe {
         view_id: u64,
+    },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIDEO_MODES_EXTENSION`]: Text mode
+    /// (`media: false`, the default) favours sharpness at up to 10 fps; Media
+    /// mode favours motion at up to 60 fps. Applies from the next keyframe.
+    RemoteVideoMode {
+        view_id: u64,
+        media: bool,
     },
 }
 

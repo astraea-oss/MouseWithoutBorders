@@ -32,8 +32,9 @@ use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
     HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
     PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_NAVIGATION_EXTENSION, PHONE_WINDOW_VIDEO_EXTENSION,
-    PHONE_WINDOW_VIEW_CHUNKS_EXTENSION, PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
-    RemoteAction, RemoteError, WindowFocusState,
+    PHONE_WINDOW_VIDEO_MODES_EXTENSION, PHONE_WINDOW_VIEW_CHUNKS_EXTENSION,
+    PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent, RemoteAction, RemoteError,
+    WindowFocusState,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -141,6 +142,7 @@ enum PhoneFrame {
     RemoteInput(u64, u64, RemoteAction),
     RemoteSize(u16, u16),
     RemoteKeyframe(u64),
+    RemoteMode(u64, bool),
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -188,6 +190,9 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Phone(PhoneEvent::RemoteVideoKeyframe { view_id }) => {
             PhoneFrame::RemoteKeyframe(*view_id)
         }
+        Frame::Phone(PhoneEvent::RemoteVideoMode { view_id, media }) => {
+            PhoneFrame::RemoteMode(*view_id, *media)
+        }
         Frame::Phone(
             PhoneEvent::RemoteViewFrame(_)
             | PhoneEvent::RemoteViewFrameChunk { .. }
@@ -225,6 +230,7 @@ impl LocalHello {
         ];
         if crate::phone_remote_video::available() {
             extensions.push(PHONE_WINDOW_VIDEO_EXTENSION.to_string());
+            extensions.push(PHONE_WINDOW_VIDEO_MODES_EXTENSION.to_string());
         }
         if notifications {
             extensions.push(NOTIFICATIONS_EXTENSION.to_string());
@@ -325,6 +331,8 @@ struct SessionContext {
     accepts_remote_chunks: bool,
     /// Both sides do HEVC video (and chunks); views stream video, not JPEG.
     accepts_remote_video: bool,
+    /// The phone can switch video views between Text and Media mode.
+    accepts_video_modes: bool,
     remote_owner: Arc<tokio::sync::Mutex<()>>,
     tray: Option<ReceiverTrayHandle>,
 }
@@ -552,6 +560,8 @@ impl PhoneSessions {
             accepts_remote_video: advertises(PHONE_WINDOW_VIEW_EXTENSION)
                 && advertises(PHONE_WINDOW_VIEW_CHUNKS_EXTENSION)
                 && advertises(PHONE_WINDOW_VIDEO_EXTENSION)
+                && crate::phone_remote_video::available(),
+            accepts_video_modes: advertises(PHONE_WINDOW_VIDEO_MODES_EXTENSION)
                 && crate::phone_remote_video::available(),
             remote_owner: self.remote_owner.clone(),
             tray: self.tray.clone(),
@@ -1161,6 +1171,10 @@ async fn run_phone_session(
                         anyhow::ensure!(context.accepts_remote_video, "remote video was not negotiated");
                         if let Some(view) = &remote && view.view_id == view_id { view.keyframe(); }
                     }
+                    PhoneFrame::RemoteMode(view_id, media) => {
+                        anyhow::ensure!(context.accepts_video_modes, "video modes were not negotiated");
+                        if let Some(view) = &remote && view.view_id == view_id { view.set_mode(media); }
+                    }
                     PhoneFrame::RemoteAck(view_id, frame_id) => {
                         anyhow::ensure!(context.accepts_remote_view, "remote view was not negotiated");
                         if let Some(view) = &remote && view.view_id == view_id { view.ack(frame_id); }
@@ -1292,6 +1306,7 @@ pub(crate) async fn assert_history_failure_keeps_phone_connected(
             accepts_remote_view: false,
             accepts_remote_chunks: false,
             accepts_remote_video: false,
+            accepts_video_modes: false,
             remote_owner: Arc::default(),
             tray: None,
         };
@@ -1533,6 +1548,7 @@ mod tests {
                 accepts_remote_view,
                 accepts_remote_chunks: false,
                 accepts_remote_video: false,
+                accepts_video_modes: false,
                 remote_owner: Arc::default(),
                 tray: None,
             };
