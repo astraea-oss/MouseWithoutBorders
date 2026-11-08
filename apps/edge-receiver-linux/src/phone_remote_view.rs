@@ -307,7 +307,7 @@ fn shortcut(key: RemoteKey) -> (&'static str, &'static str) {
     }
 }
 
-fn guarded_lua(window: &FocusedWindow, action: &RemoteAction, crop: &FocusRect) -> Result<String> {
+fn window_guard(window: &FocusedWindow) -> Result<String> {
     ensure!(
         window.address.starts_with("0x")
             && window.address.len() <= 32
@@ -315,35 +315,33 @@ fn guarded_lua(window: &FocusedWindow, action: &RemoteAction, crop: &FocusRect) 
         "Invalid window identity"
     );
     let bounds = &window.bounds;
-    // Runs atomically on the compositor event loop. Only validated hex/numbers and
-    // fixed key names are interpolated. Phone text never enters this Lua string.
-    let guard = format!(
+    Ok(format!(
         "local w=hl.get_active_window(); assert(w and w.address=='{}' and w.visible and w.accepts_input, 'Selected window changed'); local p,s=w.at,w.size; assert(p.x=={} and p.y=={} and s.x=={} and s.y=={}, 'Window moved'); ",
         window.address, bounds.x, bounds.y, bounds.width, bounds.height
-    );
-    let (movement, mods, key) = match action {
+    ))
+}
+
+fn guarded_lua(window: &FocusedWindow, action: &RemoteAction, crop: &FocusRect) -> Result<String> {
+    let guard = window_guard(window)?;
+    let (mods, key, target) = match action {
+        // Passing a window to Hyprland's pointer shortcut resets local pointer
+        // coordinates. Pointer focus is established by the separately guarded warp.
         RemoteAction::Tap { x, y, right } => {
-            let (x, y) = point(crop, *x, *y)?;
-            (
-                format!(
-                    "hl.dispatch(hl.dsp.cursor.move({{x={x},y={y}}})); assert(hl.get_active_window()==w,'Focus changed'); "
-                ),
-                "",
-                if *right { "mouse:273" } else { "mouse:272" },
-            )
+            point(crop, *x, *y)?;
+            ("", if *right { "mouse:273" } else { "mouse:272" }, "")
         }
         RemoteAction::Key { key } => {
             let (mods, key) = shortcut(*key);
-            (String::new(), mods, key)
+            (mods, key, ",window=w")
         }
         RemoteAction::Paste { terminal, .. } => (
-            String::new(),
             if *terminal { "CTRL SHIFT" } else { "CTRL" },
             "v",
+            ",window=w",
         ),
     };
     Ok(format!(
-        "{guard}{movement}hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='down',window=w}})); hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='up',window=w}}))"
+        "{guard}hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='down'{target}}})); hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='up'{target}}}))"
     ))
 }
 
@@ -380,6 +378,21 @@ async fn apply_input(
         same_target(&frame.window, &current),
         "Selected window changed; wait for a fresh frame"
     );
+    if let RemoteAction::Tap { x, y, .. } = &action {
+        let (x, y) = point(&frame.crop, *x, *y)?;
+        let guard = window_guard(&frame.window)?;
+        let path =
+            crate::phone_window_focus::socket_path().context("Hyprland session unavailable")?;
+        eval(&path,&format!("{guard}hl.dispatch(hl.dsp.cursor.move({{x={x},y={y}}})); assert(hl.get_active_window()==w,'Focus changed')")).await?;
+        // Let the compositor send pointer motion before its button event. Otherwise
+        // GTK/Wayland clients can receive a click at the previous pointer position.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        ensure!(
+            frame.sent.elapsed() < Duration::from_secs(2)
+                && same_target(&frame.window, &focused().await?),
+            "Window changed; wait for a fresh image"
+        );
+    }
     if let RemoteAction::Paste { text, .. } = &action {
         ensure!(
             !text.is_empty() && text.len() <= 2048,
