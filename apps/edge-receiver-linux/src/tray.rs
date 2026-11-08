@@ -77,6 +77,7 @@ struct TrayPhone {
 /// which reads it over the control socket.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrayStatus {
+    pub remote_input_busy: bool,
     pub summary: String,
     pub connected: bool,
     pub peer: Option<String>,
@@ -698,6 +699,8 @@ impl ReceiverTray {
     fn status(&self) -> TrayStatus {
         let connected = self.state == TrayState::Connected;
         TrayStatus {
+            remote_input_busy: self.state == TrayState::Connected
+                && (!self.local_is_controller || self.role_switching),
             summary: self.summary(),
             connected,
             peer: connected.then(|| self.peer_name().to_string()),

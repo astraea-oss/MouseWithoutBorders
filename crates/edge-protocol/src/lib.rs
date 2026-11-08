@@ -29,6 +29,10 @@ pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
 /// Opt-in focused-window metadata. Does not grant capture or input access.
 pub const PHONE_WINDOW_FOCUS_EXTENSION: &str = "phone-window-focus-v1";
+/// Bounded, acknowledged JPEG remote view with frame-scoped actions.
+pub const PHONE_WINDOW_VIEW_EXTENSION: &str = "phone-window-view-v1";
+pub const REMOTE_VIEW_MAX_JPEG: usize = 48 * 1024;
+pub const REMOTE_VIEW_MAX_EDGE: u16 = 960;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -145,7 +149,9 @@ pub enum PairingEvent {
 pub enum PhoneEvent {
     /// Phone → receiver, as the first frame after the receiver's `Hello`.
     /// The phone's name comes from its `Hello`.
-    PairRequest { token: String },
+    PairRequest {
+        token: String,
+    },
     /// Receiver → phone: the phone is pinned. Also sent when an already
     /// pinned phone repeats its request, so a lost reply is recovered by
     /// asking again.
@@ -171,13 +177,19 @@ pub enum PhoneEvent {
         jitter_target_ms: u16,
     },
     /// Either way: the stream ended, and why.
-    AudioStopped { reason: String },
+    AudioStopped {
+        reason: String,
+    },
     /// Receiver → phone: please start a stream this way by sending an
     /// `AudioRequest`, which keeps the phone's firewall path working. Only
     /// sent to phones advertising [`PHONE_AUDIO_INVITE_EXTENSION`].
-    AudioInvite { direction: AudioDirection },
+    AudioInvite {
+        direction: AudioDirection,
+    },
     /// Phone → receiver. Only with phone-window-focus-v1; off by default.
-    WindowFocusSubscribe { enabled: bool },
+    WindowFocusSubscribe {
+        enabled: bool,
+    },
     /// Receiver → phone. Sent on subscription and when the sampled state changes.
     /// Sequence starts at 1 for each subscription. No screenshots or input.
     WindowFocusUpdate {
@@ -185,6 +197,84 @@ pub enum PhoneEvent {
         sampled_at_ms: u64,
         state: WindowFocusState,
     },
+    RemoteViewRequest {
+        view_id: u64,
+        enabled: bool,
+        control: bool,
+    },
+    RemoteViewAck {
+        view_id: u64,
+        frame_id: u64,
+    },
+    RemoteViewFrame(RemoteViewFrame),
+    RemoteViewStatus {
+        view_id: u64,
+        active: bool,
+        control: bool,
+        error: Option<String>,
+    },
+    RemoteViewInput {
+        view_id: u64,
+        frame_id: u64,
+        action: RemoteAction,
+    },
+    RemoteViewInputResult {
+        view_id: u64,
+        error: Option<String>,
+    },
+}
+
+/// One JPEG, small enough for a single encrypted message. No queued video backlog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteViewFrame {
+    pub view_id: u64,
+    pub frame_id: u64,
+    pub captured_at_ms: u64,
+    pub window: FocusedWindow,
+    pub crop: FocusRect,
+    pub width: u16,
+    pub height: u16,
+    /// False until geometry has settled; input still gets revalidated server-side.
+    pub interactive: bool,
+    #[serde(with = "serde_bytes")]
+    pub jpeg: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteAction {
+    /// Coordinates normalized to 0..10000 within the displayed crop.
+    Tap {
+        x: u16,
+        y: u16,
+        right: bool,
+    },
+    Key {
+        key: RemoteKey,
+    },
+    /// Explicit clipboard paste, bounded to 2048 UTF-8 bytes.
+    Paste {
+        text: String,
+        terminal: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteKey {
+    Escape,
+    Tab,
+    Enter,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    SelectAll,
+    Copy,
+    Paste,
+    AddressBar,
 }
 
 /// Desktop logical coordinates, NOT encoded-video pixels. Negative origins are valid.
@@ -1262,6 +1352,49 @@ mod tests {
             },
             PhoneEvent::PairAccepted,
             PhoneEvent::Unpair,
+            PhoneEvent::RemoteViewRequest {
+                view_id: 2,
+                enabled: true,
+                control: false,
+            },
+            PhoneEvent::RemoteViewAck {
+                view_id: 2,
+                frame_id: 1,
+            },
+            PhoneEvent::RemoteViewStatus {
+                view_id: 2,
+                active: true,
+                control: false,
+                error: None,
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Tap {
+                    x: 0,
+                    y: 10000,
+                    right: true,
+                },
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Paste {
+                    text: "日本語 café".into(),
+                    terminal: true,
+                },
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Key {
+                    key: RemoteKey::Enter,
+                },
+            },
+            PhoneEvent::RemoteViewInputResult {
+                view_id: 2,
+                error: Some("stale frame".into()),
+            },
             PhoneEvent::WindowFocusSubscribe { enabled: true },
             PhoneEvent::WindowFocusUpdate {
                 sequence: 1,
@@ -1341,6 +1474,31 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.len() < MAX_SECURE_FRAME_BYTES);
         assert_eq!(decode_frame(&encoded).unwrap(), frame);
+        let Frame::Phone(PhoneEvent::WindowFocusUpdate {
+            state: WindowFocusState::Focused { mut window },
+            ..
+        }) = frame
+        else {
+            panic!("expected window")
+        };
+        window.title = "😀".repeat(1024);
+        let frame = Frame::Phone(PhoneEvent::RemoteViewFrame(RemoteViewFrame {
+            view_id: 3,
+            frame_id: 7,
+            captured_at_ms: 99,
+            crop: window.bounds.clone(),
+            window,
+            width: 800,
+            height: 960,
+            interactive: true,
+            jpeg: vec![255; REMOTE_VIEW_MAX_JPEG],
+        }));
+        let bytes = encode_frame(&frame).unwrap();
+        assert!(
+            bytes.len() < MAX_SECURE_FRAME_BYTES,
+            "JPEG must use MessagePack binary encoding"
+        );
+        assert_eq!(decode_frame(&bytes).unwrap(), frame);
     }
 
     #[test]

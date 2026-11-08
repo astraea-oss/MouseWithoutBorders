@@ -31,7 +31,8 @@ use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
     HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
-    PHONE_WINDOW_FOCUS_EXTENSION, PROTOCOL_VERSION, PhoneEvent, RemoteError, WindowFocusState,
+    PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
+    RemoteAction, RemoteError, WindowFocusState,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
 use tokio::{
@@ -134,6 +135,9 @@ enum PhoneFrame {
     AudioRequest(Option<AudioDirection>, u16),
     AudioStopped,
     WindowFocusSubscribe(bool),
+    RemoteRequest(u64, bool, bool),
+    RemoteAck(u64, u64),
+    RemoteInput(u64, u64, RemoteAction),
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -162,6 +166,24 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
         Frame::Phone(PhoneEvent::WindowFocusUpdate { .. }) => {
             PhoneFrame::NotAllowed("WindowFocusUpdate")
         }
+        Frame::Phone(PhoneEvent::RemoteViewRequest {
+            view_id,
+            enabled,
+            control,
+        }) => PhoneFrame::RemoteRequest(*view_id, *enabled, *control),
+        Frame::Phone(PhoneEvent::RemoteViewAck { view_id, frame_id }) => {
+            PhoneFrame::RemoteAck(*view_id, *frame_id)
+        }
+        Frame::Phone(PhoneEvent::RemoteViewInput {
+            view_id,
+            frame_id,
+            action,
+        }) => PhoneFrame::RemoteInput(*view_id, *frame_id, action.clone()),
+        Frame::Phone(
+            PhoneEvent::RemoteViewFrame(_)
+            | PhoneEvent::RemoteViewStatus { .. }
+            | PhoneEvent::RemoteViewInputResult { .. },
+        ) => PhoneFrame::NotAllowed("RemoteViewOutput"),
         Frame::Hello(_) => PhoneFrame::NotAllowed("Hello"),
         Frame::ScreenInfo(_) => PhoneFrame::NotAllowed("ScreenInfo"),
         Frame::Input(_) => PhoneFrame::NotAllowed("Input"),
@@ -186,6 +208,7 @@ impl LocalHello {
         let mut extensions = vec![
             HYPR_PHONE_EXTENSION.to_string(),
             PHONE_WINDOW_FOCUS_EXTENSION.to_string(),
+            PHONE_WINDOW_VIEW_EXTENSION.to_string(),
         ];
         if notifications {
             extensions.push(NOTIFICATIONS_EXTENSION.to_string());
@@ -281,6 +304,8 @@ struct SessionContext {
     /// The phone takes `AudioInvite`, so the tray can start streams.
     accepts_audio_invite: bool,
     accepts_window_focus: bool,
+    accepts_remote_view: bool,
+    remote_owner: Arc<tokio::sync::Mutex<()>>,
     tray: Option<ReceiverTrayHandle>,
 }
 
@@ -341,6 +366,7 @@ struct RunningPhone {
 
 /// Live phone sessions, keyed by key fingerprint. Dropping it ends them all.
 pub(crate) struct PhoneSessions {
+    remote_owner: Arc<tokio::sync::Mutex<()>>,
     local: LocalHello,
     listen: SocketAddr,
     log_path: PathBuf,
@@ -367,6 +393,7 @@ impl PhoneSessions {
     ) -> Self {
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
         Self {
+            remote_owner: Arc::default(),
             local,
             listen,
             log_path,
@@ -499,6 +526,8 @@ impl PhoneSessions {
             state_dir: edge_common::default_state_dir(),
             accepts_audio_invite: advertises(PHONE_AUDIO_INVITE_EXTENSION),
             accepts_window_focus: advertises(PHONE_WINDOW_FOCUS_EXTENSION),
+            accepts_remote_view: advertises(PHONE_WINDOW_VIEW_EXTENSION),
+            remote_owner: self.remote_owner.clone(),
             tray: self.tray.clone(),
         };
         let (commands, commands_rx) = mpsc::unbounded_channel();
@@ -827,6 +856,13 @@ async fn run_phone_session(
     let focus_allowed = phone.allowed_features.contains(&PhoneFeature::WindowFocus);
     let mut focus = None;
     let mut focus_sequence = 0_u64;
+    let mut remote: Option<crate::phone_remote_view::RemoteView> = None;
+    let mut remote_id = 0_u64;
+    let remote_clipboard = context
+        .clipboard
+        .as_ref()
+        .filter(|_| phone.allowed_features.contains(&PhoneFeature::Clipboard))
+        .map(|s| s.config.clipboard.clone());
     let clipboard_allowed = phone.allowed_features.contains(&PhoneFeature::Clipboard);
     let mut image_pace = time::interval(Duration::from_millis(2));
     image_pace.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -916,6 +952,11 @@ async fn run_phone_session(
                     }
                 }
             },
+            Some(event) = crate::phone_remote_view::changed(&mut remote) => {
+                let stopped = matches!(&event, PhoneEvent::RemoteViewStatus { active: false, .. });
+                send(&mut writer, &Frame::Phone(event)).await?;
+                if stopped { remote = None; }
+            }
             Some(sample) = crate::phone_window_focus::changed(&mut focus) => {
                 focus_sequence += 1;
                 send(&mut writer, &Frame::Phone(PhoneEvent::WindowFocusUpdate {
@@ -1057,6 +1098,48 @@ async fn run_phone_session(
                         tracing::info!(phone = %context.name, ?direction, "phone audio starting");
                         audio = Some(running);
                     }
+                    PhoneFrame::RemoteRequest(view_id, enabled, control) => {
+                        anyhow::ensure!(context.accepts_remote_view, "remote view was not negotiated");
+                        if view_id <= remote_id { continue; }
+                        remote_id = view_id;
+                        if let Some(old) = remote.take() { old.stop().await; }
+                        let mut error = None;
+                        let mut owner = None;
+                        if enabled {
+                            if !phone.allowed_features.contains(&PhoneFeature::RemoteView) {
+                                error = Some("Live view permission is not granted to this phone".to_string());
+                            } else if control {
+                                if !phone.allowed_features.contains(&PhoneFeature::RemoteInput) {
+                                    error = Some("Touch control permission is not granted to this phone".to_string());
+                                } else if context.tray.as_ref().is_none_or(|t| t.status().borrow().remote_input_busy) {
+                                    error = Some("The computer is under KVM control or its control state is unavailable".into());
+                                } else {
+                                    match context.remote_owner.clone().try_lock_owned() {
+                                        Ok(guard) => owner = Some(guard),
+                                        Err(_) => error = Some("Another phone is controlling the computer".into()),
+                                    }
+                                }
+                            }
+                        }
+                        let active = enabled && error.is_none();
+                        send(&mut writer, &Frame::Phone(PhoneEvent::RemoteViewStatus { view_id, active, control: active && control, error })).await?;
+                        if active { remote = Some(crate::phone_remote_view::RemoteView::start(view_id, control, remote_clipboard.clone(), owner, context.tray.as_ref().map(|t| t.status()))); }
+                    }
+                    PhoneFrame::RemoteAck(view_id, frame_id) => {
+                        anyhow::ensure!(context.accepts_remote_view, "remote view was not negotiated");
+                        if let Some(view) = &remote && view.view_id == view_id { view.ack(frame_id); }
+                    }
+                    PhoneFrame::RemoteInput(view_id, frame_id, action) => {
+                        anyhow::ensure!(context.accepts_remote_view, "remote view was not negotiated");
+                        let result = if context.tray.as_ref().is_none_or(|t| t.status().borrow().remote_input_busy) {
+                            Err(anyhow::anyhow!("Computer control is currently unavailable"))
+                        } else {
+                            remote.as_ref().filter(|v| v.view_id == view_id)
+                                .ok_or_else(|| anyhow::anyhow!("Open a live view first"))
+                                .and_then(|view| view.input(frame_id, action))
+                        };
+                        if let Err(error) = result { send(&mut writer, &Frame::Phone(PhoneEvent::RemoteViewInputResult { view_id, error: Some(error.to_string()) })).await?; }
+                    }
                     PhoneFrame::WindowFocusSubscribe(enabled) => {
                         // Never send an unfamiliar variant to an old phone.
                         anyhow::ensure!(context.accepts_window_focus, "window focus was not negotiated");
@@ -1170,6 +1253,8 @@ pub(crate) async fn assert_history_failure_keeps_phone_connected(
             state_dir,
             accepts_audio_invite: false,
             accepts_window_focus: false,
+            accepts_remote_view: false,
+            remote_owner: Arc::default(),
             tray: None,
         };
         let (_commands, commands) = mpsc::unbounded_channel();
@@ -1370,6 +1455,15 @@ mod tests {
         entry: Entry,
         accepts_window_focus: bool,
     ) -> Harness {
+        start_session_with_features(timings, entry, accepts_window_focus, false).await
+    }
+
+    async fn start_session_with_features(
+        timings: PhoneTimings,
+        entry: Entry,
+        accepts_window_focus: bool,
+        accepts_remote_view: bool,
+    ) -> Harness {
         let (requests_tx, requests) = mpsc::unbounded_channel();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1398,6 +1492,8 @@ mod tests {
                 state_dir: std::env::temp_dir(),
                 accepts_audio_invite: false,
                 accepts_window_focus,
+                accepts_remote_view,
+                remote_owner: Arc::default(),
                 tray: None,
             };
             let (_commands, commands) = mpsc::unbounded_channel();
@@ -1959,5 +2055,71 @@ mod tests {
             .await
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn remote_view_requires_negotiation_and_separate_permissions() {
+        let request = Frame::Phone(PhoneEvent::RemoteViewRequest {
+            view_id: 1,
+            enabled: true,
+            control: false,
+        });
+        let mut old = start_session(FAST).await;
+        write_secure_frame(&mut old.phone, &request).await.unwrap();
+        assert!(
+            ended(old)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not negotiated")
+        );
+        let mut denied = start_session_with_features(FAST, pinned(), false, true).await;
+        write_secure_frame(&mut denied.phone, &request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut denied.phone).await,
+            Frame::Phone(PhoneEvent::RemoteViewStatus {
+                active: false,
+                error: Some(_),
+                ..
+            })
+        ));
+        let mut view_only = start_session_with_features(
+            FAST,
+            Entry::Pinned(PinnedPhone {
+                fingerprint: "phone".into(),
+                allowed_features: BTreeSet::from([PhoneFeature::RemoteView]),
+            }),
+            false,
+            true,
+        )
+        .await;
+        write_secure_frame(
+            &mut view_only.phone,
+            &Frame::Phone(PhoneEvent::RemoteViewRequest {
+                view_id: 1,
+                enabled: true,
+                control: true,
+            }),
+        )
+        .await
+        .unwrap();
+        match next_frame(&mut view_only.phone).await {
+            Frame::Phone(PhoneEvent::RemoteViewStatus {
+                active: false,
+                error: Some(reason),
+                ..
+            }) => assert!(reason.contains("Touch control permission")),
+            other => panic!("expected input permission refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_phone_frame(&Frame::Phone(PhoneEvent::RemoteViewStatus {
+                view_id: 1,
+                active: true,
+                control: true,
+                error: None
+            })),
+            PhoneFrame::NotAllowed(_)
+        ));
     }
 }

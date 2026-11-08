@@ -10,6 +10,7 @@ edge-common = { path = "../edge-common" }
 bytes.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
+serde_bytes = "0.11"
 thiserror.workspace = true
 tokio.workspace = true
 

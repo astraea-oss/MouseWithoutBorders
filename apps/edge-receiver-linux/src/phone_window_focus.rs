@@ -88,7 +88,7 @@ pub(crate) async fn changed(tracker: &mut Option<Tracker>) -> Option<Sample> {
     std::future::pending().await
 }
 
-fn socket_path() -> Option<PathBuf> {
+pub(crate) fn socket_path() -> Option<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
     let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
     Some(
@@ -99,7 +99,7 @@ fn socket_path() -> Option<PathBuf> {
     )
 }
 
-async fn request(path: &Path, command: &[u8]) -> Result<serde_json::Value> {
+pub(crate) async fn request(path: &Path, command: &[u8]) -> Result<serde_json::Value> {
     tokio::time::timeout(Duration::from_millis(500), async {
         let mut socket = UnixStream::connect(path).await?;
         socket.write_all(command).await?;
@@ -114,7 +114,7 @@ async fn request(path: &Path, command: &[u8]) -> Result<serde_json::Value> {
     .context("Hyprland request timed out")?
 }
 
-async fn sample(path: &Path) -> Result<WindowFocusState> {
+pub(crate) async fn sample(path: &Path) -> Result<WindowFocusState> {
     let window = request(path, b"j/activewindow").await?;
     // Avoid querying monitor state if there is no focused window.
     if no_window(&window) {

@@ -130,6 +130,8 @@ pub struct PinnedPhone {
 pub enum PhoneFeature {
     /// Window identity/geometry only; separate from input or screen capture.
     WindowFocus,
+    RemoteView,
+    RemoteInput,
     Clipboard,
     Notifications,
     Audio,
@@ -144,6 +146,8 @@ impl PhoneFeature {
     pub fn all() -> BTreeSet<Self> {
         let mut features = Self::legacy();
         features.insert(Self::WindowFocus);
+        features.insert(Self::RemoteView);
+        features.insert(Self::RemoteInput);
         features
     }
 }
