@@ -82,6 +82,20 @@ with a compositor roundtrip and another focus/geometry check before clicking.
 This preserves client pointer coordinates. Key events use fixed Lua guards and
 target the selected window directly. Addresses must be hex; coordinates are bounded; keys come from an enum.
 
+With `phone-window-gestures-v1`, the receiver also takes `scroll` (whole
+wheel steps at a point, at most 10 per message) and `drag_start` /
+`drag_move` / `drag_end` (the left button held between them). They pass the
+same frame and window checks as a tap. A drag's held button is released if a
+step fails, if the window changes, or if the view ends, including when the
+view task is aborted mid-drag.
+
+With `phone-window-typing-v1`, `type` carries live typing from the phone's
+keyboard: press Backspace `backspaces` times, then type `text` (at most 256
+bytes). Characters a US layout can type are pressed on the virtual keyboard,
+whose own US keymap makes them independent of the desktop's layout.
+Anything else (such as £, accents or emoji) goes through the clipboard and
+Ctrl+V, which needs the clipboard grant and doesn't work in terminals.
+
 Super+arrow (`super_left`/`right`/`up`/`down`) is the exception. A key sent to
 one window would bypass compositor binds, so these are pressed on the virtual
 keyboard after the same identity and freshness checks, and the user's own

@@ -251,6 +251,8 @@ async fn run<F, Fut>(
     let mut stats = Stats::default();
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = None;
+    // A drag's held left button, released if the view ends first.
+    let mut held = HeldButton::default();
     let mut history: VecDeque<SentFrame> = VecDeque::new();
     let mut waiting: Option<(u64, Instant)> = None;
     let mut next_id = 0;
@@ -274,7 +276,7 @@ async fn run<F, Fut>(
                 }
                 Some(CommandMessage::Input(id, action)) => {
                     let result = match history.iter().find(|f| f.id == id) {
-                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref(), &mut pointer).await,
+                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref(), &mut pointer, &mut held).await,
                         _ => Err(anyhow::anyhow!("That image is no longer current")),
                     };
                     if events.send(PhoneEvent::RemoteViewInputResult { view_id, error: result.err().map(|e| e.to_string()) }).await.is_err() { break; }
@@ -363,6 +365,8 @@ async fn run_video(
     let mut watchdog = tokio::time::interval(Duration::from_millis(500));
     let mut stats = Stats::default();
     let mut pointer = None;
+    // A drag's held left button, released if the view ends first.
+    let mut held = HeldButton::default();
     let mut history: VecDeque<SentFrame> = VecDeque::new();
     let mut next_id = 0;
     let mut previous: Option<FocusedWindow> = None;
@@ -381,7 +385,7 @@ async fn run_video(
                 }
                 Some(CommandMessage::Input(id, action)) => {
                     let result = match history.iter().find(|f| f.id == id) {
-                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref(), &mut pointer).await,
+                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref(), &mut pointer, &mut held).await,
                         _ => Err(anyhow::anyhow!("That image is no longer current")),
                     };
                     if events.send(PhoneEvent::RemoteViewInputResult { view_id, error: result.err().map(|e| e.to_string()) }).await.is_err() { break; }
@@ -654,7 +658,14 @@ fn window_guard(window: &FocusedWindow) -> Result<String> {
 fn guarded_lua(window: &FocusedWindow, action: &RemoteAction) -> Result<String> {
     let guard = window_guard(window)?;
     let (mods, key, target) = match action {
-        RemoteAction::Tap { .. } => bail!("Pointer actions use the Wayland input backend"),
+        RemoteAction::Tap { .. }
+        | RemoteAction::Scroll { .. }
+        | RemoteAction::DragStart { .. }
+        | RemoteAction::DragMove { .. }
+        | RemoteAction::DragEnd { .. }
+        | RemoteAction::Type { .. } => {
+            bail!("Pointer and typing actions use the Wayland input backend")
+        }
         RemoteAction::Key { key } if key.super_arrow().is_some() => {
             bail!("Super+arrow uses the Wayland input backend")
         }
@@ -691,22 +702,324 @@ async fn eval(path: &Path, script: &str) -> Result<()> {
     .context("Hyprland action timed out")?
 }
 
+/// Moves the virtual pointer to (`x`, `y`) of the frame's crop.
+async fn move_pointer(
+    frame: &SentFrame,
+    x: u16,
+    y: u16,
+    pointer: &mut Option<edge_linux_input::HyprlandVirtualInputBackend>,
+) -> Result<()> {
+    let (x, y) = point(&frame.crop, x, y)?;
+    let desktop = crate::phone_window_focus::desktop_bounds().await?;
+    let dx = u32::try_from(x - i64::from(desktop.x))?;
+    let dy = u32::try_from(y - i64::from(desktop.y))?;
+    if pointer.is_none() {
+        *pointer = Some(edge_linux_input::HyprlandVirtualInputBackend::connect()?);
+    }
+    pointer
+        .as_ref()
+        .unwrap()
+        .move_absolute(dx, dy, desktop.width, desktop.height)
+        .await?;
+    Ok(())
+}
+
+async fn left_button(
+    pointer: &Option<edge_linux_input::HyprlandVirtualInputBackend>,
+    down: bool,
+) -> Result<()> {
+    let backend = pointer.as_ref().context("No pointer")?;
+    backend
+        .inject(edge_protocol::InputEvent::PointerButton {
+            button: edge_protocol::MouseButton::Left,
+            down,
+        })
+        .await?;
+    Ok(())
+}
+
+/// The left button a drag holds. Also released on drop: stopping a view aborts
+/// its task mid-loop, and the computer must never be left with it pressed.
+#[derive(Default)]
+struct HeldButton(Option<edge_linux_input::HyprlandVirtualInputBackend>);
+
+impl HeldButton {
+    fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+
+    async fn release(&mut self) {
+        if let Some(backend) = self.0.take() {
+            let _ = backend.inject(left_up()).await;
+        }
+    }
+}
+
+impl Drop for HeldButton {
+    fn drop(&mut self) {
+        if let Some(backend) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let _ = backend.inject(left_up()).await;
+            });
+        }
+    }
+}
+
+fn left_up() -> edge_protocol::InputEvent {
+    edge_protocol::InputEvent::PointerButton {
+        button: edge_protocol::MouseButton::Left,
+        down: false,
+    }
+}
+
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_BACKSPACE: u16 = 14;
+const KEY_V: u16 = 47;
+
+/// The evdev code, and whether Shift is needed, for `c` on a US layout: the
+/// virtual keyboard's own fixed keymap, so the desktop's layout doesn't matter.
+fn us_key(c: char) -> Option<(u16, bool)> {
+    const LETTERS: [u16; 26] = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
+    const DIGITS: [u16; 10] = [11, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    Some(match c {
+        'a'..='z' => (LETTERS[c as usize - 'a' as usize], false),
+        'A'..='Z' => (LETTERS[c as usize - 'A' as usize], true),
+        '0'..='9' => (DIGITS[c as usize - '0' as usize], false),
+        ' ' => (57, false),
+        '\n' => (28, false),
+        '\t' => (15, false),
+        '-' => (12, false),
+        '_' => (12, true),
+        '=' => (13, false),
+        '+' => (13, true),
+        '[' => (26, false),
+        '{' => (26, true),
+        ']' => (27, false),
+        '}' => (27, true),
+        ';' => (39, false),
+        ':' => (39, true),
+        '\'' => (40, false),
+        '"' => (40, true),
+        '`' => (41, false),
+        '~' => (41, true),
+        '\\' => (43, false),
+        '|' => (43, true),
+        ',' => (51, false),
+        '<' => (51, true),
+        '.' => (52, false),
+        '>' => (52, true),
+        '/' => (53, false),
+        '?' => (53, true),
+        '!' => (2, true),
+        '@' => (3, true),
+        '#' => (4, true),
+        '$' => (5, true),
+        '%' => (6, true),
+        '^' => (7, true),
+        '&' => (8, true),
+        '*' => (9, true),
+        '(' => (10, true),
+        ')' => (11, true),
+        _ => return None,
+    })
+}
+
+/// Presses and releases `code`, holding each of `modifiers` around it. Every
+/// press is released, even if an earlier event fails.
+async fn press_key(
+    backend: &edge_linux_input::HyprlandVirtualInputBackend,
+    modifiers: &[u16],
+    code: u16,
+) -> Result<()> {
+    use edge_protocol::InputEvent::Key;
+    let mut results = Vec::new();
+    for &modifier in modifiers {
+        results.push(
+            backend
+                .inject(Key {
+                    evdev_code: modifier,
+                    down: true,
+                })
+                .await,
+        );
+    }
+    results.push(
+        backend
+            .inject(Key {
+                evdev_code: code,
+                down: true,
+            })
+            .await,
+    );
+    results.push(
+        backend
+            .inject(Key {
+                evdev_code: code,
+                down: false,
+            })
+            .await,
+    );
+    for &modifier in modifiers.iter().rev() {
+        results.push(
+            backend
+                .inject(Key {
+                    evdev_code: modifier,
+                    down: false,
+                })
+                .await,
+        );
+    }
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+/// Live typing: Backspaces, then `text` as key presses on the virtual
+/// keyboard. Characters a US layout can't type (emoji, accents) go through the
+/// clipboard and Ctrl+V, which needs the clipboard permission.
+async fn type_text(
+    backend: &edge_linux_input::HyprlandVirtualInputBackend,
+    backspaces: u8,
+    text: &str,
+    clipboard: Option<&ClipboardConfig>,
+) -> Result<()> {
+    ensure!(text.len() <= 256, "Type at most 256 UTF-8 bytes at once");
+    for _ in 0..backspaces {
+        press_key(backend, &[], KEY_BACKSPACE).await?;
+    }
+    let mut pasted = String::new();
+    let flush = async |pasted: &mut String| -> Result<()> {
+        if pasted.is_empty() {
+            return Ok(());
+        }
+        let config = clipboard.context("Typing this character needs the clipboard permission")?;
+        edge_linux_input::write_clipboard_text(config, pasted).await?;
+        pasted.clear();
+        press_key(backend, &[KEY_LEFTCTRL], KEY_V).await
+    };
+    for c in text.chars() {
+        match us_key(c) {
+            Some((code, shift)) => {
+                flush(&mut pasted).await?;
+                let modifiers: &[u16] = if shift { &[KEY_LEFTSHIFT] } else { &[] };
+                press_key(backend, modifiers, code).await?;
+            }
+            None => pasted.push(c),
+        }
+    }
+    flush(&mut pasted).await
+}
+
+/// Scroll and drag (phone-window-gestures-v1), after `apply_input`'s checks.
+/// Returns `None` for any other action.
+async fn apply_gesture(
+    frame: &SentFrame,
+    action: &RemoteAction,
+    pointer: &mut Option<edge_linux_input::HyprlandVirtualInputBackend>,
+    held: &mut HeldButton,
+) -> Option<Result<()>> {
+    let result = match *action {
+        RemoteAction::Scroll { x, y, dx, dy } => {
+            async {
+                ensure!(
+                    (dx != 0 || dy != 0) && dx.abs() <= 10 && dy.abs() <= 10,
+                    "Scroll at most 10 steps at a time"
+                );
+                move_pointer(frame, x, y, pointer).await?;
+                // The backend's wheel axis is inverted: positive y scrolls up.
+                pointer
+                    .as_ref()
+                    .unwrap()
+                    .inject(edge_protocol::InputEvent::PointerWheel {
+                        x: f64::from(dx),
+                        y: -f64::from(dy),
+                    })
+                    .await?;
+                Ok(())
+            }
+            .await
+        }
+        RemoteAction::DragStart { x, y } => {
+            async {
+                held.release().await;
+                move_pointer(frame, x, y, pointer).await?;
+                ensure!(
+                    same_target(&frame.window, &focused().await?),
+                    "Window changed; wait for a fresh image"
+                );
+                left_button(pointer, true).await?;
+                held.0 = pointer.clone();
+                Ok(())
+            }
+            .await
+        }
+        RemoteAction::DragMove { x, y } => {
+            async {
+                ensure!(held.is_held(), "No drag in progress");
+                move_pointer(frame, x, y, pointer).await
+            }
+            .await
+        }
+        RemoteAction::DragEnd { x, y } => {
+            async {
+                ensure!(held.is_held(), "No drag in progress");
+                let moved = move_pointer(frame, x, y, pointer).await;
+                held.release().await;
+                moved
+            }
+            .await
+        }
+        _ => return None,
+    };
+    if result.is_err() {
+        // Never leave the button held after a failed step.
+        held.release().await;
+    }
+    Some(result)
+}
+
 async fn apply_input(
     frame: &SentFrame,
     action: RemoteAction,
     clipboard: Option<&ClipboardConfig>,
     pointer: &mut Option<edge_linux_input::HyprlandVirtualInputBackend>,
+    held: &mut HeldButton,
 ) -> Result<()> {
+    if !frame.interactive || frame.sent.elapsed() >= Duration::from_secs(2) {
+        held.release().await;
+    }
     ensure!(frame.interactive, "Wait for the window to settle");
     ensure!(
         frame.sent.elapsed() < Duration::from_secs(2),
         "That image is too old; wait for a fresh frame"
     );
-    let current = focused().await?;
-    ensure!(
-        same_target(&frame.window, &current),
-        "Selected window changed; wait for a fresh frame"
-    );
+    let current = match focused().await {
+        Ok(current) => current,
+        Err(error) => {
+            held.release().await;
+            return Err(error);
+        }
+    };
+    if !same_target(&frame.window, &current) {
+        held.release().await;
+        bail!("Selected window changed; wait for a fresh frame");
+    }
+    if let Some(result) = apply_gesture(frame, &action, pointer, held).await {
+        return result;
+    }
+    if let RemoteAction::Type { backspaces, text } = &action {
+        if pointer.is_none() {
+            *pointer = Some(edge_linux_input::HyprlandVirtualInputBackend::connect()?);
+        }
+        return type_text(pointer.as_ref().unwrap(), *backspaces, text, clipboard).await;
+    }
     if let RemoteAction::Tap { x, y, right } = &action {
         let (x, y) = point(&frame.crop, *x, *y)?;
         let desktop = crate::phone_window_focus::desktop_bounds().await?;
@@ -867,16 +1180,22 @@ mod tests {
             key: RemoteKey::Enter,
         };
         assert!(
-            apply_input(&frame, action.clone(), None, &mut None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("settle")
+            apply_input(
+                &frame,
+                action.clone(),
+                None,
+                &mut None,
+                &mut HeldButton::default()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("settle")
         );
         frame.interactive = true;
         frame.sent = Instant::now() - Duration::from_secs(3);
         assert!(
-            apply_input(&frame, action, None, &mut None)
+            apply_input(&frame, action, None, &mut None, &mut HeldButton::default())
                 .await
                 .unwrap_err()
                 .to_string()
@@ -966,6 +1285,52 @@ mod tests {
             joined.extend(bytes);
         }
         assert_eq!(joined, vec![7; 200_000]);
+    }
+
+    #[test]
+    fn us_layout_covers_printable_ascii_and_nothing_else() {
+        for c in (' '..='~').chain(['\n', '\t']) {
+            assert!(us_key(c).is_some(), "{c:?}");
+        }
+        assert_eq!(us_key('a'), Some((30, false)));
+        assert_eq!(us_key('Q'), Some((16, true)));
+        assert_eq!(us_key('0'), Some((11, false)));
+        assert_eq!(us_key('?'), Some((53, true)));
+        assert_eq!(us_key('é'), None);
+        assert_eq!(us_key('😀'), None);
+        assert!(
+            guarded_lua(
+                &fixture(),
+                &RemoteAction::Type {
+                    backspaces: 1,
+                    text: "x".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_gestures_never_become_window_targeted_shortcuts() {
+        let window = fixture();
+        for action in [
+            RemoteAction::Scroll {
+                x: 1,
+                y: 1,
+                dx: 0,
+                dy: 3,
+            },
+            RemoteAction::DragStart { x: 1, y: 1 },
+            RemoteAction::DragMove { x: 2, y: 2 },
+            RemoteAction::DragEnd { x: 3, y: 3 },
+        ] {
+            assert!(guarded_lua(&window, &action).is_err(), "{action:?}");
+        }
+        // Nothing held: releasing and dropping are no-ops.
+        let mut held = HeldButton::default();
+        assert!(!held.is_held());
+        held.release().await;
+        drop(held);
     }
 
     #[test]

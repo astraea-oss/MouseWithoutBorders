@@ -31,7 +31,8 @@ use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
     HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
-    PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_NAVIGATION_EXTENSION, PHONE_WINDOW_VIDEO_EXTENSION,
+    PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_GESTURES_EXTENSION,
+    PHONE_WINDOW_NAVIGATION_EXTENSION, PHONE_WINDOW_TYPING_EXTENSION, PHONE_WINDOW_VIDEO_EXTENSION,
     PHONE_WINDOW_VIDEO_MODES_EXTENSION, PHONE_WINDOW_VIEW_CHUNKS_EXTENSION,
     PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent, RemoteAction, RemoteError,
     WindowFocusState,
@@ -227,6 +228,8 @@ impl LocalHello {
             PHONE_WINDOW_VIEW_EXTENSION.to_string(),
             PHONE_WINDOW_NAVIGATION_EXTENSION.to_string(),
             PHONE_WINDOW_VIEW_CHUNKS_EXTENSION.to_string(),
+            PHONE_WINDOW_GESTURES_EXTENSION.to_string(),
+            PHONE_WINDOW_TYPING_EXTENSION.to_string(),
         ];
         if crate::phone_remote_video::available() {
             extensions.push(PHONE_WINDOW_VIDEO_EXTENSION.to_string());

@@ -50,6 +50,12 @@ pub const REMOTE_VIEW_MAX_CHUNKED_EDGE: u16 = 4096;
 /// an HEVC stream ([`PhoneEvent::RemoteVideoFrame`]) instead of JPEG frames.
 /// Experimental; see the phone's docs/video-pipeline.md.
 pub const PHONE_WINDOW_VIDEO_EXTENSION: &str = "phone-window-video-v1";
+/// The receiver takes [`RemoteAction::Scroll`] and the `Drag*` actions. Phones
+/// send them only when this is advertised; older receivers reject them.
+pub const PHONE_WINDOW_GESTURES_EXTENSION: &str = "phone-window-gestures-v1";
+/// The receiver takes [`RemoteAction::Type`]. Phones send it only when this is
+/// advertised; older receivers reject it.
+pub const PHONE_WINDOW_TYPING_EXTENSION: &str = "phone-window-typing-v1";
 /// Both peers, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: the phone can switch a
 /// video view between Text and Media mode ([`PhoneEvent::RemoteVideoMode`]).
 pub const PHONE_WINDOW_VIDEO_MODES_EXTENSION: &str = "phone-window-video-modes-v1";
@@ -318,6 +324,40 @@ pub enum RemoteAction {
     Paste {
         text: String,
         terminal: bool,
+    },
+    /// Scroll at (`x`, `y`) by whole wheel steps; positive `dy` scrolls down
+    /// (content moves up), positive `dx` scrolls right. Each at most 10 steps.
+    /// Requires [`PHONE_WINDOW_GESTURES_EXTENSION`].
+    Scroll {
+        x: u16,
+        y: u16,
+        dx: i8,
+        dy: i8,
+    },
+    /// Press the left button at (`x`, `y`) and hold it. Requires
+    /// [`PHONE_WINDOW_GESTURES_EXTENSION`]; the receiver releases it if the
+    /// view ends first.
+    DragStart {
+        x: u16,
+        y: u16,
+    },
+    /// Move while the button is held.
+    DragMove {
+        x: u16,
+        y: u16,
+    },
+    /// Move to (`x`, `y`) and release.
+    DragEnd {
+        x: u16,
+        y: u16,
+    },
+    /// Live typing from the phone's keyboard: press Backspace `backspaces`
+    /// times, then type `text` (at most 256 UTF-8 bytes). An edit such as an
+    /// autocorrected word arrives as one of these. Requires
+    /// [`PHONE_WINDOW_TYPING_EXTENSION`].
+    Type {
+        backspaces: u8,
+        text: String,
     },
 }
 

@@ -389,14 +389,20 @@ mod tests {
     #[ignore = "requires Hyprland, screencopy and NVENC"]
     async fn source_streams_the_focused_window_in_both_modes() {
         for mode in [Mode::Text, Mode::Media] {
-            let control = Arc::new(Mutex::new(SourceControl { mode, restart: false }));
+            let control = Arc::new(Mutex::new(SourceControl {
+                mode,
+                restart: false,
+            }));
             let (tx, mut rx) = mpsc::channel(1);
             let task = tokio::spawn(source(control, tx));
             let started = Instant::now();
             let (mut frames, mut keyframes, mut bytes) = (0, 0, 0);
             let (mut capture, mut encode) = (Duration::ZERO, Duration::ZERO);
             while started.elapsed() < Duration::from_secs(4) {
-                let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await else { break };
+                let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+                else {
+                    break;
+                };
                 let frame = frame.unwrap();
                 frames += 1;
                 keyframes += u32::from(frame.keyframe);
