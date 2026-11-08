@@ -97,6 +97,7 @@ mod phone_audio;
 mod phone_pairing;
 #[cfg(target_os = "linux")]
 mod phone_projection;
+mod phone_remote_video;
 mod phone_remote_view;
 mod phone_window_focus;
 mod tray;

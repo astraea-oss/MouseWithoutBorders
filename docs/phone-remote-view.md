@@ -43,6 +43,16 @@ gesture yet; the arrow keys provide basic navigation.
   `RemoteViewFrameChunk`s of at most 56 KiB, followed by the `RemoteViewFrame`
   with an empty `jpeg`. Measured on a 1154×1428 window: about 115 KB per frame,
   about 235 KB/s at 2 fps, about 2% of one CPU core on the desktop.
+- With `phone-window-video-v1` as well (experimental; advertised only when
+  GStreamer has `nvh265enc`), the view is an HEVC stream instead: raw grim
+  captures (`-t ppm`, cropped to even sizes, rows padded to GStreamer's 4-byte
+  stride) are encoded by NVENC at up to 10 fps with constant quality, one
+  access unit per frame, sent as `RemoteVideoFrame` (chunked when large) with
+  the same metadata and input rules. The phone can ask for a keyframe with
+  `RemoteVideoKeyframe`. Measured on an 874×1428 text window: a 325 KB first
+  frame, then about 1 KB per frame; about 24 KB/s at 9 fps, about 9% of one
+  CPU core. Each view logs its fps, data rate, capture/encode time and ack
+  time every 10 seconds.
 - The receiver sends at most two frames per second. It waits for the phone's
   image-onload acknowledgement before another capture. Four seconds without an
   acknowledgement closes the stream. There is no accumulating video queue.

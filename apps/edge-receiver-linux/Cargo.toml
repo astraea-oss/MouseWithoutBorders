@@ -37,6 +37,8 @@ socket2 = { version = "0.6.4", features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+gstreamer = "0.25.4"
+gstreamer-app = "0.25.2"
 
 [dev-dependencies]
 tempfile.workspace = true

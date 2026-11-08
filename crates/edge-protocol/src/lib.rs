@@ -46,6 +46,12 @@ pub const REMOTE_VIEW_CHUNK_BYTES: usize = 56 * 1024;
 /// Per-frame budgets once chunks are negotiated.
 pub const REMOTE_VIEW_MAX_CHUNKED_JPEG: usize = 512 * 1024;
 pub const REMOTE_VIEW_MAX_CHUNKED_EDGE: u16 = 4096;
+/// Both peers, together with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: the view is
+/// an HEVC stream ([`PhoneEvent::RemoteVideoFrame`]) instead of JPEG frames.
+/// Experimental; see the phone's docs/video-pipeline.md.
+pub const PHONE_WINDOW_VIDEO_EXTENSION: &str = "phone-window-video-v1";
+/// One encoded video frame, after reassembly (a keyframe of a large window).
+pub const REMOTE_VIDEO_MAX_FRAME: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -252,6 +258,21 @@ pub enum PhoneEvent {
         total_bytes: u32,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
+    },
+    /// Receiver → phone, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: one HEVC access
+    /// unit (Annex B) in `frame.jpeg`, with the same metadata and frame-scoped
+    /// input rules as a JPEG frame. Empty means "the chunks just before". Frames
+    /// form one decoding chain per view; `keyframe` starts it, and `codec` is the
+    /// WebCodecs codec string.
+    RemoteVideoFrame {
+        frame: RemoteViewFrame,
+        keyframe: bool,
+        codec: String,
+    },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: the decoding
+    /// chain broke; start the next frame with a keyframe.
+    RemoteVideoKeyframe {
+        view_id: u64,
     },
 }
 

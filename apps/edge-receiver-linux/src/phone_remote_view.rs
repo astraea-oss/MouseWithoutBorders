@@ -26,6 +26,8 @@ enum CommandMessage {
     Ack(u64),
     Input(u64, RemoteAction),
     Size(u16, u16),
+    /// The phone's video decoding chain broke; restart it with a keyframe.
+    Keyframe,
 }
 
 /// What one capture may produce. Without chunks: the original single-message
@@ -37,6 +39,8 @@ pub(crate) struct CaptureLimits {
     pub max_edge: u16,
     /// The phone's frame in device pixels, when it has said.
     pub target: Option<(u16, u16)>,
+    /// Raw RGB for the video encoder instead of JPEG.
+    pub video: bool,
 }
 
 impl CaptureLimits {
@@ -46,12 +50,14 @@ impl CaptureLimits {
                 max_jpeg: REMOTE_VIEW_MAX_CHUNKED_JPEG,
                 max_edge: REMOTE_VIEW_MAX_CHUNKED_EDGE,
                 target: target.filter(|(w, h)| *w > 0 && *h > 0),
+                video: false,
             }
         } else {
             Self {
                 max_jpeg: REMOTE_VIEW_MAX_JPEG,
                 max_edge: REMOTE_VIEW_MAX_EDGE,
                 target: None,
+                video: false,
             }
         }
     }
@@ -88,6 +94,7 @@ impl RemoteView {
         control_state: Option<tokio::sync::watch::Receiver<crate::tray::TrayStatus>>,
         chunked: bool,
         size: Option<(u16, u16)>,
+        video: bool,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(8);
         let (sender, events) = mpsc::channel(2);
@@ -98,8 +105,12 @@ impl RemoteView {
                 clipboard,
                 _owner: owner,
                 control_state,
-                limits: CaptureLimits::new(chunked, size),
+                limits: CaptureLimits {
+                    video,
+                    ..CaptureLimits::new(chunked, size)
+                },
                 chunked,
+                video,
             },
             receiver,
             sender,
@@ -116,6 +127,11 @@ impl RemoteView {
 
     pub fn ack(&self, frame_id: u64) {
         let _ = self.commands.try_send(CommandMessage::Ack(frame_id));
+    }
+
+    /// The phone lost its video decoding chain.
+    pub fn keyframe(&self) {
+        let _ = self.commands.try_send(CommandMessage::Keyframe);
     }
 
     /// The phone's frame changed size, e.g. on rotation.
@@ -172,6 +188,79 @@ struct Worker {
     limits: CaptureLimits,
     /// The phone reassembles `RemoteViewFrameChunk`s.
     chunked: bool,
+    /// HEVC frames (`RemoteVideoFrame`) instead of JPEG.
+    video: bool,
+}
+
+/// Rolling numbers for the log: what a view costs per frame.
+#[derive(Default)]
+struct Stats {
+    frames: u32,
+    keyframes: u32,
+    bytes: usize,
+    capture: Duration,
+    encode: Duration,
+    acked: u32,
+    ack: Duration,
+    since: Option<Instant>,
+}
+
+impl Stats {
+    fn report(&mut self, view_id: u64, video: bool) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed();
+        if elapsed < Duration::from_secs(10) || self.frames == 0 {
+            return;
+        }
+        let per = |d: Duration, n: u32| d.as_secs_f64() * 1000.0 / f64::from(n.max(1));
+        tracing::info!(
+            view_id,
+            mode = if video { "hevc" } else { "jpeg" },
+            fps = format!("{:.1}", f64::from(self.frames) / elapsed.as_secs_f64()),
+            kb_per_s = (self.bytes as f64 / 1024.0 / elapsed.as_secs_f64()).round(),
+            kb_per_frame = (self.bytes as f64 / 1024.0 / f64::from(self.frames)).round(),
+            keyframes = self.keyframes,
+            capture_ms = format!("{:.1}", per(self.capture, self.frames)),
+            encode_ms = format!("{:.1}", per(self.encode, self.frames)),
+            ack_ms = format!("{:.1}", per(self.ack, self.acked)),
+            "remote view"
+        );
+        *self = Self {
+            since: Some(Instant::now()),
+            ..Self::default()
+        };
+    }
+}
+
+/// Encodes a raw capture, creating the encoder for a new size or after a
+/// keyframe request. The encoder runs on a blocking thread.
+async fn encode_video(
+    encoder: &mut Option<crate::phone_remote_video::Encoder>,
+    restart: &mut bool,
+    captured: Captured,
+) -> Result<(Captured, Option<(bool, String)>)> {
+    let (window, crop, rgb, width, height) = captured;
+    let (w, h) = (u32::from(width), u32::from(height));
+    let current = encoder
+        .take()
+        .filter(|e| e.width == w && e.height == h && !*restart);
+    *restart = false;
+    let (kept, result) = tokio::task::spawn_blocking(move || {
+        let mut encoder = match current {
+            Some(encoder) => encoder,
+            None => match crate::phone_remote_video::Encoder::new(w, h) {
+                Ok(encoder) => encoder,
+                Err(error) => return (None, Err(error)),
+            },
+        };
+        let result = encoder.encode(rgb);
+        (Some(encoder), result)
+    })
+    .await
+    .context("Video encoder stopped")?;
+    *encoder = kept;
+    let (data, keyframe, codec) = result?;
+    Ok(((window, crop, data, width, height), Some((keyframe, codec))))
 }
 
 async fn run<F, Fut>(
@@ -191,8 +280,13 @@ async fn run<F, Fut>(
         control_state,
         mut limits,
         chunked,
+        video,
     } = worker;
-    let mut pace = tokio::time::interval(Duration::from_millis(500));
+    // Video: up to 10 fps (Text mode). JPEG keeps its original 2 fps.
+    let mut pace = tokio::time::interval(Duration::from_millis(if video { 100 } else { 500 }));
+    let mut encoder = None;
+    let mut restart = false;
+    let mut stats = Stats::default();
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = None;
     let mut history: VecDeque<SentFrame> = VecDeque::new();
@@ -205,10 +299,16 @@ async fn run<F, Fut>(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(CommandMessage::Size(width, height)) => {
-                    limits = CaptureLimits::new(chunked, Some((width, height)));
+                    limits = CaptureLimits { video, ..CaptureLimits::new(chunked, Some((width, height))) };
                 }
+                Some(CommandMessage::Keyframe) => restart = true,
                 Some(CommandMessage::Ack(id)) => {
-                    if waiting.is_some_and(|(pending, _)| pending == id) { waiting = None; }
+                    if let Some((pending, sent)) = waiting && pending == id {
+                        stats.acked += 1;
+                        stats.ack += sent.elapsed();
+                        waiting = None;
+                        stats.report(view_id, video);
+                    }
                 }
                 Some(CommandMessage::Input(id, action)) => {
                     let result = match history.iter().find(|f| f.id == id) {
@@ -227,9 +327,17 @@ async fn run<F, Fut>(
                     }
                     continue;
                 }
+                let started = Instant::now();
                 let captured = capture_next(limits).await;
+                stats.capture += started.elapsed();
+                let started = Instant::now();
+                let captured = match captured {
+                    Ok(captured) if video => encode_video(&mut encoder, &mut restart, captured).await,
+                    other => other.map(|captured| (captured, None)),
+                };
+                stats.encode += started.elapsed();
                 match captured {
-                    Ok((window, crop, jpeg, width, height)) => {
+                    Ok(((window, crop, jpeg, width, height), encoded)) => {
                         if !previous.as_ref().is_some_and(|w| same_target(w, &window)) {
                             history.clear(); stable_since = Instant::now();
                         }
@@ -241,6 +349,8 @@ async fn run<F, Fut>(
                             captured_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             window: window.clone(), crop: crop.clone(), width, height, interactive, jpeg,
                         };
+                        stats.frames += 1;
+                        stats.bytes += frame.jpeg.len();
                         let (frame, chunks) = split_frame(frame, chunked);
                         history.push_back(SentFrame { id: next_id, window, crop, interactive, sent: Instant::now() });
                         while history.len() > 4 { history.pop_front(); }
@@ -249,7 +359,14 @@ async fn run<F, Fut>(
                         for chunk in chunks {
                             if events.send(chunk).await.is_err() { closed = true; break; }
                         }
-                        if closed || events.send(PhoneEvent::RemoteViewFrame(frame)).await.is_err() { break; }
+                        let event = match encoded {
+                            Some((keyframe, codec)) => {
+                                stats.keyframes += u32::from(keyframe);
+                                PhoneEvent::RemoteVideoFrame { frame, keyframe, codec }
+                            }
+                            None => PhoneEvent::RemoteViewFrame(frame),
+                        };
+                        if closed || events.send(event).await.is_err() { break; }
                         waiting = Some((next_id, Instant::now()));
                     }
                     Err(error) => {
@@ -309,6 +426,9 @@ async fn capture(limits: CaptureLimits) -> Result<(FocusedWindow, FocusRect, Vec
         .clone()
         .context("Selected window is outside the visible monitor")?;
     let mut scale = limits.scale(&crop, f64::from(before.monitor.scale_milli) / 1000.0);
+    if limits.video {
+        return capture_raw(before, crop, scale, limits.max_edge).await;
+    }
     for _ in 0..3 {
         let mut command = Command::new("grim");
         command
@@ -366,6 +486,59 @@ async fn capture(limits: CaptureLimits) -> Result<(FocusedWindow, FocusRect, Vec
         return Ok((after, crop, jpeg, width as u16, height as u16));
     }
     bail!("Captured image is too large; reduce the window size")
+}
+
+/// An uncompressed capture for the video encoder, cropped to even dimensions.
+async fn capture_raw(
+    before: FocusedWindow,
+    crop: FocusRect,
+    scale: f64,
+    max_edge: u16,
+) -> Result<Captured> {
+    let limit = (u64::from(max_edge) + 1).pow(2) * 3 + 64;
+    let mut command = Command::new("grim");
+    command
+        .args([
+            "-t",
+            "ppm",
+            "-s",
+            &format!("{scale:.6}"),
+            "-g",
+            &format!("{},{} {}x{}", crop.x, crop.y, crop.width, crop.height),
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let ppm = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut child = command
+            .spawn()
+            .context("Install grim on the computer to enable live view")?;
+        let mut ppm = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(limit + 1)
+            .read_to_end(&mut ppm)
+            .await?;
+        ensure!(ppm.len() as u64 <= limit, "Captured image is too large");
+        ensure!(child.wait().await?.success(), "Screen capture unavailable");
+        Ok::<_, anyhow::Error>(ppm)
+    })
+    .await
+    .context("Screen capture timed out")??;
+    let (width, height, rgb) = crate::phone_remote_video::rgb_from_ppm(&ppm)?;
+    ensure!(
+        width.max(height) <= u32::from(max_edge),
+        "Invalid captured dimensions"
+    );
+    let after = focused().await?;
+    ensure!(
+        same_target(&before, &after),
+        "Window moved; waiting for a stable image"
+    );
+    Ok((after, crop, rgb, width as u16, height as u16))
 }
 
 fn point(crop: &FocusRect, x: u16, y: u16) -> Result<(i64, i64)> {
@@ -621,6 +794,7 @@ mod tests {
                 control_state: None,
                 limits: CaptureLimits::new(false, None),
                 chunked: false,
+                video: false,
             },
             input,
             output,
