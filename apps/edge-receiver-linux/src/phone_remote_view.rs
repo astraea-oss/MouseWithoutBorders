@@ -343,7 +343,7 @@ fn guarded_lua(window: &FocusedWindow, action: &RemoteAction, crop: &FocusRect) 
         ),
     };
     Ok(format!(
-        "{guard}{movement}hl.dispatch(hl.dsp.send_shortcut({{mods='{mods}',key='{key}',window=w}}))"
+        "{guard}{movement}hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='down',window=w}})); hl.dispatch(hl.dsp.send_key_state({{mods='{mods}',key='{key}',state='up',window=w}}))"
     ))
 }
 
