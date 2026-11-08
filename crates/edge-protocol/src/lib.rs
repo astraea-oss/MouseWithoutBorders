@@ -31,8 +31,21 @@ pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
 pub const PHONE_WINDOW_FOCUS_EXTENSION: &str = "phone-window-focus-v1";
 /// Bounded, acknowledged JPEG remote view with frame-scoped actions.
 pub const PHONE_WINDOW_VIEW_EXTENSION: &str = "phone-window-view-v1";
+/// The receiver accepts the `Super*` [`RemoteKey`]s and delivers them as real
+/// key presses, so the compositor's own Super+arrow binds run. Phones only
+/// send them when this is advertised; older receivers reject unknown keys.
+pub const PHONE_WINDOW_NAVIGATION_EXTENSION: &str = "phone-window-navigation-v1";
 pub const REMOTE_VIEW_MAX_JPEG: usize = 48 * 1024;
 pub const REMOTE_VIEW_MAX_EDGE: u16 = 960;
+/// Both peers: frames may exceed one encrypted message, arriving as
+/// [`PhoneEvent::RemoteViewFrameChunk`]s, and the phone reports its frame size
+/// with [`PhoneEvent::RemoteViewSize`] so capture can match it.
+pub const PHONE_WINDOW_VIEW_CHUNKS_EXTENSION: &str = "phone-window-view-chunks-v1";
+/// Chunk payload: leaves room for the event and the Noise tag in 64 KiB.
+pub const REMOTE_VIEW_CHUNK_BYTES: usize = 56 * 1024;
+/// Per-frame budgets once chunks are negotiated.
+pub const REMOTE_VIEW_MAX_CHUNKED_JPEG: usize = 512 * 1024;
+pub const REMOTE_VIEW_MAX_CHUNKED_EDGE: u16 = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -222,6 +235,24 @@ pub enum PhoneEvent {
         view_id: u64,
         error: Option<String>,
     },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: the
+    /// on-screen frame in device pixels. Sent when it changes (rotation) and
+    /// kept for the session; capture never exceeds what the phone can show.
+    RemoteViewSize {
+        width: u16,
+        height: u16,
+    },
+    /// Receiver → phone, with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: part of a
+    /// JPEG too large for one message, in order from offset 0. The frame's
+    /// `RemoteViewFrame` follows with an empty `jpeg`, meaning "these chunks".
+    RemoteViewFrameChunk {
+        view_id: u64,
+        frame_id: u64,
+        offset: u32,
+        total_bytes: u32,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
 }
 
 /// One JPEG, small enough for a single encrypted message. No queued video backlog.
@@ -275,6 +306,25 @@ pub enum RemoteKey {
     Copy,
     Paste,
     AddressBar,
+    /// Super+arrow, sent through the compositor so its binds run (focus
+    /// navigation by default). Requires [`PHONE_WINDOW_NAVIGATION_EXTENSION`].
+    SuperLeft,
+    SuperRight,
+    SuperUp,
+    SuperDown,
+}
+
+impl RemoteKey {
+    /// The arrow's evdev code for a `Super*` key; `None` for every other key.
+    pub fn super_arrow(self) -> Option<u16> {
+        match self {
+            Self::SuperLeft => Some(105),
+            Self::SuperRight => Some(106),
+            Self::SuperUp => Some(103),
+            Self::SuperDown => Some(108),
+            _ => None,
+        }
+    }
 }
 
 /// Desktop logical coordinates, NOT encoded-video pixels. Negative origins are valid.
@@ -1499,6 +1549,20 @@ mod tests {
             "JPEG must use MessagePack binary encoding"
         );
         assert_eq!(decode_frame(&bytes).unwrap(), frame);
+        let chunk = Frame::Phone(PhoneEvent::RemoteViewFrameChunk {
+            view_id: u64::MAX,
+            frame_id: u64::MAX,
+            offset: u32::MAX,
+            total_bytes: u32::MAX,
+            bytes: vec![255; REMOTE_VIEW_CHUNK_BYTES],
+        });
+        let bytes = encode_frame(&chunk).unwrap();
+        assert!(
+            bytes.len() < MAX_SECURE_FRAME_BYTES,
+            "a chunk must fit one message"
+        );
+        assert_eq!(decode_frame(&bytes).unwrap(), chunk);
+        const _: () = assert!(REMOTE_VIEW_MAX_CHUNKED_JPEG <= MAX_FRAME_BYTES as usize);
     }
 
     #[test]

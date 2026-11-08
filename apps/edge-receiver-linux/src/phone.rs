@@ -31,7 +31,8 @@ use edge_crypto::{NoiseSession, PhoneFeature, PinStatus, PinStore, PinnedPhone};
 use edge_protocol::{
     AudioDirection, CLIPBOARD_IMAGE_EXTENSION, ClipboardCancelReason, ClipboardEvent, Frame,
     HYPR_PHONE_EXTENSION, Heartbeat, Hello, NOTIFICATIONS_EXTENSION, PHONE_AUDIO_INVITE_EXTENSION,
-    PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
+    PHONE_WINDOW_FOCUS_EXTENSION, PHONE_WINDOW_NAVIGATION_EXTENSION,
+    PHONE_WINDOW_VIEW_CHUNKS_EXTENSION, PHONE_WINDOW_VIEW_EXTENSION, PROTOCOL_VERSION, PhoneEvent,
     RemoteAction, RemoteError, WindowFocusState,
 };
 use edge_runtime::{SecureFrameReader, SecureFrameSession, SecureFrameWriter};
@@ -138,6 +139,7 @@ enum PhoneFrame {
     RemoteRequest(u64, bool, bool),
     RemoteAck(u64, u64),
     RemoteInput(u64, u64, RemoteAction),
+    RemoteSize(u16, u16),
     PairRequest(String),
     Unpair,
     NotAllowed(&'static str),
@@ -179,8 +181,12 @@ fn classify_phone_frame(frame: &Frame) -> PhoneFrame {
             frame_id,
             action,
         }) => PhoneFrame::RemoteInput(*view_id, *frame_id, action.clone()),
+        Frame::Phone(PhoneEvent::RemoteViewSize { width, height }) => {
+            PhoneFrame::RemoteSize(*width, *height)
+        }
         Frame::Phone(
             PhoneEvent::RemoteViewFrame(_)
+            | PhoneEvent::RemoteViewFrameChunk { .. }
             | PhoneEvent::RemoteViewStatus { .. }
             | PhoneEvent::RemoteViewInputResult { .. },
         ) => PhoneFrame::NotAllowed("RemoteViewOutput"),
@@ -209,6 +215,8 @@ impl LocalHello {
             HYPR_PHONE_EXTENSION.to_string(),
             PHONE_WINDOW_FOCUS_EXTENSION.to_string(),
             PHONE_WINDOW_VIEW_EXTENSION.to_string(),
+            PHONE_WINDOW_NAVIGATION_EXTENSION.to_string(),
+            PHONE_WINDOW_VIEW_CHUNKS_EXTENSION.to_string(),
         ];
         if notifications {
             extensions.push(NOTIFICATIONS_EXTENSION.to_string());
@@ -305,6 +313,8 @@ struct SessionContext {
     accepts_audio_invite: bool,
     accepts_window_focus: bool,
     accepts_remote_view: bool,
+    /// The phone reassembles chunked frames and reports its frame size.
+    accepts_remote_chunks: bool,
     remote_owner: Arc<tokio::sync::Mutex<()>>,
     tray: Option<ReceiverTrayHandle>,
 }
@@ -527,6 +537,8 @@ impl PhoneSessions {
             accepts_audio_invite: advertises(PHONE_AUDIO_INVITE_EXTENSION),
             accepts_window_focus: advertises(PHONE_WINDOW_FOCUS_EXTENSION),
             accepts_remote_view: advertises(PHONE_WINDOW_VIEW_EXTENSION),
+            accepts_remote_chunks: advertises(PHONE_WINDOW_VIEW_EXTENSION)
+                && advertises(PHONE_WINDOW_VIEW_CHUNKS_EXTENSION),
             remote_owner: self.remote_owner.clone(),
             tray: self.tray.clone(),
         };
@@ -858,6 +870,7 @@ async fn run_phone_session(
     let mut focus_sequence = 0_u64;
     let mut remote: Option<crate::phone_remote_view::RemoteView> = None;
     let mut remote_id = 0_u64;
+    let mut remote_size: Option<(u16, u16)> = None;
     let remote_clipboard = context
         .clipboard
         .as_ref()
@@ -1123,7 +1136,12 @@ async fn run_phone_session(
                         }
                         let active = enabled && error.is_none();
                         send(&mut writer, &Frame::Phone(PhoneEvent::RemoteViewStatus { view_id, active, control: active && control, error })).await?;
-                        if active { remote = Some(crate::phone_remote_view::RemoteView::start(view_id, control, remote_clipboard.clone(), owner, context.tray.as_ref().map(|t| t.status()))); }
+                        if active { remote = Some(crate::phone_remote_view::RemoteView::start(view_id, control, remote_clipboard.clone(), owner, context.tray.as_ref().map(|t| t.status()), context.accepts_remote_chunks, remote_size)); }
+                    }
+                    PhoneFrame::RemoteSize(width, height) => {
+                        anyhow::ensure!(context.accepts_remote_chunks, "remote view chunks were not negotiated");
+                        remote_size = Some((width, height));
+                        if let Some(view) = &remote { view.resize(width, height); }
                     }
                     PhoneFrame::RemoteAck(view_id, frame_id) => {
                         anyhow::ensure!(context.accepts_remote_view, "remote view was not negotiated");
@@ -1254,6 +1272,7 @@ pub(crate) async fn assert_history_failure_keeps_phone_connected(
             accepts_audio_invite: false,
             accepts_window_focus: false,
             accepts_remote_view: false,
+            accepts_remote_chunks: false,
             remote_owner: Arc::default(),
             tray: None,
         };
@@ -1493,6 +1512,7 @@ mod tests {
                 accepts_audio_invite: false,
                 accepts_window_focus,
                 accepts_remote_view,
+                accepts_remote_chunks: false,
                 remote_owner: Arc::default(),
                 tray: None,
             };

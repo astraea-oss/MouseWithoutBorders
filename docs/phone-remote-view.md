@@ -18,9 +18,9 @@ grants; re-pair or intentionally grant the new features while the receiver is
 stopped. `windowfocus`, `remoteview`, `remoteinput`, and `clipboard` are distinct
 permissions. Clipboard permission is required for the text composer's paste.
 
-On the phone, choose **Live view**, then **Touch on** when you want input.
-Tap to left-click, arm **Right click…** for a single right click, use the key
-buttons, or compose text and choose **Paste text**. Terminal paste uses
+On the phone, open the **Remote** tile, then switch **Touch** on when you want input.
+Tap to left-click, arm **Right** for a single right click, use **Super + arrows**
+to move between windows, or open the keyboard panel to compose text and paste. Terminal paste uses
 Ctrl+Shift+V. Pasting intentionally replaces the desktop clipboard. Fit/2× zoom
 and touch panning help with small targets. There is no drag or desktop scroll
 gesture yet; the arrow keys provide basic navigation.
@@ -35,6 +35,14 @@ gesture yet; the arrow keys provide basic navigation.
 - The longest encoded edge is at most 960 pixels; JPEG payloads are at most
   48 KiB. Oversized captures are retried at smaller sizes. The complete event
   fits one Noise message, tested with a maximum-length Unicode title.
+- With `phone-window-view-chunks-v1` (both peers advertise it), the phone
+  reports its on-screen frame in device pixels (`RemoteViewSize`, again on
+  rotation). Capture then covers that frame, as the phone's Fill mode does, but
+  never exceeds the window's native pixels; the longest edge is at most 4096
+  and a JPEG at most 512 KiB. Frames over 48 KiB are sent as ordered
+  `RemoteViewFrameChunk`s of at most 56 KiB, followed by the `RemoteViewFrame`
+  with an empty `jpeg`. Measured on a 1154×1428 window: about 115 KB per frame,
+  about 235 KB/s at 2 fps, about 2% of one CPU core on the desktop.
 - The receiver sends at most two frames per second. It waits for the phone's
   image-onload acknowledgement before another capture. Four seconds without an
   acknowledgement closes the stream. There is no accumulating video queue.
@@ -56,6 +64,14 @@ and bounds. Pointer motion uses the existing Wayland virtual input backend,
 with a compositor roundtrip and another focus/geometry check before clicking.
 This preserves client pointer coordinates. Key events use fixed Lua guards and
 target the selected window directly. Addresses must be hex; coordinates are bounded; keys come from an enum.
+
+Super+arrow (`super_left`/`right`/`up`/`down`) is the exception. A key sent to
+one window would bypass compositor binds, so these are pressed on the virtual
+keyboard after the same identity and freshness checks, and the user's own
+Super+arrow binds run (focus navigation by default). The receiver advertises
+this as `phone-window-navigation-v1`; phones send these keys only when it is
+present, because older receivers reject unknown keys. The view then follows
+the newly focused window.
 Phone-supplied text is written through the clipboard API, never interpolated
 into shell or Lua code. Every click/shortcut is a complete press/release; no
 persistent button or modifier holds are created.

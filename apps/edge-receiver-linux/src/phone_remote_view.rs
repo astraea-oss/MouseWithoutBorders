@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use edge_common::ClipboardConfig;
 use edge_protocol::{
-    FocusRect, FocusedWindow, PhoneEvent, REMOTE_VIEW_MAX_EDGE, REMOTE_VIEW_MAX_JPEG, RemoteAction,
+    FocusRect, FocusedWindow, PhoneEvent, REMOTE_VIEW_CHUNK_BYTES, REMOTE_VIEW_MAX_CHUNKED_EDGE,
+    REMOTE_VIEW_MAX_CHUNKED_JPEG, REMOTE_VIEW_MAX_EDGE, REMOTE_VIEW_MAX_JPEG, RemoteAction,
     RemoteKey, RemoteViewFrame, WindowFocusState,
 };
 use std::{
@@ -24,6 +25,49 @@ use tokio::{
 enum CommandMessage {
     Ack(u64),
     Input(u64, RemoteAction),
+    Size(u16, u16),
+}
+
+/// What one capture may produce. Without chunks: the original single-message
+/// budget. With chunks: up to the phone's on-screen size, never upscaled past
+/// the window's native pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CaptureLimits {
+    pub max_jpeg: usize,
+    pub max_edge: u16,
+    /// The phone's frame in device pixels, when it has said.
+    pub target: Option<(u16, u16)>,
+}
+
+impl CaptureLimits {
+    pub fn new(chunked: bool, target: Option<(u16, u16)>) -> Self {
+        if chunked {
+            Self {
+                max_jpeg: REMOTE_VIEW_MAX_CHUNKED_JPEG,
+                max_edge: REMOTE_VIEW_MAX_CHUNKED_EDGE,
+                target: target.filter(|(w, h)| *w > 0 && *h > 0),
+            }
+        } else {
+            Self {
+                max_jpeg: REMOTE_VIEW_MAX_JPEG,
+                max_edge: REMOTE_VIEW_MAX_EDGE,
+                target: None,
+            }
+        }
+    }
+
+    /// Image pixels per logical desktop pixel for `crop` on a monitor with
+    /// `native` (its output scale): enough to cover the phone's frame, as Fill
+    /// does, and no more than the desktop actually has.
+    fn scale(&self, crop: &FocusRect, native: f64) -> f64 {
+        let (width, height) = (f64::from(crop.width), f64::from(crop.height));
+        let fit_edge = f64::from(self.max_edge) / width.max(height);
+        let wanted = match self.target {
+            Some((w, h)) => (f64::from(w) / width).max(f64::from(h) / height),
+            None => fit_edge,
+        };
+        wanted.min(fit_edge).min(native.max(1.0))
+    }
 }
 
 pub(crate) struct RemoteView {
@@ -35,12 +79,15 @@ pub(crate) struct RemoteView {
 }
 
 impl RemoteView {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         view_id: u64,
         control: bool,
         clipboard: Option<ClipboardConfig>,
         owner: Option<OwnedMutexGuard<()>>,
         control_state: Option<tokio::sync::watch::Receiver<crate::tray::TrayStatus>>,
+        chunked: bool,
+        size: Option<(u16, u16)>,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(8);
         let (sender, events) = mpsc::channel(2);
@@ -51,6 +98,8 @@ impl RemoteView {
                 clipboard,
                 _owner: owner,
                 control_state,
+                limits: CaptureLimits::new(chunked, size),
+                chunked,
             },
             receiver,
             sender,
@@ -67,6 +116,11 @@ impl RemoteView {
 
     pub fn ack(&self, frame_id: u64) {
         let _ = self.commands.try_send(CommandMessage::Ack(frame_id));
+    }
+
+    /// The phone's frame changed size, e.g. on rotation.
+    pub fn resize(&self, width: u16, height: u16) {
+        let _ = self.commands.try_send(CommandMessage::Size(width, height));
     }
 
     pub fn input(&self, frame_id: u64, action: RemoteAction) -> Result<()> {
@@ -115,6 +169,9 @@ struct Worker {
     clipboard: Option<ClipboardConfig>,
     _owner: Option<OwnedMutexGuard<()>>,
     control_state: Option<tokio::sync::watch::Receiver<crate::tray::TrayStatus>>,
+    limits: CaptureLimits,
+    /// The phone reassembles `RemoteViewFrameChunk`s.
+    chunked: bool,
 }
 
 async fn run<F, Fut>(
@@ -123,7 +180,7 @@ async fn run<F, Fut>(
     events: mpsc::Sender<PhoneEvent>,
     mut capture_next: F,
 ) where
-    F: FnMut() -> Fut + Send,
+    F: FnMut(CaptureLimits) -> Fut + Send,
     Fut: std::future::Future<Output = Result<Captured>> + Send,
 {
     let Worker {
@@ -132,6 +189,8 @@ async fn run<F, Fut>(
         clipboard,
         _owner,
         control_state,
+        mut limits,
+        chunked,
     } = worker;
     let mut pace = tokio::time::interval(Duration::from_millis(500));
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -145,6 +204,9 @@ async fn run<F, Fut>(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
+                Some(CommandMessage::Size(width, height)) => {
+                    limits = CaptureLimits::new(chunked, Some((width, height)));
+                }
                 Some(CommandMessage::Ack(id)) => {
                     if waiting.is_some_and(|(pending, _)| pending == id) { waiting = None; }
                 }
@@ -165,7 +227,7 @@ async fn run<F, Fut>(
                     }
                     continue;
                 }
-                let captured = capture_next().await;
+                let captured = capture_next(limits).await;
                 match captured {
                     Ok((window, crop, jpeg, width, height)) => {
                         if !previous.as_ref().is_some_and(|w| same_target(w, &window)) {
@@ -179,10 +241,15 @@ async fn run<F, Fut>(
                             captured_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                             window: window.clone(), crop: crop.clone(), width, height, interactive, jpeg,
                         };
+                        let (frame, chunks) = split_frame(frame, chunked);
                         history.push_back(SentFrame { id: next_id, window, crop, interactive, sent: Instant::now() });
                         while history.len() > 4 { history.pop_front(); }
                         if last_error.take().is_some() && events.send(PhoneEvent::RemoteViewStatus { view_id, active: true, control, error: None }).await.is_err() { break; }
-                        if events.send(PhoneEvent::RemoteViewFrame(frame)).await.is_err() { break; }
+                        let mut closed = false;
+                        for chunk in chunks {
+                            if events.send(chunk).await.is_err() { closed = true; break; }
+                        }
+                        if closed || events.send(PhoneEvent::RemoteViewFrame(frame)).await.is_err() { break; }
                         waiting = Some((next_id, Instant::now()));
                     }
                     Err(error) => {
@@ -199,6 +266,29 @@ async fn run<F, Fut>(
     }
 }
 
+/// A frame too large for one message becomes ordered chunks, then the frame
+/// itself with an empty `jpeg`. Small frames, and phones without chunk
+/// support, keep the single-message form.
+fn split_frame(mut frame: RemoteViewFrame, chunked: bool) -> (RemoteViewFrame, Vec<PhoneEvent>) {
+    if !chunked || frame.jpeg.len() <= REMOTE_VIEW_MAX_JPEG {
+        return (frame, Vec::new());
+    }
+    let jpeg = std::mem::take(&mut frame.jpeg);
+    let total_bytes = jpeg.len() as u32;
+    let chunks = jpeg
+        .chunks(REMOTE_VIEW_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, bytes)| PhoneEvent::RemoteViewFrameChunk {
+            view_id: frame.view_id,
+            frame_id: frame.frame_id,
+            offset: (index * REMOTE_VIEW_CHUNK_BYTES) as u32,
+            total_bytes,
+            bytes: bytes.to_vec(),
+        })
+        .collect();
+    (frame, chunks)
+}
+
 async fn focused() -> Result<FocusedWindow> {
     let path = crate::phone_window_focus::socket_path().context("Hyprland session unavailable")?;
     let lock = crate::phone_window_focus::request(&path, b"j/locked").await?;
@@ -212,14 +302,13 @@ async fn focused() -> Result<FocusedWindow> {
     }
 }
 
-async fn capture() -> Result<(FocusedWindow, FocusRect, Vec<u8>, u16, u16)> {
+async fn capture(limits: CaptureLimits) -> Result<(FocusedWindow, FocusRect, Vec<u8>, u16, u16)> {
     let before = focused().await?;
     let crop = before
         .visible_bounds
         .clone()
         .context("Selected window is outside the visible monitor")?;
-    let mut scale = f64::from(REMOTE_VIEW_MAX_EDGE) / f64::from(crop.width.max(crop.height));
-    scale = scale.min(1.0);
+    let mut scale = limits.scale(&crop, f64::from(before.monitor.scale_milli) / 1000.0);
     for _ in 0..3 {
         let mut command = Command::new("grim");
         command
@@ -246,10 +335,10 @@ async fn capture() -> Result<(FocusedWindow, FocusRect, Vec<u8>, u16, u16)> {
                 .stdout
                 .take()
                 .unwrap()
-                .take(REMOTE_VIEW_MAX_JPEG as u64 + 1)
+                .take(limits.max_jpeg as u64 + 1)
                 .read_to_end(&mut jpeg)
                 .await?;
-            if jpeg.len() > REMOTE_VIEW_MAX_JPEG {
+            if jpeg.len() > limits.max_jpeg {
                 child.kill().await?;
                 return Ok(None);
             }
@@ -266,7 +355,7 @@ async fn capture() -> Result<(FocusedWindow, FocusRect, Vec<u8>, u16, u16)> {
             .with_guessed_format()?
             .into_dimensions()?;
         ensure!(
-            width > 0 && height > 0 && width.max(height) <= u32::from(REMOTE_VIEW_MAX_EDGE),
+            width > 0 && height > 0 && width.max(height) <= u32::from(limits.max_edge),
             "Invalid captured dimensions"
         );
         let after = focused().await?;
@@ -305,7 +394,54 @@ fn shortcut(key: RemoteKey) -> (&'static str, &'static str) {
         RemoteKey::Copy => ("CTRL", "c"),
         RemoteKey::Paste => ("CTRL", "v"),
         RemoteKey::AddressBar => ("CTRL", "l"),
+        // Delivered as real key presses in `apply_input`, never to one window.
+        RemoteKey::SuperLeft
+        | RemoteKey::SuperRight
+        | RemoteKey::SuperUp
+        | RemoteKey::SuperDown => ("SUPER", ""),
     }
+}
+
+const KEY_LEFTMETA: u16 = 125;
+
+/// Presses Super+arrow on the virtual keyboard. Unlike `send_key_state` to a
+/// window, this goes through the compositor, so the user's own Super+arrow
+/// binds run (focus navigation by default). Every press is released, even if
+/// an earlier event fails.
+async fn press_super_arrow(
+    backend: &edge_linux_input::HyprlandVirtualInputBackend,
+    arrow: u16,
+) -> Result<()> {
+    use edge_protocol::InputEvent::Key;
+    let meta_down = backend
+        .inject(Key {
+            evdev_code: KEY_LEFTMETA,
+            down: true,
+        })
+        .await;
+    let arrow_down = backend
+        .inject(Key {
+            evdev_code: arrow,
+            down: true,
+        })
+        .await;
+    let arrow_up = backend
+        .inject(Key {
+            evdev_code: arrow,
+            down: false,
+        })
+        .await;
+    let meta_up = backend
+        .inject(Key {
+            evdev_code: KEY_LEFTMETA,
+            down: false,
+        })
+        .await;
+    meta_down?;
+    arrow_down?;
+    arrow_up?;
+    meta_up?;
+    Ok(())
 }
 
 fn window_guard(window: &FocusedWindow) -> Result<String> {
@@ -326,6 +462,9 @@ fn guarded_lua(window: &FocusedWindow, action: &RemoteAction) -> Result<String> 
     let guard = window_guard(window)?;
     let (mods, key, target) = match action {
         RemoteAction::Tap { .. } => bail!("Pointer actions use the Wayland input backend"),
+        RemoteAction::Key { key } if key.super_arrow().is_some() => {
+            bail!("Super+arrow uses the Wayland input backend")
+        }
         RemoteAction::Key { key } => {
             let (mods, key) = shortcut(*key);
             (mods, key, ",window=w")
@@ -410,6 +549,14 @@ async fn apply_input(
         up?;
         return Ok(());
     }
+    if let RemoteAction::Key { key } = &action
+        && let Some(arrow) = key.super_arrow()
+    {
+        if pointer.is_none() {
+            *pointer = Some(edge_linux_input::HyprlandVirtualInputBackend::connect()?);
+        }
+        return press_super_arrow(pointer.as_ref().unwrap(), arrow).await;
+    }
     if let RemoteAction::Paste { text, .. } = &action {
         ensure!(
             !text.is_empty() && text.len() <= 2048,
@@ -472,10 +619,12 @@ mod tests {
                 clipboard: None,
                 _owner: None,
                 control_state: None,
+                limits: CaptureLimits::new(false, None),
+                chunked: false,
             },
             input,
             output,
-            || {
+            |_| {
                 let window = fixture();
                 std::future::ready(Ok((
                     window.clone(),
@@ -560,6 +709,98 @@ mod tests {
     }
 
     #[test]
+    fn capture_scale_covers_the_phone_frame_without_upscaling_the_desktop() {
+        let crop = |width, height| FocusRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        // Old phones: the 960 px single-message budget, never above native.
+        let old = CaptureLimits::new(false, Some((1080, 1830)));
+        assert_eq!(old.target, None);
+        assert!((old.scale(&crop(1920, 1080), 1.0) - 0.5).abs() < 1e-9);
+        assert_eq!(old.scale(&crop(400, 300), 1.0), 1.0);
+        let phone = CaptureLimits::new(true, Some((1080, 1830)));
+        // A tall window is shown at native size: Fill would enlarge it.
+        assert_eq!(phone.scale(&crop(875, 1428), 1.0), 1.0);
+        // HiDPI monitors give their physical pixels.
+        assert_eq!(phone.scale(&crop(875, 1428), 2.0), 1830.0 / 1428.0);
+        // A huge window only needs enough to cover the frame.
+        assert!((phone.scale(&crop(3440, 4000), 1.0) - 1830.0 / 4000.0).abs() < 1e-9);
+        // The edge cap still applies.
+        let wide = CaptureLimits::new(true, Some((4000, 4000)));
+        assert!(wide.scale(&crop(8000, 1000), 4.0) * 8000.0 <= 4096.0 + 1e-6);
+    }
+
+    #[test]
+    fn large_frames_split_into_ordered_chunks_only_for_chunk_phones() {
+        let frame = |len| RemoteViewFrame {
+            view_id: 2,
+            frame_id: 5,
+            captured_at_ms: 0,
+            window: fixture(),
+            crop: fixture().bounds,
+            width: 10,
+            height: 10,
+            interactive: false,
+            jpeg: vec![7; len],
+        };
+        let (whole, chunks) = split_frame(frame(REMOTE_VIEW_MAX_JPEG), true);
+        assert!(chunks.is_empty() && whole.jpeg.len() == REMOTE_VIEW_MAX_JPEG);
+        let (whole, chunks) = split_frame(frame(200_000), false);
+        assert!(chunks.is_empty() && whole.jpeg.len() == 200_000);
+        let (last, chunks) = split_frame(frame(200_000), true);
+        assert!(last.jpeg.is_empty());
+        assert_eq!(
+            chunks.len(),
+            200_000_usize.div_ceil(REMOTE_VIEW_CHUNK_BYTES)
+        );
+        let mut joined = Vec::new();
+        for chunk in chunks {
+            let PhoneEvent::RemoteViewFrameChunk {
+                view_id: 2,
+                frame_id: 5,
+                offset,
+                total_bytes: 200_000,
+                bytes,
+            } = chunk
+            else {
+                panic!("unexpected chunk {chunk:?}");
+            };
+            assert_eq!(offset as usize, joined.len());
+            assert!(bytes.len() <= REMOTE_VIEW_CHUNK_BYTES);
+            joined.extend(bytes);
+        }
+        assert_eq!(joined, vec![7; 200_000]);
+    }
+
+    #[test]
+    fn super_arrows_never_become_window_targeted_shortcuts() {
+        let window = fixture();
+        for (key, code) in [
+            (RemoteKey::SuperLeft, 105),
+            (RemoteKey::SuperRight, 106),
+            (RemoteKey::SuperUp, 103),
+            (RemoteKey::SuperDown, 108),
+        ] {
+            assert_eq!(key.super_arrow(), Some(code));
+            // A window-targeted send_key_state would bypass the user's binds.
+            assert!(guarded_lua(&window, &RemoteAction::Key { key }).is_err());
+        }
+        assert_eq!(RemoteKey::Left.super_arrow(), None);
+        assert!(
+            guarded_lua(
+                &window,
+                &RemoteAction::Key {
+                    key: RemoteKey::Left
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn maps_edges_and_negative_origins_without_leaving_crop() {
         let crop = FocusRect {
             x: -960,
@@ -575,7 +816,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a running Hyprland session and grim"]
     async fn live_cropped_capture() {
-        let (_, crop, jpeg, width, height) = capture().await.unwrap();
+        let (_, crop, jpeg, width, height) =
+            capture(CaptureLimits::new(false, None)).await.unwrap();
         assert!(jpeg.len() <= REMOTE_VIEW_MAX_JPEG);
         assert!(width.max(height) <= REMOTE_VIEW_MAX_EDGE);
         println!(
