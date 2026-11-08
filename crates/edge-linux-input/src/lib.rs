@@ -87,6 +87,10 @@ impl HyprlandVirtualInputBackend {
         Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
     }
 
+    pub async fn move_absolute(&self, _x: u32, _y: u32, _width: u32, _height: u32) -> Result<()> {
+        Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
+    }
+
     pub async fn all_keys_up(&self) -> Result<()> {
         Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
     }

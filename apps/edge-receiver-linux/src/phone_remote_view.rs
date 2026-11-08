@@ -135,6 +135,7 @@ async fn run<F, Fut>(
     } = worker;
     let mut pace = tokio::time::interval(Duration::from_millis(500));
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pointer = None;
     let mut history: VecDeque<SentFrame> = VecDeque::new();
     let mut waiting: Option<(u64, Instant)> = None;
     let mut next_id = 0;
@@ -149,7 +150,7 @@ async fn run<F, Fut>(
                 }
                 Some(CommandMessage::Input(id, action)) => {
                     let result = match history.iter().find(|f| f.id == id) {
-                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref()).await,
+                        Some(frame) if control && control_state.as_ref().is_some_and(|s| !s.borrow().remote_input_busy) => apply_input(frame, action, clipboard.as_ref(), &mut pointer).await,
                         _ => Err(anyhow::anyhow!("That image is no longer current")),
                     };
                     if events.send(PhoneEvent::RemoteViewInputResult { view_id, error: result.err().map(|e| e.to_string()) }).await.is_err() { break; }
@@ -321,15 +322,10 @@ fn window_guard(window: &FocusedWindow) -> Result<String> {
     ))
 }
 
-fn guarded_lua(window: &FocusedWindow, action: &RemoteAction, crop: &FocusRect) -> Result<String> {
+fn guarded_lua(window: &FocusedWindow, action: &RemoteAction) -> Result<String> {
     let guard = window_guard(window)?;
     let (mods, key, target) = match action {
-        // Passing a window to Hyprland's pointer shortcut resets local pointer
-        // coordinates. Pointer focus is established by the separately guarded warp.
-        RemoteAction::Tap { x, y, right } => {
-            point(crop, *x, *y)?;
-            ("", if *right { "mouse:273" } else { "mouse:272" }, "")
-        }
+        RemoteAction::Tap { .. } => bail!("Pointer actions use the Wayland input backend"),
         RemoteAction::Key { key } => {
             let (mods, key) = shortcut(*key);
             (mods, key, ",window=w")
@@ -367,6 +363,7 @@ async fn apply_input(
     frame: &SentFrame,
     action: RemoteAction,
     clipboard: Option<&ClipboardConfig>,
+    pointer: &mut Option<edge_linux_input::HyprlandVirtualInputBackend>,
 ) -> Result<()> {
     ensure!(frame.interactive, "Wait for the window to settle");
     ensure!(
@@ -378,20 +375,40 @@ async fn apply_input(
         same_target(&frame.window, &current),
         "Selected window changed; wait for a fresh frame"
     );
-    if let RemoteAction::Tap { x, y, .. } = &action {
+    if let RemoteAction::Tap { x, y, right } = &action {
         let (x, y) = point(&frame.crop, *x, *y)?;
-        let guard = window_guard(&frame.window)?;
-        let path =
-            crate::phone_window_focus::socket_path().context("Hyprland session unavailable")?;
-        eval(&path,&format!("{guard}hl.dispatch(hl.dsp.cursor.move({{x={x},y={y}}})); assert(hl.get_active_window()==w,'Focus changed')")).await?;
-        // Let the compositor send pointer motion before its button event. Otherwise
-        // GTK/Wayland clients can receive a click at the previous pointer position.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let desktop = crate::phone_window_focus::desktop_bounds().await?;
+        let dx = u32::try_from(x - i64::from(desktop.x))?;
+        let dy = u32::try_from(y - i64::from(desktop.y))?;
+        if pointer.is_none() {
+            *pointer = Some(edge_linux_input::HyprlandVirtualInputBackend::connect()?);
+        }
+        let backend = pointer.as_ref().unwrap();
+        backend
+            .move_absolute(dx, dy, desktop.width, desktop.height)
+            .await?;
         ensure!(
             frame.sent.elapsed() < Duration::from_secs(2)
                 && same_target(&frame.window, &focused().await?),
             "Window changed; wait for a fresh image"
         );
+        let button = if *right {
+            edge_protocol::MouseButton::Right
+        } else {
+            edge_protocol::MouseButton::Left
+        };
+        let down = backend
+            .inject(edge_protocol::InputEvent::PointerButton { button, down: true })
+            .await;
+        let up = backend
+            .inject(edge_protocol::InputEvent::PointerButton {
+                button,
+                down: false,
+            })
+            .await;
+        down?;
+        up?;
+        return Ok(());
     }
     if let RemoteAction::Paste { text, .. } = &action {
         ensure!(
@@ -401,7 +418,7 @@ async fn apply_input(
         let config = clipboard.context("This phone does not have clipboard permission")?;
         edge_linux_input::write_clipboard_text(config, text).await?;
     }
-    let script = guarded_lua(&frame.window, &action, &frame.crop)?;
+    let script = guarded_lua(&frame.window, &action)?;
     eval(
         &crate::phone_window_focus::socket_path().context("Hyprland session unavailable")?,
         &script,
@@ -508,7 +525,7 @@ mod tests {
             key: RemoteKey::Enter,
         };
         assert!(
-            apply_input(&frame, action.clone(), None)
+            apply_input(&frame, action.clone(), None, &mut None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -517,7 +534,7 @@ mod tests {
         frame.interactive = true;
         frame.sent = Instant::now() - Duration::from_secs(3);
         assert!(
-            apply_input(&frame, action, None)
+            apply_input(&frame, action, None, &mut None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -532,11 +549,11 @@ mod tests {
             text: "'); os.execute('bad'); --".into(),
             terminal: false,
         };
-        let script = guarded_lua(&window, &action, &window.bounds).unwrap();
+        let script = guarded_lua(&window, &action).unwrap();
         assert!(!script.contains("os.execute"));
         assert!(script.contains("window=w") && script.contains("w.address=='0x123'"));
         window.address = "0x123';bad()".into();
-        assert!(guarded_lua(&window, &action, &window.bounds).is_err());
+        assert!(guarded_lua(&window, &action).is_err());
         let mut moved = fixture();
         moved.bounds.x += 1;
         assert!(!same_target(&fixture(), &moved));

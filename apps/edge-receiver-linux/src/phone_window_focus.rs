@@ -124,6 +124,51 @@ pub(crate) async fn sample(path: &Path) -> Result<WindowFocusState> {
     parse(window, monitors)
 }
 
+pub(crate) async fn desktop_bounds() -> Result<FocusRect> {
+    let path = socket_path().context("Hyprland session unavailable")?;
+    let monitors: Vec<Monitor> = serde_json::from_value(request(&path, b"j/monitors").await?)?;
+    let mut rects = Vec::new();
+    for m in monitors {
+        if !m.scale.is_finite()
+            || !(0.25..=8.0).contains(&m.scale)
+            || m.transform > 7
+            || m.width == 0
+            || m.height == 0
+        {
+            bail!("invalid monitor geometry");
+        }
+        let (w, h) = if m.transform % 2 == 1 {
+            (m.height, m.width)
+        } else {
+            (m.width, m.height)
+        };
+        rects.push(FocusRect {
+            x: m.x,
+            y: m.y,
+            width: (f64::from(w) / m.scale).round() as u32,
+            height: (f64::from(h) / m.scale).round() as u32,
+        });
+    }
+    let x = rects.iter().map(|r| r.x).min().context("no monitors")?;
+    let y = rects.iter().map(|r| r.y).min().unwrap();
+    let right = rects
+        .iter()
+        .map(|r| i64::from(r.x) + i64::from(r.width))
+        .max()
+        .unwrap();
+    let bottom = rects
+        .iter()
+        .map(|r| i64::from(r.y) + i64::from(r.height))
+        .max()
+        .unwrap();
+    Ok(FocusRect {
+        x,
+        y,
+        width: u32::try_from(right - i64::from(x))?,
+        height: u32::try_from(bottom - i64::from(y))?,
+    })
+}
+
 fn no_window(window: &serde_json::Value) -> bool {
     window.as_object().is_some_and(|o| o.is_empty())
         || window

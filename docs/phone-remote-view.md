@@ -52,9 +52,10 @@ Actions refer to a displayed frame. Unknown frames, frames older than two second
 and unsettled geometry are rejected. Input is initially disabled until geometry
 has stayed unchanged for one second. Capture rechecks window identity and bounds
 before and after taking the image. Input rechecks identity, monitor, workspace,
-and bounds, then runs fixed Lua guards on Hyprland's event loop. Pointer
-motion is sent before the click, with a brief settle and another target check;
-key events target the selected window directly. Addresses must be hex; coordinates are bounded; keys come from an enum.
+and bounds. Pointer motion uses the existing Wayland virtual input backend,
+with a compositor roundtrip and another focus/geometry check before clicking.
+This preserves client pointer coordinates. Key events use fixed Lua guards and
+target the selected window directly. Addresses must be hex; coordinates are bounded; keys come from an enum.
 Phone-supplied text is written through the clipboard API, never interpolated
 into shell or Lua code. Every click/shortcut is a complete press/release; no
 persistent button or modifier holds are created.
