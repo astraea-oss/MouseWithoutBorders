@@ -47,6 +47,15 @@ const PORTAL_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CAPTURE_OWNER_LEASE: Duration = Duration::from_secs(3);
 const CAPTURE_LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const FAILSAFE_PORTAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the compositor may keep delivering captured input while this
+/// backend has no active capture before the portal session is force-closed.
+/// Short enough that a wedged grab heals itself without user action, long
+/// enough to tolerate the EIS stream racing ahead of the D-Bus `Activated`
+/// signal.
+const STRAY_INPUT_LIMIT: Duration = Duration::from_millis(1500);
+/// Upper bound for [`PortalCaptureBackend::close`]: release, disable and
+/// session close each have a two second portal timeout.
+const CAPTURE_CLOSE_TIMEOUT: Duration = Duration::from_secs(7);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureEvent {
@@ -223,6 +232,24 @@ impl PortalCaptureBackend {
             .await
             .map_err(|_| capture_task_closed())?;
         receiver.await.map_err(|_| capture_task_closed())?
+    }
+
+    /// Shuts the capture down and waits until its portal session is closed.
+    /// Closing the session is the strongest way to make the compositor give
+    /// keyboard and pointer input back, so callers use this when a release or
+    /// disable could not be confirmed.
+    pub async fn close(mut self) {
+        self.owner_lease.clear();
+        let _ = time::timeout(
+            CAPTURE_CLOSE_TIMEOUT,
+            self.command_tx.send(CaptureCommand::Shutdown),
+        )
+        .await;
+        // The worker drops its event sender only after its session teardown.
+        let _ = time::timeout(CAPTURE_CLOSE_TIMEOUT, async {
+            while self.event_rx.recv().await.is_some() {}
+        })
+        .await;
     }
 
     pub async fn release_and_disarm(&self, cursor_position: Option<(f64, f64)>) -> Result<()> {
@@ -495,6 +522,10 @@ async fn run_portal_capture(
     let mut activation_id = None;
     let mut input_state = CaptureInputState::default();
     let mut armed = false;
+    // First captured input event seen while no capture is active. If the
+    // compositor keeps grabbing after a Release/Disable it reported as
+    // successful, local input would otherwise be swallowed indefinitely.
+    let mut stray_input_since: Option<Instant> = None;
     let mut lease_watchdog = time::interval(CAPTURE_LEASE_CHECK_INTERVAL);
     lease_watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -629,6 +660,7 @@ async fn run_portal_capture(
             Some(activated) = activated_events.next() => {
                 if let Some(id) = activated.activation_id() {
                     activation_id = Some(id);
+                    stray_input_since = None;
                     if let Some((edge, normalized_position)) = activated
                         .barrier_id()
                         .and_then(|barrier| barrier_metadata(barrier, &barriers))
@@ -645,7 +677,30 @@ async fn run_portal_capture(
                             edge,
                             normalized_position,
                         });
+                    } else {
+                        // Nothing upstream learns about an activation without
+                        // a known barrier, so it would hold local input with no
+                        // owner. Hand it straight back.
+                        tracing::warn!(
+                            activation_id = id,
+                            barrier_id = ?activated.barrier_id(),
+                            "InputCapture activated on an unknown barrier; releasing it"
+                        );
+                        let result = portal_command(
+                            "Release for unknown barrier",
+                            input_capture.release(
+                                &session,
+                                ReleaseOptions::default().set_activation_id(id),
+                            ),
+                        )
+                        .await;
+                        if result.is_ok() {
+                            activation_id = None;
+                        }
+                        result?;
                     }
+                } else {
+                    tracing::warn!("InputCapture activated without an activation id; it cannot be released by id");
                 }
             }
             Some(_deactivated) = deactivated_events.next() => {
@@ -699,6 +754,29 @@ async fn run_portal_capture(
                 match handle_eis_event(&context, &mut input_state, event)? {
                     EisAction::None => {}
                     EisAction::Input(input) => {
+                        if activation_id.is_some() || input == InputEvent::AllKeysUp {
+                            stray_input_since = None;
+                        } else {
+                            let since = *stray_input_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= STRAY_INPUT_LIMIT {
+                                tracing::error!(
+                                    armed,
+                                    stray_milliseconds = since.elapsed().as_millis(),
+                                    "compositor kept delivering captured input with no active capture; closing the portal session to restore local input"
+                                );
+                                armed = false;
+                                owner_lease.clear();
+                                input_state.clear();
+                                let _ = event_tx.send(CaptureEvent::Input(InputEvent::AllKeysUp));
+                                force_close_portal_capture(&input_capture, &session, &mut activation_id)
+                                    .await;
+                                let _ = event_tx.send(CaptureEvent::EmergencyReleased);
+                                break Err(LinuxInputError::LibeiInit(
+                                    "compositor kept capturing local input after it was released; portal session was closed to restore local input"
+                                        .to_string(),
+                                ));
+                            }
+                        }
                         let _ = event_tx.send(CaptureEvent::Input(input));
                     }
                     EisAction::EmergencyRelease => {
