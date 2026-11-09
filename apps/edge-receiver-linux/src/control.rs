@@ -334,6 +334,7 @@ mod tests {
     #[test]
     fn status_reply_lists_the_status_then_diagnostics() {
         let status = TrayStatus {
+            remote_input_busy: false,
             summary: "Main PC is controlling this computer · 4 ms".to_string(),
             connected: true,
             peer: Some("Main PC".to_string()),

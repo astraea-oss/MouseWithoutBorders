@@ -27,6 +27,40 @@ pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
 /// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
 /// it to start a stream.
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
+/// Opt-in focused-window metadata. Does not grant capture or input access.
+pub const PHONE_WINDOW_FOCUS_EXTENSION: &str = "phone-window-focus-v1";
+/// Bounded, acknowledged JPEG remote view with frame-scoped actions.
+pub const PHONE_WINDOW_VIEW_EXTENSION: &str = "phone-window-view-v1";
+/// The receiver accepts the `Super*` [`RemoteKey`]s and delivers them as real
+/// key presses, so the compositor's own Super+arrow binds run. Phones only
+/// send them when this is advertised; older receivers reject unknown keys.
+pub const PHONE_WINDOW_NAVIGATION_EXTENSION: &str = "phone-window-navigation-v1";
+pub const REMOTE_VIEW_MAX_JPEG: usize = 48 * 1024;
+pub const REMOTE_VIEW_MAX_EDGE: u16 = 960;
+/// Both peers: frames may exceed one encrypted message, arriving as
+/// [`PhoneEvent::RemoteViewFrameChunk`]s, and the phone reports its frame size
+/// with [`PhoneEvent::RemoteViewSize`] so capture can match it.
+pub const PHONE_WINDOW_VIEW_CHUNKS_EXTENSION: &str = "phone-window-view-chunks-v1";
+/// Chunk payload: leaves room for the event and the Noise tag in 64 KiB.
+pub const REMOTE_VIEW_CHUNK_BYTES: usize = 56 * 1024;
+/// Per-frame budgets once chunks are negotiated.
+pub const REMOTE_VIEW_MAX_CHUNKED_JPEG: usize = 512 * 1024;
+pub const REMOTE_VIEW_MAX_CHUNKED_EDGE: u16 = 4096;
+/// Both peers, together with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: the view is
+/// an HEVC stream ([`PhoneEvent::RemoteVideoFrame`]) instead of JPEG frames.
+/// Experimental; see the phone's docs/video-pipeline.md.
+pub const PHONE_WINDOW_VIDEO_EXTENSION: &str = "phone-window-video-v1";
+/// The receiver takes [`RemoteAction::Scroll`] and the `Drag*` actions. Phones
+/// send them only when this is advertised; older receivers reject them.
+pub const PHONE_WINDOW_GESTURES_EXTENSION: &str = "phone-window-gestures-v1";
+/// The receiver takes [`RemoteAction::Type`]. Phones send it only when this is
+/// advertised; older receivers reject it.
+pub const PHONE_WINDOW_TYPING_EXTENSION: &str = "phone-window-typing-v1";
+/// Both peers, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: the phone can switch a
+/// video view between Text and Media mode ([`PhoneEvent::RemoteVideoMode`]).
+pub const PHONE_WINDOW_VIDEO_MODES_EXTENSION: &str = "phone-window-video-modes-v1";
+/// One encoded video frame, after reassembly (a keyframe of a large window).
+pub const REMOTE_VIDEO_MAX_FRAME: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -143,7 +177,9 @@ pub enum PairingEvent {
 pub enum PhoneEvent {
     /// Phone → receiver, as the first frame after the receiver's `Hello`.
     /// The phone's name comes from its `Hello`.
-    PairRequest { token: String },
+    PairRequest {
+        token: String,
+    },
     /// Receiver → phone: the phone is pinned. Also sent when an already
     /// pinned phone repeats its request, so a lost reply is recovered by
     /// asking again.
@@ -169,11 +205,240 @@ pub enum PhoneEvent {
         jitter_target_ms: u16,
     },
     /// Either way: the stream ended, and why.
-    AudioStopped { reason: String },
+    AudioStopped {
+        reason: String,
+    },
     /// Receiver → phone: please start a stream this way by sending an
     /// `AudioRequest`, which keeps the phone's firewall path working. Only
     /// sent to phones advertising [`PHONE_AUDIO_INVITE_EXTENSION`].
-    AudioInvite { direction: AudioDirection },
+    AudioInvite {
+        direction: AudioDirection,
+    },
+    /// Phone → receiver. Only with phone-window-focus-v1; off by default.
+    WindowFocusSubscribe {
+        enabled: bool,
+    },
+    /// Receiver → phone. Sent on subscription and when the sampled state changes.
+    /// Sequence starts at 1 for each subscription. No screenshots or input.
+    WindowFocusUpdate {
+        sequence: u64,
+        sampled_at_ms: u64,
+        state: WindowFocusState,
+    },
+    RemoteViewRequest {
+        view_id: u64,
+        enabled: bool,
+        control: bool,
+    },
+    RemoteViewAck {
+        view_id: u64,
+        frame_id: u64,
+    },
+    RemoteViewFrame(RemoteViewFrame),
+    RemoteViewStatus {
+        view_id: u64,
+        active: bool,
+        control: bool,
+        error: Option<String>,
+    },
+    RemoteViewInput {
+        view_id: u64,
+        frame_id: u64,
+        action: RemoteAction,
+    },
+    RemoteViewInputResult {
+        view_id: u64,
+        error: Option<String>,
+    },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: the
+    /// on-screen frame in device pixels. Sent when it changes (rotation) and
+    /// kept for the session; capture never exceeds what the phone can show.
+    RemoteViewSize {
+        width: u16,
+        height: u16,
+    },
+    /// Receiver → phone, with [`PHONE_WINDOW_VIEW_CHUNKS_EXTENSION`]: part of a
+    /// JPEG too large for one message, in order from offset 0. The frame's
+    /// `RemoteViewFrame` follows with an empty `jpeg`, meaning "these chunks".
+    RemoteViewFrameChunk {
+        view_id: u64,
+        frame_id: u64,
+        offset: u32,
+        total_bytes: u32,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// Receiver → phone, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: one HEVC access
+    /// unit (Annex B) in `frame.jpeg`, with the same metadata and frame-scoped
+    /// input rules as a JPEG frame. Empty means "the chunks just before". Frames
+    /// form one decoding chain per view; `keyframe` starts it, and `codec` is the
+    /// WebCodecs codec string.
+    RemoteVideoFrame {
+        frame: RemoteViewFrame,
+        keyframe: bool,
+        codec: String,
+    },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIDEO_EXTENSION`]: the decoding
+    /// chain broke; start the next frame with a keyframe.
+    RemoteVideoKeyframe {
+        view_id: u64,
+    },
+    /// Phone → receiver, with [`PHONE_WINDOW_VIDEO_MODES_EXTENSION`]: Text mode
+    /// (`media: false`, the default) favours sharpness at up to 10 fps; Media
+    /// mode favours motion at up to 60 fps. Applies from the next keyframe.
+    RemoteVideoMode {
+        view_id: u64,
+        media: bool,
+    },
+}
+
+/// One JPEG, small enough for a single encrypted message. No queued video backlog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteViewFrame {
+    pub view_id: u64,
+    pub frame_id: u64,
+    pub captured_at_ms: u64,
+    pub window: FocusedWindow,
+    pub crop: FocusRect,
+    pub width: u16,
+    pub height: u16,
+    /// False until geometry has settled; input still gets revalidated server-side.
+    pub interactive: bool,
+    #[serde(with = "serde_bytes")]
+    pub jpeg: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteAction {
+    /// Coordinates normalized to 0..10000 within the displayed crop.
+    Tap {
+        x: u16,
+        y: u16,
+        right: bool,
+    },
+    Key {
+        key: RemoteKey,
+    },
+    /// Explicit clipboard paste, bounded to 2048 UTF-8 bytes.
+    Paste {
+        text: String,
+        terminal: bool,
+    },
+    /// Scroll at (`x`, `y`) by whole wheel steps; positive `dy` scrolls down
+    /// (content moves up), positive `dx` scrolls right. Each at most 10 steps.
+    /// Requires [`PHONE_WINDOW_GESTURES_EXTENSION`].
+    Scroll {
+        x: u16,
+        y: u16,
+        dx: i8,
+        dy: i8,
+    },
+    /// Press the left button at (`x`, `y`) and hold it. Requires
+    /// [`PHONE_WINDOW_GESTURES_EXTENSION`]; the receiver releases it if the
+    /// view ends first.
+    DragStart {
+        x: u16,
+        y: u16,
+    },
+    /// Move while the button is held.
+    DragMove {
+        x: u16,
+        y: u16,
+    },
+    /// Move to (`x`, `y`) and release.
+    DragEnd {
+        x: u16,
+        y: u16,
+    },
+    /// Live typing from the phone's keyboard: press Backspace `backspaces`
+    /// times, then type `text` (at most 256 UTF-8 bytes). An edit such as an
+    /// autocorrected word arrives as one of these. Requires
+    /// [`PHONE_WINDOW_TYPING_EXTENSION`].
+    Type {
+        backspaces: u8,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteKey {
+    Escape,
+    Tab,
+    Enter,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    SelectAll,
+    Copy,
+    Paste,
+    AddressBar,
+    /// Super+arrow, sent through the compositor so its binds run (focus
+    /// navigation by default). Requires [`PHONE_WINDOW_NAVIGATION_EXTENSION`].
+    SuperLeft,
+    SuperRight,
+    SuperUp,
+    SuperDown,
+}
+
+impl RemoteKey {
+    /// The arrow's evdev code for a `Super*` key; `None` for every other key.
+    pub fn super_arrow(self) -> Option<u16> {
+        match self {
+            Self::SuperLeft => Some(105),
+            Self::SuperRight => Some(106),
+            Self::SuperUp => Some(103),
+            Self::SuperDown => Some(108),
+            _ => None,
+        }
+    }
+}
+
+/// Desktop logical coordinates, NOT encoded-video pixels. Negative origins are valid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusMonitor {
+    pub id: i32,
+    pub name: String,
+    /// Native, untransformed output dimensions.
+    pub width_px: u32,
+    pub height_px: u32,
+    /// Output scale multiplied by 1000.
+    pub scale_milli: u32,
+    /// Wayland output transform (0..7).
+    pub transform: u8,
+    pub logical_bounds: FocusRect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusedWindow {
+    pub address: String,
+    pub app_id: String,
+    pub title: String,
+    pub workspace_id: i32,
+    pub bounds: FocusRect,
+    /// Intersection with its monitor. None means outside the visible output.
+    pub visible_bounds: Option<FocusRect>,
+    pub monitor: FocusMonitor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WindowFocusState {
+    Focused { window: FocusedWindow },
+    NoWindow,
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1208,6 +1473,62 @@ mod tests {
             },
             PhoneEvent::PairAccepted,
             PhoneEvent::Unpair,
+            PhoneEvent::RemoteViewRequest {
+                view_id: 2,
+                enabled: true,
+                control: false,
+            },
+            PhoneEvent::RemoteViewAck {
+                view_id: 2,
+                frame_id: 1,
+            },
+            PhoneEvent::RemoteViewStatus {
+                view_id: 2,
+                active: true,
+                control: false,
+                error: None,
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Tap {
+                    x: 0,
+                    y: 10000,
+                    right: true,
+                },
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Paste {
+                    text: "日本語 café".into(),
+                    terminal: true,
+                },
+            },
+            PhoneEvent::RemoteViewInput {
+                view_id: 2,
+                frame_id: 1,
+                action: RemoteAction::Key {
+                    key: RemoteKey::Enter,
+                },
+            },
+            PhoneEvent::RemoteViewInputResult {
+                view_id: 2,
+                error: Some("stale frame".into()),
+            },
+            PhoneEvent::WindowFocusSubscribe { enabled: true },
+            PhoneEvent::WindowFocusUpdate {
+                sequence: 1,
+                sampled_at_ms: 123,
+                state: WindowFocusState::NoWindow,
+            },
+            PhoneEvent::WindowFocusUpdate {
+                sequence: 2,
+                sampled_at_ms: 124,
+                state: WindowFocusState::Unavailable {
+                    reason: "not running".into(),
+                },
+            },
             PhoneEvent::AudioRequest {
                 direction: Some(AudioDirection::FromPhone),
                 udp_port: 40_000,
@@ -1229,6 +1550,90 @@ mod tests {
             let frame = Frame::Phone(event);
             assert_eq!(decode_frame(&encode_frame(&frame).unwrap()).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn focused_window_metadata_round_trips_with_negative_coordinates_and_unicode() {
+        let frame = Frame::Phone(PhoneEvent::WindowFocusUpdate {
+            sequence: 4,
+            sampled_at_ms: 1234,
+            state: WindowFocusState::Focused {
+                window: FocusedWindow {
+                    address: "0x123".into(),
+                    app_id: "browser".into(),
+                    title: "日本語 · café".into(),
+                    workspace_id: -99,
+                    bounds: FocusRect {
+                        x: -900,
+                        y: 10,
+                        width: 800,
+                        height: 1000,
+                    },
+                    visible_bounds: Some(FocusRect {
+                        x: -900,
+                        y: 10,
+                        width: 800,
+                        height: 1000,
+                    }),
+                    monitor: FocusMonitor {
+                        id: 1,
+                        name: "DP-1".into(),
+                        width_px: 2560,
+                        height_px: 1440,
+                        scale_milli: 1500,
+                        transform: 3,
+                        logical_bounds: FocusRect {
+                            x: -960,
+                            y: 0,
+                            width: 960,
+                            height: 1707,
+                        },
+                    },
+                },
+            },
+        });
+        let encoded = encode_frame(&frame).unwrap();
+        assert!(encoded.len() < MAX_SECURE_FRAME_BYTES);
+        assert_eq!(decode_frame(&encoded).unwrap(), frame);
+        let Frame::Phone(PhoneEvent::WindowFocusUpdate {
+            state: WindowFocusState::Focused { mut window },
+            ..
+        }) = frame
+        else {
+            panic!("expected window")
+        };
+        window.title = "😀".repeat(1024);
+        let frame = Frame::Phone(PhoneEvent::RemoteViewFrame(RemoteViewFrame {
+            view_id: 3,
+            frame_id: 7,
+            captured_at_ms: 99,
+            crop: window.bounds.clone(),
+            window,
+            width: 800,
+            height: 960,
+            interactive: true,
+            jpeg: vec![255; REMOTE_VIEW_MAX_JPEG],
+        }));
+        let bytes = encode_frame(&frame).unwrap();
+        assert!(
+            bytes.len() < MAX_SECURE_FRAME_BYTES,
+            "JPEG must use MessagePack binary encoding"
+        );
+        assert_eq!(decode_frame(&bytes).unwrap(), frame);
+        let chunk = Frame::Phone(PhoneEvent::RemoteViewFrameChunk {
+            view_id: u64::MAX,
+            frame_id: u64::MAX,
+            offset: u32::MAX,
+            total_bytes: u32::MAX,
+            bytes: vec![255; REMOTE_VIEW_CHUNK_BYTES],
+        });
+        let bytes = encode_frame(&chunk).unwrap();
+        assert!(
+            bytes.len() < MAX_SECURE_FRAME_BYTES,
+            "a chunk must fit one message"
+        );
+        assert_eq!(decode_frame(&bytes).unwrap(), chunk);
+        const _: () = assert!(REMOTE_VIEW_MAX_CHUNKED_JPEG <= MAX_FRAME_BYTES as usize);
     }
 
     #[test]

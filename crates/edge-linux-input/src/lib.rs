@@ -23,6 +23,8 @@ mod portal_capture;
 #[cfg(target_os = "linux")]
 mod uinput;
 #[cfg(target_os = "linux")]
+mod wayland_screencopy;
+#[cfg(target_os = "linux")]
 mod wayland_virtual_input;
 
 pub const LIBEI_PKG_CONFIG: &str = "libei-1.0";
@@ -71,6 +73,8 @@ pub use portal_capture::{CaptureEvent, PortalCaptureBackend};
 #[cfg(target_os = "linux")]
 pub use uinput::UinputBackend;
 #[cfg(target_os = "linux")]
+pub use wayland_screencopy::{CapturedRegion, ScreenCopy};
+#[cfg(target_os = "linux")]
 pub use wayland_virtual_input::HyprlandVirtualInputBackend;
 
 #[cfg(not(target_os = "linux"))]
@@ -84,6 +88,10 @@ impl HyprlandVirtualInputBackend {
     }
 
     pub async fn inject(&self, _event: InputEvent) -> Result<()> {
+        Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
+    }
+
+    pub async fn move_absolute(&self, _x: u32, _y: u32, _width: u32, _height: u32) -> Result<()> {
         Err(LinuxInputError::HyprlandVirtualInputUnsupportedPlatform)
     }
 

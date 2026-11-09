@@ -77,6 +77,7 @@ struct TrayPhone {
 /// which reads it over the control socket.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrayStatus {
+    pub remote_input_busy: bool,
     pub summary: String,
     pub connected: bool,
     pub peer: Option<String>,
@@ -294,6 +295,16 @@ impl ReceiverTrayHandle {
         .await;
     }
 
+    /// A KVM role assignment is not an active capture. Phones only yield while
+    /// capture/input is actually entered or a role switch is in progress.
+    pub async fn input_activity(&self, active: bool) {
+        if self.status.borrow().remote_input_busy == active {
+            return;
+        }
+        self.update(move |tray| tray.kvm_input_active = active)
+            .await;
+    }
+
     pub async fn role_assignment(
         &self,
         local_device_name: String,
@@ -464,6 +475,7 @@ pub struct ReceiverTray {
     local_device_name: Option<String>,
     peer_device_name: Option<String>,
     local_is_controller: bool,
+    kvm_input_active: bool,
     role_switch_available: bool,
     role_switching: bool,
     last_error: Option<String>,
@@ -645,6 +657,7 @@ impl ReceiverTray {
             local_device_name: None,
             peer_device_name: None,
             local_is_controller: true,
+            kvm_input_active: false,
             role_switch_available: false,
             role_switching: false,
             last_error: None,
@@ -698,6 +711,8 @@ impl ReceiverTray {
     fn status(&self) -> TrayStatus {
         let connected = self.state == TrayState::Connected;
         TrayStatus {
+            remote_input_busy: self.state == TrayState::Connected
+                && (self.kvm_input_active || self.role_switching),
             summary: self.summary(),
             connected,
             peer: connected.then(|| self.peer_name().to_string()),
@@ -1525,5 +1540,16 @@ mod tests {
         assert_eq!(label(TrayState::Connected), "Disconnect");
         assert_eq!(label(TrayState::Paused), "Reconnect");
         assert_eq!(label(TrayState::Listening), "Disconnect");
+    }
+    #[test]
+    fn phone_input_yields_to_active_capture_not_an_idle_role_assignment() {
+        let (mut tray, _) = test_tray(TrayState::Connected);
+        tray.local_is_controller = false;
+        assert!(!tray.status().remote_input_busy);
+        tray.kvm_input_active = true;
+        assert!(tray.status().remote_input_busy);
+        tray.kvm_input_active = false;
+        tray.role_switching = true;
+        assert!(tray.status().remote_input_busy);
     }
 }

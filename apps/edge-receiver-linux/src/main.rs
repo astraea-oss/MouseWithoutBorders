@@ -97,6 +97,9 @@ mod phone_audio;
 mod phone_pairing;
 #[cfg(target_os = "linux")]
 mod phone_projection;
+mod phone_remote_video;
+mod phone_remote_view;
+mod phone_window_focus;
 mod tray;
 use tray::{ControllerChoice, ReceiverTrayHandle, TrayCommand};
 
@@ -971,6 +974,10 @@ async fn run_linux_controller_session(
 
     let outcome: Result<ControllerSessionExit> = async {
         loop {
+            if let Some(tray) = tray {
+                tray.input_activity(input_forwarding_enabled && !session_paused &&
+                    if local_is_controller { input_active } else { input_epoch.accepts_input() }).await;
+            }
             if !session_paused && writer.bulk_is_due() && clipboard_sync.outgoing.is_some() {
                 clipboard_sync.send_next_image_frame(&mut writer).await?;
                 continue;
@@ -3778,6 +3785,18 @@ async fn handle_controller(
     }
 
     loop {
+        if let Some(tray) = tray {
+            tray.input_activity(
+                input_forwarding_enabled
+                    && !session_paused
+                    && if local_is_controller {
+                        capture_input_active
+                    } else {
+                        input_epoch.accepts_input()
+                    },
+            )
+            .await;
+        }
         if !session_paused && writer.bulk_is_due() && clipboard_sync.outgoing.is_some() {
             match clipboard_sync.send_next_image_frame(&mut writer).await {
                 Ok(true) => {

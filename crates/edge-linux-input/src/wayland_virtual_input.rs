@@ -71,6 +71,30 @@ impl HyprlandVirtualInputBackend {
         sender.inject(event)
     }
 
+    /// Absolute motion in the compositor's full logical desktop bounding box.
+    /// A roundtrip makes the motion precede any following guarded click.
+    pub async fn move_absolute(&self, x: u32, y: u32, width: u32, height: u32) -> Result<()> {
+        let mut sender = self
+            .sender
+            .lock()
+            .map_err(|_| LinuxInputError::HyprlandVirtualInputLockPoisoned)?;
+        if width == 0 || height == 0 || x >= width || y >= height {
+            return Err(LinuxInputError::HyprlandVirtualInputInit(
+                "absolute pointer coordinate outside desktop".into(),
+            ));
+        }
+        let time = sender.time_ms();
+        sender.pointer.motion_absolute(time, x, y, width, height);
+        sender.pointer.frame();
+        let HyprlandVirtualInput {
+            event_queue, state, ..
+        } = &mut *sender;
+        event_queue
+            .roundtrip(state)
+            .map_err(|e| LinuxInputError::HyprlandVirtualInputInit(e.to_string()))?;
+        Ok(())
+    }
+
     pub async fn all_keys_up(&self) -> Result<()> {
         self.inject(InputEvent::AllKeysUp).await
     }
