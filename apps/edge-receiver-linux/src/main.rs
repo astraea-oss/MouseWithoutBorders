@@ -1022,13 +1022,8 @@ async fn run_linux_controller_session(
                     }
                     match peer_liveness.poll(tokio::time::Instant::now(), input_active) {
                         Some(LivenessEvent::SoftInputTimeout) => {
-                            if local_is_controller && let Some(capture) = &capture {
-                                if let Err(error) = capture.release(None).await {
-                                    tracing::warn!(%error, "portal release failed during peer timeout");
-                                }
-                                if let Err(error) = capture.disarm().await {
-                                    tracing::warn!(%error, "portal disable failed during peer timeout");
-                                }
+                            if local_is_controller && capture.is_some() {
+                                release_local_capture(capture, log_path, "peer went silent").await;
                                 capture_released_for_liveness = true;
                             } else {
                                 input_epoch.suspend();
@@ -1097,9 +1092,21 @@ async fn run_linux_controller_session(
                             ..
                         }) => {
                             if session_paused || !local_is_controller || !input_forwarding_enabled {
+                                // Nothing would forward this input, so the
+                                // grab must not stay on.
+                                append_portable_log(
+                                    log_path,
+                                    "local input was captured while this computer is not forwarding it; releasing",
+                                );
+                                release_local_capture(capture, log_path, "unexpected capture activation").await;
                                 continue;
                             }
                             input_active = true;
+                            tracing::info!(?edge, normalized_position, "local input captured for the peer");
+                            append_portable_log(
+                                log_path,
+                                format!("local input captured for the peer at {edge:?} edge"),
+                            );
                             write_secure_frame_writer(
                                 &mut writer,
                                 &Frame::control(
@@ -1127,6 +1134,8 @@ async fn run_linux_controller_session(
                         }
                         Some(CaptureEvent::Deactivated) => {
                             input_active = false;
+                            tracing::info!("local input returned to this computer");
+                            append_portable_log(log_path, "local input returned to this computer");
                             write_secure_frame_writer(
                                 &mut writer,
                                 &Frame::input(role_epoch, InputEvent::AllKeysUp),
@@ -1335,6 +1344,7 @@ async fn run_linux_controller_session(
                                     &injector,
                                     &mut writer,
                                     edge,
+                                    log_path,
                                 )
                                 .await?;
                                 transition_deadline = pending_readiness
@@ -1390,10 +1400,7 @@ async fn run_linux_controller_session(
                                 coordinator.set_paused(true)?;
                                 session_paused = true;
                                 connector_pause.store(true, Ordering::Release);
-                                if let Some(capture) = &capture {
-                                    capture.release(None).await.ok();
-                                    capture.disarm().await.ok();
-                                }
+                                release_local_capture(capture, log_path, "pausing the session").await;
                                 input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
                                 drop(audio_start_task.take());
@@ -1711,6 +1718,7 @@ async fn run_linux_controller_session(
                                     &injector,
                                     &mut writer,
                                     edge,
+                                    log_path,
                                 )
                                 .await?;
                                 transition_deadline = pending_readiness
@@ -1873,10 +1881,7 @@ async fn run_linux_controller_session(
                             session_paused = paused;
                             connector_pause.store(paused, Ordering::Release);
                             if paused {
-                                if let Some(capture) = &capture {
-                                    capture.release(None).await.ok();
-                                    capture.disarm().await.ok();
-                                }
+                                release_local_capture(capture, log_path, "peer paused the session").await;
                                 input_epoch.suspend();
                                 injector.all_keys_up().await.ok();
                                 drop(audio_start_task.take());
@@ -2116,10 +2121,7 @@ async fn run_linux_controller_session(
     )
     .await
     .ok();
-    if let Some(capture) = capture.as_ref() {
-        capture.release(None).await.ok();
-        capture.disarm().await.ok();
-    }
+    release_local_capture(capture, log_path, "session ended").await;
     drop(audio_start_task.take());
     if let Some(sender) = audio_sender.take() {
         sender.stop().await.ok();
@@ -2148,6 +2150,36 @@ async fn arm_connector_capture(
     Ok(())
 }
 
+/// Gives local keyboard and pointer input back to the compositor.
+///
+/// Release/disable failures used to be discarded, which could leave the
+/// compositor grabbing all local input with nothing consuming it. When either
+/// step fails the capture session is closed instead, which makes the portal
+/// tear the grab down; the next session preflights a fresh one.
+#[cfg(target_os = "linux")]
+async fn release_local_capture(
+    capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
+    log_path: &Path,
+    context: &str,
+) {
+    let Some(backend) = capture.as_ref() else {
+        return;
+    };
+    let released = backend.release(None).await;
+    let disarmed = backend.disarm().await;
+    if let Err(error) = released.and(disarmed) {
+        let message = format!(
+            "{context}: could not release local input ({error}); closing the capture session to restore it"
+        );
+        tracing::warn!(%message);
+        append_portable_log(log_path, &message);
+        if let Some(backend) = capture.take() {
+            backend.close().await;
+        }
+        append_portable_log(log_path, format!("{context}: capture session closed"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn disarm_connector_capture(
     capture: &mut Option<edge_linux_input::PortalCaptureBackend>,
@@ -2171,6 +2203,7 @@ struct ConnectorRoleReadiness {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn begin_connector_role_switch(
     requested_controller: &str,
     local_fingerprint: &str,
@@ -2179,14 +2212,12 @@ async fn begin_connector_role_switch(
     injector: &ReceiverBackend,
     writer: &mut ScheduledNoiseWriter,
     local_exit_edge: Edge,
+    log_path: &Path,
 ) -> Result<Option<ConnectorRoleReadiness>> {
     let old_local_controller =
         coordinator.state().controller_fingerprint.as_deref() == Some(local_fingerprint);
     if old_local_controller {
-        if let Some(capture) = capture.as_ref() {
-            capture.release(None).await.ok();
-            capture.disarm().await.ok();
-        }
+        release_local_capture(capture, log_path, "handing control to the peer").await;
         write_secure_frame_writer(
             writer,
             &Frame::input(coordinator.state().role_epoch, InputEvent::AllKeysUp),
@@ -3178,10 +3209,7 @@ async fn run_node(
             }
         }
         #[cfg(target_os = "linux")]
-        if let Some(capture_backend) = &capture {
-            capture_backend.release(None).await.ok();
-            capture_backend.disarm().await.ok();
-        }
+        release_local_capture(&mut capture, &log_path, "controller session ended").await;
         backend.all_keys_up().await.ok();
     }
 
@@ -3883,6 +3911,11 @@ async fn handle_controller(
                         if local_is_controller && input_forwarding_enabled && !session_paused =>
                     {
                         capture_input_active = true;
+                        tracing::info!(?edge, normalized_position, "local input captured for the peer");
+                        append_portable_log(
+                            log_path,
+                            format!("local input captured for the peer at {edge:?} edge"),
+                        );
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::control(role_epoch, ControlEvent::EnterRemote {
@@ -3904,8 +3937,19 @@ async fn handle_controller(
                             tray.input_event();
                         }
                     }
+                    Some(CaptureEvent::Activated { .. }) => {
+                        // Nothing would forward this input, so the grab must
+                        // not stay on.
+                        append_portable_log(
+                            log_path,
+                            "local input was captured while this computer is not forwarding it; releasing",
+                        );
+                        release_local_capture(capture, log_path, "unexpected capture activation").await;
+                    }
                     Some(CaptureEvent::Deactivated | CaptureEvent::EmergencyReleased) => {
                         capture_input_active = false;
+                        tracing::info!("local input returned to this computer");
+                        append_portable_log(log_path, "local input returned to this computer");
                         write_secure_frame_writer(
                             &mut writer,
                             &Frame::input(role_epoch, InputEvent::AllKeysUp),
@@ -4116,10 +4160,7 @@ async fn handle_controller(
                             }
                             audio_receiver = None;
                             backend.all_keys_up().await.ok();
-                            if let Some(capture) = &capture {
-                                capture.release(None).await.ok();
-                                capture.disarm().await.ok();
-                            }
+                            release_local_capture(capture, log_path, "pausing the session").await;
                             write_secure_frame_writer(
                                 &mut writer,
                                 &Frame::Role(RoleEvent::SetPaused { paused: true }),
@@ -4216,9 +4257,7 @@ async fn handle_controller(
                             return_watcher.record_control(
                                 &ControlEvent::SetInputForwarding { enabled: false },
                             );
-                            if let Some(capture) = &capture {
-                                capture.release_and_disarm(None).await.ok();
-                            }
+                            release_local_capture(capture, log_path, "input forwarding disabled").await;
                         } else if local_is_controller && let Some(capture) = &capture {
                             capture.arm().await?;
                         }
@@ -4446,9 +4485,7 @@ async fn handle_controller(
                                     capture_input_active = false;
                                     input_epoch.suspend();
                                     backend.all_keys_up().await.ok();
-                                    if let Some(capture) = &capture {
-                                        capture.release_and_disarm(None).await.ok();
-                                    }
+                                    release_local_capture(capture, log_path, "peer disabled input forwarding").await;
                                 } else if local_is_controller
                                     && let Some(capture) = &capture
                                 {
@@ -4802,10 +4839,7 @@ async fn handle_controller(
                                 *capture = None;
                             }
                         } else {
-                            if let Some(capture) = &capture {
-                                capture.release(None).await.ok();
-                                capture.disarm().await.ok();
-                            }
+                            release_local_capture(capture, log_path, "role state no longer makes this computer the controller").await;
                         }
                         if state.paused || state.controller_fingerprint.is_none() {
                             input_epoch.suspend();
@@ -4889,10 +4923,7 @@ async fn handle_controller(
                         }
                         if local_is_controller {
                             capture_input_active = false;
-                            if let Some(capture) = &capture {
-                                capture.release(None).await.ok();
-                                capture.disarm().await.ok();
-                            }
+                            release_local_capture(capture, log_path, "handing control to the peer").await;
                             write_secure_frame_writer(
                                 &mut writer,
                                 &Frame::input(role_epoch, InputEvent::AllKeysUp),
@@ -5056,9 +5087,7 @@ async fn handle_controller(
                             audio_receiver = None;
                             input_epoch.suspend();
                             backend.all_keys_up().await.ok();
-                            if let Some(capture) = &capture {
-                                capture.release_and_disarm(None).await.ok();
-                            }
+                            release_local_capture(capture, log_path, "input forwarding disabled").await;
                         } else if local_is_controller && let Some(capture) = &capture {
                             capture.arm().await?;
                         }

@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "edge-controller-win"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "edge-receiver-linux"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
