@@ -1213,6 +1213,59 @@ mod tests {
         assert!(gate.ensure_available(&first).is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn close_waits_for_worker_teardown() {
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let backend = PortalCaptureBackend {
+            command_tx,
+            event_rx,
+            zone_set: Arc::new(AtomicU32::new(0)),
+            owner_lease: Arc::new(CaptureOwnerLease::new()),
+        };
+        let mut cleanup = tokio::spawn(backend.close());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(CaptureCommand::Shutdown)
+        ));
+        // A shutdown request alone does not confirm the grab has been torn down.
+        assert!(
+            time::timeout(Duration::from_millis(10), &mut cleanup)
+                .await
+                .is_err()
+        );
+        event_tx
+            .send(CaptureEvent::Deactivated)
+            .expect("worker still has its event receiver");
+        drop(event_tx);
+        time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("close finishes after worker teardown")
+            .expect("cleanup task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_does_not_wait_forever_for_a_stalled_worker() {
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let backend = PortalCaptureBackend {
+            command_tx,
+            event_rx,
+            zone_set: Arc::new(AtomicU32::new(0)),
+            owner_lease: Arc::new(CaptureOwnerLease::new()),
+        };
+        let cleanup = tokio::spawn(backend.close());
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(CaptureCommand::Shutdown)
+        ));
+        // Retain the event sender to simulate a worker stuck during teardown.
+        time::timeout(CAPTURE_CLOSE_TIMEOUT + Duration::from_secs(1), cleanup)
+            .await
+            .expect("close remains bounded when the worker stalls")
+            .expect("cleanup task");
+    }
+
     #[tokio::test]
     async fn releases_active_capture_before_disarming_it() {
         let (command_tx, mut command_rx) = mpsc::channel(2);
