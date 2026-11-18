@@ -37,7 +37,8 @@ After authoritative records or a coordinator epoch are received, ownership is
 fixed to protect history. Disabling sharing preserves its identity and history.
 The PCs confirm that they selected the same owner before exchanging history;
 a transport connection alone is not reported as working notification sharing.
-This uses `notification-sync-v2`; both PCs need this version. Older peers retain
+This uses `notification-sync-v3`; upgrade both PCs to exchange the compact
+removal metadata. There is no Quickshell bridge update for this change. Older peers retain
 normal KVM operation while notification sharing waits for their update.
 
 For an existing service installation, upgrading is:
@@ -159,6 +160,15 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   not repost the entire history.
 - A shell reconnect reconciles its complete inventory before projecting copies.
   Cached entries missing after a cold shell restart are restored silently.
+- Dismissed notifications are removed from active history. Only content-free
+  removal metadata remains: exact ranges of sequential source IDs, or individual
+  keys for opaque lifetimes such as phone entries. Ranges never fill gaps or cross
+  source identities/shell lifetimes. This prevents stale offline copies returning
+  without retaining a history row for every dismissal. These markers have their
+  own bounded metadata budget and do not consume the 4,096 active-entry slots.
+  They are not deleted by age: an indefinitely offline peer may still replay a key.
+  The first upgraded start migrates old null-content rows and saves
+  `store.before-removal-compaction.json` before writing the compact store.
 - Notification state and pending operations survive edge-kvm restarts. Quickshell's
   own DND, epoch and offline closure queue survive configuration reloads, not a
   full Quickshell process restart. Closures not yet delivered to edge-kvm can be
@@ -173,14 +183,15 @@ used was astraea.files merge commit `ef8ee2c57b20319f8572f3667ae3610d6a20b7da`.
   Duplicate operations, ACKs and unchanged snapshots avoid redundant state writes.
   A notification worker failure/overflow disables notification sync for
   that session; reconnect after fixing the reported cause.
-- Storage is capped at 4,096 records including terminal markers, 1,024 pending
-  operations, and 32 MiB serialized state. At capacity, notification operations
-  fail with a diagnostic without disconnecting the Quickshell bridge or phone
-  session. Native notifications and local phone delivery continue; phone clipboard
-  and audio remain connected. New overflow entries are local-only until history
-  capacity is recovered. Automatic tombstone compaction remains deferred: deleting
-  markers without an origin-retirement protocol could resurrect dismissed entries.
-  This initial version still requires explicit maintenance at the history limit.
+- Storage is capped at 4,096 active records, 1,024 pending operations, 65,536
+  compact removal ranges/opaque keys, and 32 MiB serialized state. Adjacent removed
+  IDs merge automatically. Dismissals no longer consume active history slots, and
+  existing entries remain dismissible when active history is full. Metadata is
+  exact and bounded; it is not an unlimited notification archive. If any budget
+  is exhausted, operations report a diagnostic while native/local phone delivery
+  and the other KVM features continue. Completely forgetting old source lifetimes
+  still needs a future origin-retirement protocol; arbitrary age-based deletion
+  would allow an offline device to resurrect old notifications.
 - The store contains private notification text in plaintext, protected by a 0700
   directory and 0600 files/socket. Removed content is deleted from state while
   minimal terminal markers remain. Bodies are never logged. Icons use bounded

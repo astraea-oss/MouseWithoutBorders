@@ -1,15 +1,16 @@
 //! One durable notification writer, replicas, and a private Quickshell bridge.
 //! The hub is independent of input roles and never owns a notification UI.
+use crate::notification_removals::{MAX_REMOVALS, Removals};
 use crate::{AbortOnDropTask, notifications::FreedesktopNotifications};
 use anyhow::{Context, Result, bail, ensure};
 use edge_common::NotificationConfig;
 use edge_protocol::{
-    NotificationKey, NotificationOperation, NotificationRecord, NotificationSync,
-    SharedNotification,
+    NotificationKey, NotificationOperation, NotificationRecord, NotificationRemoval,
+    NotificationSync, SharedNotification,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -35,6 +36,8 @@ struct Store {
     local_identity: String,
     sequence: u64,
     records: Vec<NotificationRecord>,
+    #[serde(default)]
+    removals: Removals,
     pending: Vec<NotificationOperation>,
     #[serde(default)]
     phone_instances: BTreeMap<String, PhoneInstance>,
@@ -51,6 +54,7 @@ impl Store {
     fn coordinator_locked(&self) -> bool {
         !self.epoch.is_empty()
             || !self.records.is_empty()
+            || self.removals.len() > 0
             || self
                 .pending
                 .iter()
@@ -69,23 +73,22 @@ impl Store {
             );
             validate_content(content)?;
         }
-        if let Some(record) = self.records.iter_mut().find(|r| r.key == operation.key) {
-            // Removal is terminal even if the source reconnects with stale state.
-            if record.content.is_none() {
+        if self.removals.contains(&operation.key) {
+            return Ok(false);
+        }
+        if operation.content.is_none() {
+            self.removals.insert(&operation.key)?;
+            self.records.retain(|record| record.key != operation.key);
+        } else if let Some(record) = self.records.iter_mut().find(|r| r.key == operation.key) {
+            if operation.sequence <= record.source_sequence {
                 return Ok(false);
             }
-            if operation.content.is_none() || operation.sequence > record.source_sequence {
-                record.content = operation.content.clone();
-                if operation.content.is_some() {
-                    record.source_sequence = operation.sequence;
-                }
-            } else {
-                return Ok(false);
-            }
+            record.content = operation.content.clone();
+            record.source_sequence = operation.sequence;
         } else {
             ensure!(
                 self.records.len() < MAX_RECORDS,
-                "notification state is full; explicit reset required"
+                "active notification history is full"
             );
             self.records.push(NotificationRecord {
                 key: operation.key.clone(),
@@ -102,7 +105,7 @@ impl Store {
         coordinator: bool,
     ) -> Result<bool> {
         // Repeated inventory, updates, and retries must not allocate new operations.
-        if let Some(record) = self.view().iter().find(|r| r.key == key)
+        if let Some(record) = self.record(&key)
             && (record.content.is_none() || record.content == content)
         {
             return Ok(false);
@@ -130,9 +133,22 @@ impl Store {
             // Keep only the newest unsent operation for an instance. A terminal
             // removal cannot be overwritten because the view check above rejects it.
             self.pending.retain(|pending| pending.key != operation.key);
+            // Pending updates/removals of committed keys use no new record slots.
+            // In particular, a full history must still allow dismissing its entries.
+            let keys: BTreeSet<_> = self
+                .records
+                .iter()
+                .map(|record| &record.key)
+                .chain(
+                    self.pending
+                        .iter()
+                        .filter(|pending| pending.content.is_some())
+                        .map(|pending| &pending.key),
+                )
+                .chain(operation.content.as_ref().map(|_| &operation.key))
+                .collect();
             ensure!(
-                self.pending.len() < MAX_PENDING
-                    && self.records.len() + self.pending.len() < MAX_RECORDS,
+                self.pending.len() < MAX_PENDING && keys.len() <= MAX_RECORDS,
                 "notification outbox is full"
             );
             self.pending.push(operation);
@@ -140,6 +156,13 @@ impl Store {
         Ok(true)
     }
     fn record(&self, key: &NotificationKey) -> Option<NotificationRecord> {
+        if self.removals.contains(key) {
+            return Some(NotificationRecord {
+                key: key.clone(),
+                source_sequence: 0,
+                content: None,
+            });
+        }
         let current = self.records.iter().find(|record| &record.key == key);
         let Some(operation) = self.pending.iter().find(|operation| &operation.key == key) else {
             return current.cloned();
@@ -151,7 +174,31 @@ impl Store {
             ..Store::default()
         };
         let _ = overlay.apply(&self.local_identity, operation);
-        overlay.records.pop()
+        if overlay.removals.contains(key) {
+            Some(NotificationRecord {
+                key: key.clone(),
+                source_sequence: 0,
+                content: None,
+            })
+        } else {
+            overlay.records.pop()
+        }
+    }
+    // Upgrade old stores without retaining content-free records in active history.
+    fn compact_legacy(&mut self) -> Result<bool> {
+        let mut changed = false;
+        for record in &self.records {
+            if record.content.is_none() {
+                self.removals.insert(&record.key)?;
+                changed = true;
+            }
+        }
+        self.records
+            .retain(|record| record.content.is_some() && !self.removals.contains(&record.key));
+        self.removals.validate()?;
+        self.pending
+            .retain(|operation| !self.removals.contains(&operation.key));
+        Ok(changed)
     }
     fn view(&self) -> Vec<NotificationRecord> {
         let mut overlay = self.clone();
@@ -162,7 +209,7 @@ impl Store {
         overlay.records
     }
 }
-fn validate_key(key: &NotificationKey) -> Result<()> {
+pub(super) fn validate_key(key: &NotificationKey) -> Result<()> {
     ensure!(
         key.origin.len() == 35
             && key.origin.split(':').count() == 4
@@ -462,7 +509,6 @@ impl PhoneNotificationSource {
         // single daemon-scoped ID cache also serves the bridge's reconciliation.
         let delivered: Result<()> = async {
             if let Some(desktop) = desktop {
-                let view = state.view();
                 let path = self.hub.phone_projection_path();
                 let mut cache = self.hub.0.phone_projections.lock().await;
                 for (instance, content) in &operations {
@@ -470,7 +516,7 @@ impl PhoneNotificationSource {
                         origin: self.hub.0.identity.clone(),
                         instance: instance.clone(),
                     };
-                    let terminal = view.iter().any(|r| r.key == key && r.content.is_none());
+                    let terminal = state.record(&key).is_some_and(|r| r.content.is_none());
                     cache
                         .show(
                             desktop,
@@ -584,6 +630,14 @@ impl NotificationHub {
                             state.apply(identity, &operation)?;
                         }
                         state.epoch = new_epoch()?;
+                    }
+                }
+                if state.compact_legacy()? {
+                    let backup = directory.join("store.before-removal-compaction.json");
+                    if !tokio::fs::try_exists(&backup).await? {
+                        tokio::fs::copy(&path, &backup).await?;
+                        tokio::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
+                            .await?;
                     }
                 }
                 ensure!(
@@ -878,7 +932,7 @@ impl NotificationHub {
                                 // Recover a closure queued while the local backend was down.
                                 let candidate = key.or_else(|| instance.map(|instance| NotificationKey { origin: self.0.identity.clone(), instance }));
                                 if let Some(key) = candidate {
-                                    let known = self.0.state.lock().await.view().iter().any(|r| r.key == key);
+                                    let known = self.0.state.lock().await.record(&key).is_some();
                                     if known && (key.origin == self.0.identity || reason == 2) { self.local_from_bridge(key, None).await; }
                                 }
                             }
@@ -897,6 +951,18 @@ impl NotificationHub {
                 continue;
             }
             let records = self.0.state.lock().await.view();
+            let removed_native: Vec<_> = {
+                let state = self.0.state.lock().await;
+                native
+                    .iter()
+                    .filter(|(key, _)| state.record(key).is_some_and(|r| r.content.is_none()))
+                    .map(|(key, id)| (key.clone(), *id))
+                    .collect()
+            };
+            for (key, id) in removed_native {
+                native.remove(&key);
+                desktop.close_shared(id).await.ok();
+            }
             for record in &records {
                 if self.local_phone(&record.key) {
                     // Read current content while holding state before the ID-cache
@@ -948,6 +1014,38 @@ impl NotificationHub {
                         projections.insert(record.key.clone(), (id, content.clone()));
                     }
                     _ => {}
+                }
+            }
+            // Phone projections also use the compact removal set.
+            let removed_phones: Vec<_> = {
+                let state = self.0.state.lock().await;
+                state
+                    .phone_instances
+                    .values()
+                    .filter_map(|entry| {
+                        let key = NotificationKey {
+                            origin: self.0.identity.clone(),
+                            instance: entry.instance.clone(),
+                        };
+                        state
+                            .record(&key)
+                            .is_some_and(|r| r.content.is_none())
+                            .then_some(key)
+                    })
+                    .collect()
+            };
+            for key in removed_phones {
+                if let Err(error) = self
+                    .0
+                    .phone_projections
+                    .lock()
+                    .await
+                    .show(&desktop, &self.phone_projection_path(), &key, None, false)
+                    .await
+                {
+                    self.record_error(&format!(
+                        "Phone notification cache: {error}; bridge remains connected"
+                    ));
                 }
             }
             // Full coordinator snapshots may remove old projection keys.
@@ -1055,7 +1153,7 @@ pub struct NotificationLink {
     peer: String,
     changes: watch::Receiver<u64>,
     outgoing: VecDeque<NotificationSync>,
-    staged: Option<(String, Vec<NotificationRecord>)>,
+    staged: Option<(String, Vec<NotificationRecord>, Removals)>,
     dirty: bool,
     pacing: tokio::time::Interval,
 }
@@ -1085,6 +1183,8 @@ impl NotificationLink {
                 });
                 self.outgoing
                     .extend(state.records.iter().cloned().map(NotificationSync::Record));
+                self.outgoing
+                    .extend(state.removals.events().map(NotificationSync::Removed));
                 self.outgoing.push_back(NotificationSync::SnapshotEnd);
             } else {
                 for operation in &state.pending {
@@ -1128,7 +1228,7 @@ impl NotificationLink {
                     self.hub.publish();
                 }
                 ensure!(
-                    self.outgoing.len() < MAX_RECORDS + MAX_PENDING + 4,
+                    self.outgoing.len() < MAX_RECORDS + MAX_REMOVALS + MAX_PENDING + 4,
                     "notification output queue full"
                 );
                 self.outgoing.push_back(NotificationSync::Ack {
@@ -1163,14 +1263,18 @@ impl NotificationLink {
                     "coordinator store reset; explicit recovery required"
                 );
                 ensure!(self.staged.is_none(), "nested notification snapshot");
-                self.staged = Some((epoch, Vec::new()));
+                self.staged = Some((epoch, Vec::new(), Removals::default()));
             }
             NotificationSync::Record(record) if !self.hub.is_coordinator() => {
                 validate_key(&record.key)?;
+                ensure!(
+                    record.content.is_some(),
+                    "dismissals must use compact removal metadata"
+                );
                 if let Some(content) = &record.content {
                     validate_content(content)?;
                 }
-                let (_, staged) = self
+                let (_, staged, _) = self
                     .staged
                     .as_mut()
                     .context("notification record outside snapshot")?;
@@ -1180,18 +1284,33 @@ impl NotificationLink {
                 );
                 staged.push(record);
             }
+            NotificationSync::Removed(removal) if !self.hub.is_coordinator() => {
+                let (_, _, removals) = self
+                    .staged
+                    .as_mut()
+                    .context("notification removal outside snapshot")?;
+                removals.add(removal)?;
+            }
             NotificationSync::SnapshotEnd if !self.hub.is_coordinator() => {
-                let (epoch, records) = self
+                let (epoch, records, removals) = self
                     .staged
                     .take()
                     .context("notification snapshot end without start")?;
                 let mut state = self.hub.0.state.lock().await;
-                if state.epoch == epoch && state.records == records {
+                ensure!(
+                    !records.iter().any(|r| removals.contains(&r.key)),
+                    "active notification is also removed"
+                );
+                if state.epoch == epoch && state.records == records && state.removals == removals {
                     return Ok(());
                 }
                 let mut next = state.clone();
                 next.epoch = epoch;
                 next.records = records;
+                next.removals = removals;
+                // A committed removal supersedes queued updates as well as their content.
+                next.pending
+                    .retain(|operation| !next.removals.contains(&operation.key));
                 self.hub.persist(&next).await?;
                 *state = next;
                 drop(state);
@@ -1229,6 +1348,7 @@ impl Drop for ByteBudget {
 struct IncomingSnapshot {
     epoch: String,
     records: Vec<NotificationRecord>,
+    removals: Vec<NotificationRemoval>,
     budget: ByteBudget,
 }
 enum IncomingNotification {
@@ -1255,6 +1375,7 @@ impl SessionLink {
                 self.staged = Some(IncomingSnapshot {
                     epoch,
                     records: Vec::new(),
+                    removals: Vec::new(),
                     budget: ByteBudget {
                         shared: self.buffered_bytes.clone(),
                         bytes: 0,
@@ -1283,6 +1404,20 @@ impl SessionLink {
                     });
                 snapshot.budget.reserve(bytes)?;
                 snapshot.records.push(record);
+                return Ok(());
+            }
+            NotificationSync::Removed(removal) => {
+                let snapshot = self
+                    .staged
+                    .as_mut()
+                    .context("notification removal outside snapshot")?;
+                ensure!(
+                    snapshot.removals.len() < MAX_REMOVALS,
+                    "notification removal metadata is full"
+                );
+                let bytes = serde_json::to_vec(&removal)?.len() + 128;
+                snapshot.budget.reserve(bytes)?;
+                snapshot.removals.push(removal);
                 return Ok(());
             }
             NotificationSync::SnapshotEnd => IncomingNotification::Snapshot(
@@ -1325,6 +1460,7 @@ impl SessionLink {
                                 IncomingNotification::Snapshot(snapshot) => {
                                     link.receive(NotificationSync::SnapshotStart { epoch: snapshot.epoch }).await?;
                                     for record in snapshot.records { link.receive(NotificationSync::Record(record)).await?; }
+                                    for removal in snapshot.removals { link.receive(NotificationSync::Removed(removal)).await?; }
                                     // Keep the budget until the snapshot has committed.
                                     let result = link.receive(NotificationSync::SnapshotEnd).await;
                                     drop(snapshot.budget);
@@ -1864,9 +2000,7 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .find(|r| r.key == first)
+                .record(&first)
                 .unwrap()
                 .content
                 .is_none()
@@ -1932,9 +2066,217 @@ mod tests {
             .apply(&edge_crypto::fingerprint(&[2; 32]), &op(1, None))
             .unwrap();
         store.apply(&key().origin, &op(4, Some(content()))).unwrap();
-        assert!(store.records[0].content.is_none());
-        assert_eq!(store.records.len(), 1);
+        assert!(store.record(&key()).unwrap().content.is_none());
+        assert!(store.records.is_empty());
     }
+    #[test]
+    fn full_replica_can_queue_dismissals_without_admitting_new_records() {
+        let mut store = Store {
+            local_identity: key().origin,
+            ..Store::default()
+        };
+        for i in 0..MAX_RECORDS {
+            let mut record_key = key();
+            record_key.instance = format!("capacity/{i}");
+            store.records.push(NotificationRecord {
+                key: record_key,
+                source_sequence: 1,
+                content: Some(content()),
+            });
+        }
+        let first = store.records[0].key.clone();
+        let second = store.records[1].key.clone();
+        assert!(store.queue_local(first.clone(), None, false).unwrap());
+        assert!(store.queue_local(second.clone(), None, false).unwrap());
+        assert!(store.record(&first).unwrap().content.is_none());
+        assert!(store.record(&second).unwrap().content.is_none());
+        assert_eq!(store.pending.len(), 2);
+        let recovered: Store =
+            serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert!(recovered.record(&first).unwrap().content.is_none());
+        assert!(store.queue_local(key(), Some(content()), false).is_err());
+    }
+
+    #[test]
+    fn replica_capacity_counts_pending_updates_once() {
+        let mut store = Store {
+            local_identity: key().origin,
+            ..Store::default()
+        };
+        for i in 0..MAX_RECORDS - 1 {
+            let mut record_key = key();
+            record_key.instance = format!("capacity/{i}");
+            store.records.push(NotificationRecord {
+                key: record_key,
+                source_sequence: 1,
+                content: Some(content()),
+            });
+        }
+        let existing = store.records[0].key.clone();
+        assert!(store.queue_local(existing, None, false).unwrap());
+        assert!(store.queue_local(key(), Some(content()), false).unwrap());
+        assert_eq!(store.view().len(), MAX_RECORDS - 1);
+        let mut extra = key();
+        extra.instance = "capacity/extra".into();
+        assert!(store.queue_local(extra, Some(content()), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_store_migrates_with_a_backup_and_keeps_active_entries_and_pending_closures() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = key().origin;
+        let mut old = Store {
+            local_identity: a.clone(),
+            coordinator: a.clone(),
+            epoch: "a".repeat(32),
+            ..Store::default()
+        };
+        old.records.push(NotificationRecord {
+            key: key(),
+            source_sequence: 1,
+            content: None,
+        });
+        let mut live = key();
+        live.instance = "epoch-1/43".into();
+        old.records.push(NotificationRecord {
+            key: live.clone(),
+            source_sequence: 2,
+            content: Some(content()),
+        });
+        old.sequence = 3;
+        old.pending.push(NotificationOperation {
+            key: key(),
+            sequence: 2,
+            content: Some(content()),
+        });
+        old.pending.push(NotificationOperation {
+            key: live.clone(),
+            sequence: 3,
+            content: None,
+        });
+        let path = directory.path().join("store.json");
+        tokio::fs::write(&path, serde_json::to_vec(&old).unwrap())
+            .await
+            .unwrap();
+        let config = NotificationConfig {
+            enabled: true,
+            coordinator_fingerprint: a.clone(),
+            peers: Vec::new(),
+        };
+        let service = NotificationHub::start(&config, &a, "Test", directory.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let state = service.hub.0.state.lock().await;
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.record(&key()).unwrap().content.is_none());
+        assert!(state.record(&live).unwrap().content.is_none());
+        drop(state);
+        let restored: Store =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(restored.records.iter().all(|r| r.content.is_some()));
+        assert!(restored.removals.contains(&key()));
+        let backup: Store = serde_json::from_slice(
+            &tokio::fs::read(
+                directory
+                    .path()
+                    .join("store.before-removal-compaction.json"),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup.records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn committed_removal_discards_offline_queued_content_without_waiting_for_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = key().origin;
+        let b = edge_crypto::fingerprint(&[2; 32]);
+        let service = NotificationHub::start(
+            &NotificationConfig {
+                enabled: true,
+                coordinator_fingerprint: b.clone(),
+                peers: vec![b.clone()],
+            },
+            &a,
+            "Test",
+            directory.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        service.hub.local(key(), Some(content())).await.unwrap();
+        let mut link = service.hub.link(&b, true).unwrap();
+        link.receive(NotificationSync::Settings { coordinator: b })
+            .await
+            .unwrap();
+        link.receive(NotificationSync::SnapshotStart {
+            epoch: "a".repeat(32),
+        })
+        .await
+        .unwrap();
+        link.receive(NotificationSync::Removed(NotificationRemoval::Range {
+            origin: a,
+            prefix: "epoch-1".into(),
+            first: 42,
+            last: 42,
+        }))
+        .await
+        .unwrap();
+        link.receive(NotificationSync::SnapshotEnd).await.unwrap();
+        let saved: Store = serde_json::from_slice(
+            &tokio::fs::read(directory.path().join("store.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(saved.records.is_empty());
+        assert!(saved.pending.is_empty());
+        assert!(saved.removals.contains(&key()));
+    }
+
+    #[test]
+    fn dismissed_history_compacts_and_long_running_churn_does_not_fill_active_history() {
+        let mut store = Store {
+            local_identity: key().origin,
+            ..Store::default()
+        };
+        for i in 0..MAX_RECORDS {
+            let mut old = key();
+            old.instance = format!("epoch/{i}");
+            store.records.push(NotificationRecord {
+                key: old,
+                source_sequence: i as u64 + 1,
+                content: None,
+            });
+        }
+        assert!(store.compact_legacy().unwrap());
+        assert!(store.records.is_empty());
+        assert_eq!(store.removals.len(), 1);
+        for i in MAX_RECORDS..MAX_RECORDS * 3 {
+            let mut fresh = key();
+            fresh.instance = format!("epoch/{i}");
+            assert!(
+                store
+                    .queue_local(fresh.clone(), Some(content()), true)
+                    .unwrap()
+            );
+            assert!(store.queue_local(fresh, None, true).unwrap());
+        }
+        assert!(store.records.is_empty());
+        assert_eq!(store.removals.len(), 1);
+        let encoded = serde_json::to_vec(&store).unwrap();
+        assert!(encoded.len() < 1024);
+        let mut restored: Store = serde_json::from_slice(&encoded).unwrap();
+        let mut stale = key();
+        stale.instance = "epoch/42".into();
+        assert!(!restored.queue_local(stale, Some(content()), true).unwrap());
+        assert!(restored.records.is_empty());
+    }
+
     #[test]
     fn source_impersonation_and_remote_paths_are_rejected() {
         let mut store = Store::default();
@@ -1975,11 +2317,11 @@ mod tests {
             key: key(),
             content: None,
         });
-        assert!(store.view()[0].content.is_none());
-        assert_eq!(store.record(&key()), Some(store.view()[0].clone()));
+        assert!(store.view().is_empty());
+        assert!(store.record(&key()).unwrap().content.is_none());
         let recovered: Store =
             serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
-        assert!(recovered.view()[0].content.is_none());
+        assert!(recovered.record(&key()).unwrap().content.is_none());
     }
     #[tokio::test]
     async fn two_nodes_reconcile_offline_dismissal_and_reject_a_reset_authority() {
@@ -2040,7 +2382,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(restored.view()[0].content.is_none());
+        assert!(restored.record(&key()).unwrap().content.is_none());
         assert_eq!(restored.pending.len(), 1);
         outgoing.receive(incoming.next().await).await.unwrap();
         for _ in 0..4 {
@@ -2048,8 +2390,29 @@ mod tests {
             incoming.receive(event).await.unwrap();
         }
         assert!(laptop.hub.0.state.lock().await.pending.is_empty());
-        assert!(main.hub.0.state.lock().await.records[0].content.is_none());
-        assert!(laptop.hub.0.state.lock().await.view()[0].content.is_none());
+        assert!(
+            main.hub
+                .0
+                .state
+                .lock()
+                .await
+                .record(&key())
+                .unwrap()
+                .content
+                .is_none()
+        );
+        assert!(
+            laptop
+                .hub
+                .0
+                .state
+                .lock()
+                .await
+                .record(&key())
+                .unwrap()
+                .content
+                .is_none()
+        );
         // A lost/recreated coordinator store must not silently clear replicas.
         assert!(
             incoming
@@ -2061,7 +2424,17 @@ mod tests {
         );
         // Delayed source inventories cannot resurrect the dismissed instance.
         main.hub.local(key(), Some(content())).await.unwrap();
-        assert!(main.hub.0.state.lock().await.records[0].content.is_none());
+        assert!(
+            main.hub
+                .0
+                .state
+                .lock()
+                .await
+                .record(&key())
+                .unwrap()
+                .content
+                .is_none()
+        );
         // Reloading durable state restores the terminal marker.
         let recovered: Store = serde_json::from_slice(
             &tokio::fs::read(directory.path().join("main/store.json"))
@@ -2069,7 +2442,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(recovered.records[0].content.is_none());
+        assert!(recovered.record(&key()).unwrap().content.is_none());
     }
     /// Run only on a private bus; this test owns its notification service name.
     #[tokio::test]
@@ -2339,9 +2712,8 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .any(|r| r.key == remote && r.content.is_none())
+                .record(&remote)
+                .is_some_and(|r| r.content.is_none())
             {
                 break;
             }
@@ -2354,9 +2726,8 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .any(|r| r.key == remote && r.content.is_none()),
+                .record(&remote)
+                .is_some_and(|r| r.content.is_none()),
             "dismissal did not reach hub"
         );
         // Reload must preserve source identity and must not create a duplicate.
@@ -2381,7 +2752,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(entries(root, &environment).await.unwrap().len(), 1);
         let state = service.hub.0.state.lock().await;
-        assert_eq!(state.records.len(), 2);
+        assert_eq!(state.records.len(), 1);
         assert!(
             state
                 .records
@@ -2459,7 +2830,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries(root, &environment).await.unwrap().len(), 2);
-        assert_eq!(service.hub.0.state.lock().await.records.len(), 2);
+        assert_eq!(service.hub.0.state.lock().await.records.len(), 1);
         let mut orphaned_mirror = NotificationMirror::default();
         orphaned_mirror
             .apply(
@@ -2542,9 +2913,8 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .any(|r| r.key == phone_key && r.content.is_none())
+                .record(&phone_key)
+                .is_some_and(|r| r.content.is_none())
             {
                 break;
             }
@@ -2561,9 +2931,8 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .any(|r| r.key == phone_key && r.content.is_none())
+                .record(&phone_key)
+                .is_some_and(|r| r.content.is_none())
         );
         assert_eq!(entries(root, &environment).await.unwrap().len(), 1);
         // A fresh phone post remains visible without a bridge. Snapshot replay
@@ -2806,8 +3175,8 @@ mod tests {
             true
         );
 
-        // At the lifetime history limit, native delivery/bridge and phone
-        // delivery still work. Errors must not retire a partial phone import.
+        // Inject a full legacy history without startup migration to exercise
+        // capacity failures. Delivery must continue and partial imports must not retire entries.
         {
             let mut state = service.hub.0.state.lock().await;
             while state.records.len() < MAX_RECORDS {
@@ -2952,9 +3321,8 @@ mod tests {
                 .state
                 .lock()
                 .await
-                .records
-                .iter()
-                .any(|r| r.key == overflow_key && r.content.is_none())
+                .record(&overflow_key)
+                .is_some_and(|r| r.content.is_none())
         );
         child.kill().await.unwrap();
     }
