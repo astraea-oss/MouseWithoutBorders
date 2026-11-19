@@ -23,7 +23,7 @@ pub const HYPR_PHONE_EXTENSION: &str = "hypr-phone-v1";
 /// shows them.
 pub const NOTIFICATIONS_EXTENSION: &str = "notifications-v1";
 /// Shared desktop notification state; independent of KVM input roles.
-pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v2";
+pub const NOTIFICATION_SYNC_EXTENSION: &str = "notification-sync-v3";
 /// A phone that accepts [`PhoneEvent::AudioInvite`], so the computer can ask
 /// it to start a stream.
 pub const PHONE_AUDIO_INVITE_EXTENSION: &str = "phone-audio-invite-v1";
@@ -92,7 +92,7 @@ pub enum Frame {
     Phone(PhoneEvent),
     /// Phone → receiver, only with `notifications-v1`.
     Notification(NotificationEvent),
-    /// Only exchanged by explicitly enrolled PCs advertising notification-sync-v2.
+    /// Only exchanged by explicitly enrolled PCs advertising notification-sync-v3.
     NotificationSync(NotificationSync),
 }
 
@@ -131,6 +131,19 @@ pub struct NotificationRecord {
     pub content: Option<SharedNotification>,
 }
 
+/// Exact, content-free removal metadata. Numeric source IDs merge into ranges;
+/// other lifetime identifiers retain only their key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationRemoval {
+    Range {
+        origin: String,
+        prefix: String,
+        first: u64,
+        last: u64,
+    },
+    Key(NotificationKey),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationSync {
     Submit(NotificationOperation),
@@ -139,6 +152,7 @@ pub enum NotificationSync {
     Record(NotificationRecord),
     SnapshotEnd,
     Settings { coordinator: String },
+    Removed(NotificationRemoval),
 }
 
 impl Frame {
@@ -1456,6 +1470,16 @@ mod tests {
                     urgency: 2,
                 }),
             }),
+            NotificationSync::Removed(NotificationRemoval::Range {
+                origin: "01234567:89abcdef:01234567:89abcdef".into(),
+                prefix: "epoch".into(),
+                first: 0,
+                last: u64::MAX,
+            }),
+            NotificationSync::Removed(NotificationRemoval::Key(NotificationKey {
+                origin: "01234567:89abcdef:01234567:89abcdef".into(),
+                instance: "phone/test/random-lifetime".into(),
+            })),
             NotificationSync::SnapshotEnd,
         ] {
             let frame = Frame::NotificationSync(event);

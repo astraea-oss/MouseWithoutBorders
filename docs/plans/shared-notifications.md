@@ -3,8 +3,9 @@
 Status: Linux PC synchronization, existing-settings setup, source device labels,
 and phone notification ingestion are implemented. The laptop notification centre
 has been ported from the merged Tera configuration. Final physical two-PC
-acceptance, reverse Android dismissal, incremental replay, and automatic
-compaction remain outstanding. See
+acceptance, reverse Android dismissal, and incremental replay remain outstanding.
+Dismissed rows now compact into content-free ID ranges/keys outside active history;
+safe complete retirement of removal metadata remains deferred. See
 [setup and current limits](../../integrations/quickshell/README.md) for implemented
 behaviour; the sections below also include deferred design work.
 

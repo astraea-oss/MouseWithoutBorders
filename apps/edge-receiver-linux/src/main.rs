@@ -90,6 +90,7 @@ mod clipboard_hub;
 mod control;
 mod control_link;
 mod notification_hub;
+mod notification_removals;
 mod notification_setup;
 mod notifications;
 mod phone;
