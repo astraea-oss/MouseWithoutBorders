@@ -7,15 +7,25 @@
 //!
 //! Capture waits for damage: a still window produces a frame only every
 //! [`KEEPALIVE`], which keeps the phone's view fresh enough to tap.
+//!
+//! No frame is ever sent over [`REMOTE_VIDEO_MAX_FRAME`]: the phone drops its
+//! whole connection on one. A large, detailed window (an ultrawide game, say)
+//! can produce a first keyframe over the limit, so an oversized frame is
+//! re-encoded at a coarser [quality step](MAX_QUALITY_STEP).
 use anyhow::{Context, Result, ensure};
 use edge_linux_input::{CapturedRegion, ScreenCopy};
-use edge_protocol::{FocusRect, FocusedWindow};
+use edge_protocol::{FocusRect, FocusedWindow, REMOTE_VIDEO_MAX_FRAME};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// How many times a too-large frame may coarsen the encoder, each step
+/// raising `const-quality` by [`QUALITY_STEP`].
+const MAX_QUALITY_STEP: u8 = 4;
+const QUALITY_STEP: u8 = 4;
 
 /// A still window still gets a frame this often.
 pub(crate) const KEEPALIVE: Duration = Duration::from_millis(500);
@@ -59,12 +69,25 @@ impl Mode {
         }
     }
 
-    fn encoder_settings(self) -> &'static str {
-        match self {
-            Self::Text => "preset=p4 tune=low-latency rc-mode=vbr const-quality=20",
-            Self::Media => {
-                "preset=p1 tune=ultra-low-latency rc-mode=vbr const-quality=26 max-bitrate=20000"
-            }
+    /// `step` coarsens the quality to keep frames under the phone's limit.
+    /// `const-quality` alone doesn't reach a new encoder's first keyframe,
+    /// whose quantizer NVENC picks itself (2.1 MB for a 3440x1440 game), so
+    /// keyframes always get a minimum QP, and a coarser step also floors P
+    /// frames.
+    fn encoder_settings(self, step: u8) -> String {
+        let step = step.min(MAX_QUALITY_STEP);
+        let (base, settings) = match self {
+            Self::Text => (20, "preset=p4 tune=low-latency rc-mode=vbr"),
+            Self::Media => (
+                26,
+                "preset=p1 tune=ultra-low-latency rc-mode=vbr max-bitrate=20000",
+            ),
+        };
+        let quality = base + step * QUALITY_STEP;
+        if step == 0 {
+            format!("{settings} const-quality={quality} qp-min-i={quality}")
+        } else {
+            format!("{settings} const-quality={quality} qp-min-i={quality} qp-min-p={quality}")
         }
     }
 }
@@ -81,7 +104,13 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(width: u32, height: u32, format: &'static str, mode: Mode) -> Result<Self> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        format: &'static str,
+        mode: Mode,
+        step: u8,
+    ) -> Result<Self> {
         ensure!(available(), "This computer can't stream video");
         ensure!(
             width >= 144 && height >= 48,
@@ -99,7 +128,7 @@ impl Encoder {
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false max-buffers=2",
-            settings = mode.encoder_settings(),
+            settings = mode.encoder_settings(step),
         );
         let pipeline = gst::parse::launch(&description)
             .context("Could not build the video encoder")?
@@ -223,6 +252,9 @@ pub(crate) async fn source(
     let mut last_sent = Instant::now() - KEEPALIVE;
     let mut last_window: Option<FocusedWindow> = None;
     let mut unlocked_at: Option<Instant> = None;
+    // Raised whenever a frame comes out over the phone's limit; kept for the
+    // rest of the view, since the same window will keep producing such frames.
+    let mut quality_step = 0_u8;
     loop {
         let started = Instant::now();
         let (mode, restart) = {
@@ -279,6 +311,7 @@ pub(crate) async fn source(
         let wait = mode.interval();
         let mut job_copier = copier.take();
         let mut job_encoder = encoder.take();
+        let mut step = quality_step;
         let job = tokio::task::spawn_blocking(move || {
             let result: Result<Option<Job>> = (|| {
                 if job_copier.is_none() {
@@ -302,7 +335,7 @@ pub(crate) async fn source(
                     width,
                     height,
                     format,
-                    data,
+                    mut data,
                 }) = captured
                 else {
                     return Ok(None);
@@ -311,9 +344,39 @@ pub(crate) async fn source(
                 let key = (width, height, format, mode);
                 if restart || job_encoder.as_ref().is_none_or(|e| e.key != key) {
                     job_encoder = None;
-                    job_encoder = Some(Encoder::new(width, height, format, mode)?);
+                    job_encoder = Some(Encoder::new(width, height, format, mode, step)?);
                 }
-                let (data, keyframe, codec) = job_encoder.as_mut().unwrap().encode(data)?;
+                let (data, keyframe, codec) = loop {
+                    // A new encoder's frame is a keyframe; keep the pixels so an
+                    // oversized one can be redone at once on a coarser encoder.
+                    let fresh = job_encoder.as_ref().is_some_and(|e| e.frames == 0);
+                    let retry = fresh.then(|| data.clone());
+                    let encoded = job_encoder.as_mut().unwrap().encode(data)?;
+                    if encoded.0.len() <= REMOTE_VIDEO_MAX_FRAME {
+                        break encoded;
+                    }
+                    // The phone never sees this frame, so the encoder's chain
+                    // must restart either way.
+                    job_encoder = None;
+                    ensure!(
+                        step < MAX_QUALITY_STEP,
+                        "This window is too detailed to stream at {width}x{height}; make it smaller"
+                    );
+                    step += 1;
+                    tracing::info!(
+                        bytes = encoded.0.len(),
+                        limit = REMOTE_VIDEO_MAX_FRAME,
+                        step,
+                        "remote video frame over the phone's limit; coarsening"
+                    );
+                    let Some(pixels) = retry else {
+                        // A delta frame: drop it; the next frame starts a coarser
+                        // keyframe.
+                        return Ok(None);
+                    };
+                    job_encoder = Some(Encoder::new(width, height, format, mode, step)?);
+                    data = pixels;
+                };
                 Ok(Some((
                     data,
                     keyframe,
@@ -324,13 +387,14 @@ pub(crate) async fn source(
                     encode_started.elapsed(),
                 )))
             })();
-            (job_copier, job_encoder, result)
+            (job_copier, job_encoder, step, result)
         });
-        let Ok((kept_copier, kept_encoder, result)) = job.await else {
+        let Ok((kept_copier, kept_encoder, kept_step, result)) = job.await else {
             return;
         };
         copier = kept_copier;
         encoder = kept_encoder;
+        quality_step = kept_step;
         let (data, keyframe, codec, width, height, capture, encode) = match result {
             Ok(Some(encoded)) => encoded,
             Ok(None) => continue,
@@ -377,6 +441,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyframes_always_have_a_quality_floor_and_steps_only_coarsen() {
+        for mode in [Mode::Text, Mode::Media] {
+            let quality = |step| {
+                let settings = mode.encoder_settings(step);
+                assert!(settings.contains("qp-min-i="), "{settings}");
+                assert_eq!(settings.contains("qp-min-p="), step > 0, "{settings}");
+                settings
+                    .split_whitespace()
+                    .find_map(|s| s.strip_prefix("const-quality="))
+                    .unwrap()
+                    .parse::<u8>()
+                    .unwrap()
+            };
+            for step in 1..=MAX_QUALITY_STEP {
+                assert!(quality(step) > quality(step - 1));
+            }
+            assert_eq!(quality(MAX_QUALITY_STEP + 3), quality(MAX_QUALITY_STEP));
+            assert!(quality(MAX_QUALITY_STEP) <= 51);
+        }
+    }
+
+    #[test]
     fn modes_trade_sharpness_for_frame_rate() {
         assert_eq!(Mode::default(), Mode::Text);
         assert!(Mode::Media.interval() < Mode::Text.interval());
@@ -404,6 +490,11 @@ mod tests {
                     break;
                 };
                 let frame = frame.unwrap();
+                assert!(
+                    frame.data.len() <= REMOTE_VIDEO_MAX_FRAME,
+                    "{} bytes is over the phone's limit",
+                    frame.data.len()
+                );
                 frames += 1;
                 keyframes += u32::from(frame.keyframe);
                 bytes += frame.data.len();
@@ -427,7 +518,7 @@ mod tests {
     #[ignore = "requires GStreamer with NVENC"]
     fn encodes_one_access_unit_per_frame_starting_with_a_keyframe() {
         for mode in [Mode::Text, Mode::Media] {
-            let mut encoder = Encoder::new(874, 1428, "BGRx", mode).unwrap();
+            let mut encoder = Encoder::new(874, 1428, "BGRx", mode, 0).unwrap();
             let started = Instant::now();
             let (first, key, codec) = encoder.encode(vec![40; 874 * 1428 * 4]).unwrap();
             assert!(key && first.starts_with(&[0, 0, 0, 1]));
