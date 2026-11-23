@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 pub const MAIN: &str = "main";
 pub const PAIR_PHONE: &str = "pair-phone";
 pub const PAIR_PHONE_TITLE: &str = "Add a phone · hyprKvm";
+const PAIR_PHONE_SIZE: (f64, f64) = (380.0, 520.0);
 
 const DECORATED: bool = cfg!(windows);
 
@@ -82,7 +83,11 @@ pub fn open_pair_phone(app: &AppHandle) -> Result<()> {
     }
     WebviewWindowBuilder::new(app, PAIR_PHONE, WebviewUrl::App("pair-phone".into()))
         .title(PAIR_PHONE_TITLE)
-        .inner_size(380.0, 520.0)
+        .inner_size(PAIR_PHONE_SIZE.0, PAIR_PHONE_SIZE.1)
+        // Equal minimum and maximum sizes make it a fixed-size window, which
+        // Hyprland floats (and centres) without any user rule.
+        .min_inner_size(PAIR_PHONE_SIZE.0, PAIR_PHONE_SIZE.1)
+        .max_inner_size(PAIR_PHONE_SIZE.0, PAIR_PHONE_SIZE.1)
         .resizable(false)
         .decorations(DECORATED)
         .center()

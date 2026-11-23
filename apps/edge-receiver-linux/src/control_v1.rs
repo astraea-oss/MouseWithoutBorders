@@ -355,7 +355,9 @@ impl Connection {
                         return Err(error(ErrorKind::NotFound, format!("{name} isn't paired")));
                     }
                     Ok(Err(message)) => return Err(error(ErrorKind::Failed, message)),
-                    Err(_) => return Err(error(ErrorKind::Failed, "no answer from phone sessions")),
+                    Err(_) => {
+                        return Err(error(ErrorKind::Failed, "no answer from phone sessions"));
+                    }
                 }
             }
             Request::Settings => {
@@ -457,7 +459,12 @@ impl Connection {
     async fn load_config(&self) -> Result<AppConfig, Outcome> {
         AppConfig::load(&self.context.config_path)
             .await
-            .map_err(|e| error(ErrorKind::Failed, format!("couldn't read the settings: {e}")))
+            .map_err(|e| {
+                error(
+                    ErrorKind::Failed,
+                    format!("couldn't read the settings: {e}"),
+                )
+            })
     }
 
     async fn notification_setup(&self) -> Option<edge_control::NotificationSetup> {
@@ -574,9 +581,7 @@ mod tests {
     use edge_control::{client::Client, framing::preamble};
     use tokio::{io::AsyncWriteExt, net::UnixStream};
 
-    fn context(
-        dir: &Path,
-    ) -> (ControlContext, mpsc::UnboundedReceiver<PhoneRequest>) {
+    fn context(dir: &Path) -> (ControlContext, mpsc::UnboundedReceiver<PhoneRequest>) {
         let (requests, received) = mpsc::unbounded_channel();
         (
             ControlContext {
@@ -766,7 +771,10 @@ mod tests {
         };
         assert_eq!(error.kind, ErrorKind::Invalid);
         assert_eq!(error.fields[0].field, "port");
-        assert_eq!(std::fs::read_to_string(&context.config_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(&context.config_path).unwrap(),
+            before
+        );
 
         // A draft made from older settings is refused rather than applied.
         let mut stale = base.clone();
@@ -783,7 +791,10 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(std::fs::read_to_string(&context.config_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(&context.config_path).unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

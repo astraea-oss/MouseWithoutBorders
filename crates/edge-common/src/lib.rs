@@ -39,6 +39,12 @@ pub enum ConfigValidationError {
     InvalidPort,
     #[error("host must not be empty")]
     EmptyHost,
+    #[error("enter the address without a port; the port has its own field")]
+    HostHasPort,
+    #[error("put an IPv6 address in brackets, like [fd00::1]")]
+    UnbracketedIpv6,
+    #[error("not a valid IP address or host name")]
+    InvalidHost,
     #[error("listen address must include a port")]
     MissingListenPort,
     #[error("listen port is invalid")]
@@ -782,12 +788,61 @@ pub fn validate_port(port: u16) -> std::result::Result<(), ConfigValidationError
     }
 }
 
+/// Accepts what the node can dial as `{host}:{port}`: an IPv4 address, an
+/// IPv6 address in brackets, or a DNS host name.
 pub fn validate_host(host: &str) -> std::result::Result<(), ConfigValidationError> {
-    if host.trim().is_empty() {
-        Err(ConfigValidationError::EmptyHost)
-    } else {
-        Ok(())
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(ConfigValidationError::EmptyHost);
     }
+    if let Some(inner) = host.strip_prefix('[') {
+        return match inner.split_once(']') {
+            Some((address, "")) if address.parse::<std::net::Ipv6Addr>().is_ok() => Ok(()),
+            Some((address, rest))
+                if address.parse::<std::net::Ipv6Addr>().is_ok() && rest.starts_with(':') =>
+            {
+                Err(ConfigValidationError::HostHasPort)
+            }
+            _ => Err(ConfigValidationError::InvalidHost),
+        };
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err(ConfigValidationError::UnbracketedIpv6);
+    }
+    if let Some((name, port)) = host.rsplit_once(':') {
+        return if !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && (name.parse::<Ipv4Addr>().is_ok() || is_host_name(name))
+        {
+            Err(ConfigValidationError::HostHasPort)
+        } else {
+            Err(ConfigValidationError::InvalidHost)
+        };
+    }
+    if host.parse::<Ipv4Addr>().is_ok() || is_host_name(host) {
+        Ok(())
+    } else {
+        Err(ConfigValidationError::InvalidHost)
+    }
+}
+
+/// An RFC 1123 host name: dot-separated labels of letters, digits and
+/// hyphens, none starting or ending with a hyphen. A name made only of
+/// digits and dots is a mistyped IPv4 address, not a name.
+fn is_host_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty()
+        && name.len() <= 253
+        && !name.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn split_host_port(value: &str) -> Option<(&str, &str)> {
@@ -953,6 +1008,37 @@ backend = "auto"
         );
         assert_eq!(validate_host(""), Err(ConfigValidationError::EmptyHost));
         assert_eq!(validate_port(0), Err(ConfigValidationError::InvalidPort));
+    }
+
+    #[test]
+    fn hosts_must_be_dialable() {
+        for ok in [
+            "192.168.0.11",
+            " 192.168.0.11 ",
+            "lua",
+            "lua.local",
+            "my-pc.example.com.",
+            "[fd00::1]",
+            "[::1]",
+        ] {
+            assert_eq!(validate_host(ok), Ok(()), "{ok}");
+        }
+        for (bad, expected) in [
+            ("not a host!", ConfigValidationError::InvalidHost),
+            ("lua_pc", ConfigValidationError::InvalidHost),
+            ("-lua", ConfigValidationError::InvalidHost),
+            ("192.168.0.300", ConfigValidationError::InvalidHost),
+            ("192.168.0", ConfigValidationError::InvalidHost),
+            ("[fd00::1", ConfigValidationError::InvalidHost),
+            ("[lua]", ConfigValidationError::InvalidHost),
+            ("http://lua", ConfigValidationError::InvalidHost),
+            ("fd00::1", ConfigValidationError::UnbracketedIpv6),
+            ("192.168.0.11:42420", ConfigValidationError::HostHasPort),
+            ("lua.local:42420", ConfigValidationError::HostHasPort),
+            ("[fd00::1]:42420", ConfigValidationError::HostHasPort),
+        ] {
+            assert_eq!(validate_host(bad), Err(expected), "{bad}");
+        }
     }
 
     #[test]

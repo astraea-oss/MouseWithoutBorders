@@ -14,7 +14,7 @@ through the explicit commands in `src-tauri/src/commands.rs`.
 | Area | State |
 | --- | --- |
 | Home (status, tiles, Arrangement, Sharing, Devices, Notifications, This computer, Advanced) | Working on Linux against the new backend |
-| Add a phone popup | Working on Linux; closing it withdraws the code |
+| Add a phone popup | Working on Linux; floats by itself; closing it withdraws the code |
 | Confirm computer popup | Not yet: computer pairing still confirms in the egui window (M3) |
 | View | Shown as unavailable; not started (M4/M5) |
 | Windows | Builds, but the Windows backend has no control endpoint yet, so the UI reports it as not running |
@@ -56,17 +56,17 @@ systemctl --user edit edge-kvm-receiver.service
 
 The windows have no decorations on Linux; Hyprland's border is the frame.
 Every window has the class `hyprkvm` (GTK gives the app one Wayland app ID,
-so popups can't have their own class). Match the popup by title instead:
+so popups can't have their own class).
+
+The Add a phone popup has a fixed size (equal minimum and maximum), so
+Hyprland floats and centres it at 380 × 520 without any window rule; checked
+on Hyprland 0.57.2. Home tiles like any other window. To style the popup
+further, match it by title:
 
 ```lua
 hl.window_rule({
     name = "hyprkvm-pair",
     match = { class = "^hyprkvm$", title = "^Add a phone · hyprKvm$" },
-    float = true,
-    center = true,
+    -- e.g. pin = true,
 })
 ```
-
-(`hyprland.conf` syntax: `windowrule = float, center, class:^(hyprkvm)$, title:^(Add a phone · hyprKvm)$`.)
-Matching on `class` with `float` was checked on Hyprland 0.57.2; the title
-match and `center` were not.

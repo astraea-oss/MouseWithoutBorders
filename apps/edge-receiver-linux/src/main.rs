@@ -3344,7 +3344,10 @@ fn open_hyprkvm(route: &str, config_path: &Path, log_path: &Path) -> bool {
         Err(error) => {
             append_portable_log(
                 log_path,
-                format!("failed to start {}: {error}; using the old windows", ui.display()),
+                format!(
+                    "failed to start {}: {error}; using the old windows",
+                    ui.display()
+                ),
             );
             false
         }
