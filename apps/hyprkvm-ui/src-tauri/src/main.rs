@@ -78,7 +78,10 @@ fn main() {
         .on_window_event(|window, event| {
             // Closing the popup withdraws its code; it never approves anything.
             if window.label() == windows::PAIR_PHONE && matches!(event, WindowEvent::Destroyed) {
-                let backend = window.state::<std::sync::Arc<backend::Backend>>().inner().clone();
+                let backend = window
+                    .state::<std::sync::Arc<backend::Backend>>()
+                    .inner()
+                    .clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = backend
                         .request(edge_control::protocol::Request::CancelPhonePairing)

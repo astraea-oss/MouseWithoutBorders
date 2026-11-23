@@ -3,9 +3,9 @@
 
 use anyhow::{Context, Result};
 use edge_common::{
-    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode,
-    NotificationConfig, PeerPosition, TransportMode, parse_listen_port, update_listen_port,
-    validate_device_name, validate_host, validate_port,
+    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, NotificationConfig,
+    PeerPosition, TransportMode, parse_listen_port, update_listen_port, validate_device_name,
+    validate_host, validate_port,
 };
 use serde::{Deserialize, Serialize};
 

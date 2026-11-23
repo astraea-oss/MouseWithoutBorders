@@ -23,7 +23,10 @@ pub struct PhoneEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhonePairingEvent {
     /// Show this link as a QR code until it expires.
-    Offer { uri: String, expires_in: Duration },
+    Offer {
+        uri: String,
+        expires_in: Duration,
+    },
     Paired(String),
     /// Expired or replaced by a newer pairing.
     Closed,

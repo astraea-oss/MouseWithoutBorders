@@ -102,11 +102,17 @@ mod tests {
     #[test]
     fn routes_come_from_either_flag_form() {
         assert_eq!(Route::from_args(&["hyprkvm"]), Route::Home);
-        assert_eq!(Route::from_args(&["hyprkvm", "--route", "view"]), Route::View);
+        assert_eq!(
+            Route::from_args(&["hyprkvm", "--route", "view"]),
+            Route::View
+        );
         assert_eq!(
             Route::from_args(&["hyprkvm", "--route=pair-phone"]),
             Route::PairPhone
         );
-        assert_eq!(Route::from_args(&["hyprkvm", "--route", "nope"]), Route::Home);
+        assert_eq!(
+            Route::from_args(&["hyprkvm", "--route", "nope"]),
+            Route::Home
+        );
     }
 }

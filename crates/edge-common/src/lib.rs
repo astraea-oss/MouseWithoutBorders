@@ -742,6 +742,32 @@ pub fn portable_app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The local address on the route to `peer_host` (an IP literal, IPv6 with
+/// or without brackets): the address the other computer sees, rather than
+/// whatever carries the default route, which may be a VPN. Host names and an
+/// empty host fall back to [`detect_primary_local_ip`] so this never waits
+/// on DNS.
+pub fn local_ip_toward(peer_host: &str) -> Option<IpAddr> {
+    let host = peer_host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(peer) = host.parse::<IpAddr>() else {
+        return detect_primary_local_ip();
+    };
+    let unspecified: IpAddr = match peer {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    let toward = || {
+        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).ok()?;
+        socket.connect(SocketAddr::new(peer, 9)).ok()?;
+        Some(socket.local_addr().ok()?.ip()).filter(|ip| !ip.is_unspecified())
+    };
+    toward().or_else(detect_primary_local_ip)
+}
+
 pub fn detect_primary_local_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
     socket.connect(SocketAddr::from(([1, 1, 1, 1], 80))).ok()?;
@@ -857,6 +883,19 @@ fn split_host_port(value: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ip_toward_follows_the_route_to_the_peer() {
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        assert_eq!(local_ip_toward("127.0.0.1"), Some(loopback));
+        assert_eq!(
+            local_ip_toward("[::1]"),
+            Some(std::net::Ipv6Addr::LOCALHOST.into())
+        );
+        // Host names and an empty host never resolve; they use the default route.
+        assert_eq!(local_ip_toward("tera.local"), detect_primary_local_ip());
+        assert_eq!(local_ip_toward(""), detect_primary_local_ip());
+    }
 
     #[tokio::test]
     async fn config_round_trip() {

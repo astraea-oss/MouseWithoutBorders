@@ -394,7 +394,9 @@
           <span class="label">{linked ? peer : snap?.local_name ?? draft?.device_name ?? 'This computer'}</span>
           <h1 class="display">{hero.word}</h1>
           <span class="label">
-            {#if linked && snap?.round_trip_ms != null}{snap.round_trip_ms} ms · {/if}{settings?.local_address ?? ''}
+            <!-- Under the peer's name, the peer's address; otherwise this
+                 computer's, which is what the other side needs to type. -->
+            {#if linked}{[snap?.round_trip_ms != null ? `${snap.round_trip_ms} ms` : '', base?.peer_host ?? ''].filter(Boolean).join(' · ')}{:else}{settings?.local_address ?? ''}{/if}
           </span>
           <p>{heroLine}</p>
           {#if conn.status === 'absent'}

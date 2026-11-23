@@ -59,9 +59,15 @@ pub enum Request {
     Subscribe,
     Snapshot,
     /// Share this computer's mouse and keyboard with the connected computer.
-    SetInputForwarding { enabled: bool },
-    SetController { controller: Controller },
-    SetAudio { target: AudioTarget },
+    SetInputForwarding {
+        enabled: bool,
+    },
+    SetController {
+        controller: Controller,
+    },
+    SetAudio {
+        target: AudioTarget,
+    },
     /// Pause the computer connection without quitting.
     Disconnect,
     Reconnect,
@@ -71,11 +77,15 @@ pub enum Request {
     /// [`Event::PhonePairing`]. Closing the connection cancels it.
     StartPhonePairing,
     CancelPhonePairing,
-    UnpairPhone { name: String },
+    UnpairPhone {
+        name: String,
+    },
     /// Reply [`Reply::Settings`].
     Settings,
     /// Reply [`Reply::Validation`]. Writes nothing.
-    ValidateSettings { draft: SettingsDraft },
+    ValidateSettings {
+        draft: SettingsDraft,
+    },
     /// Validate, write and restart the backend. Reply [`Reply::Saved`], or
     /// [`ErrorKind::Invalid`] with the persisted settings left untouched.
     SaveSettings {
@@ -86,10 +96,14 @@ pub enum Request {
     },
     /// Reply [`Reply::Autostart`].
     Autostart,
-    SetAutostart { enabled: bool },
+    SetAutostart {
+        enabled: bool,
+    },
     /// Reply [`Reply::Notifications`].
     Notifications,
-    InstallNotificationBridge { shell_path: PathBuf },
+    InstallNotificationBridge {
+        shell_path: PathBuf,
+    },
     /// Reply [`Reply::Diagnostics`].
     Diagnostics,
     /// Stop the backend.
@@ -114,7 +128,9 @@ pub enum AudioTarget {
     /// The connected computer's audio plays here.
     FromPeer,
     /// This computer's audio plays on a connected phone.
-    ToPhone { fingerprint: String },
+    ToPhone {
+        fingerprint: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,13 +138,17 @@ pub enum AudioTarget {
 pub enum ServerMessage {
     Hello(Hello),
     /// The server can't speak the client's version. It closes after this.
-    Incompatible { server_protocol: u32 },
+    Incompatible {
+        server_protocol: u32,
+    },
     Response {
         id: u32,
         #[serde(flatten)]
         outcome: Outcome,
     },
-    Event { event: Event },
+    Event {
+        event: Event,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,13 +165,25 @@ pub enum Reply {
     Snapshot(Box<Snapshot>),
     PhonePairing(PhonePairingOffer),
     Settings(Box<SettingsView>),
-    Validation { errors: Vec<FieldError> },
-    Saved { restarting: bool },
+    Validation {
+        errors: Vec<FieldError>,
+    },
+    Saved {
+        restarting: bool,
+    },
     /// `None` when starting at login can't be set on this installation.
-    Autostart { enabled: Option<bool> },
-    Notifications { setup: Option<NotificationSetup> },
-    Message { text: String },
-    Diagnostics { report: String },
+    Autostart {
+        enabled: Option<bool>,
+    },
+    Notifications {
+        setup: Option<NotificationSetup>,
+    },
+    Message {
+        text: String,
+    },
+    Diagnostics {
+        report: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -209,7 +241,9 @@ pub enum Event {
     Snapshot(Box<Snapshot>),
     PhonePairing(PhonePairingUpdate),
     /// The backend is about to stop or restart; the UI should reconnect.
-    Stopping { restarting: bool },
+    Stopping {
+        restarting: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,7 +255,9 @@ pub struct PhonePairingOffer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PhonePairingUpdate {
-    Paired { name: String },
+    Paired {
+        name: String,
+    },
     /// Expired, cancelled or replaced by a newer pairing.
     Closed,
 }
@@ -376,7 +412,10 @@ mod tests {
             }])),
         };
         let text = serde_json::to_string(&message).unwrap();
-        assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), message);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&text).unwrap(),
+            message
+        );
     }
 
     #[test]

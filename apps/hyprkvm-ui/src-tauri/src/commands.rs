@@ -133,7 +133,7 @@ pub async fn load_settings(backend: State<'_, Arc<Backend>>) -> Result<SettingsV
         draft: SettingsDraft::from_config(&config),
         config_path: path,
         connector_only: cfg!(windows),
-        local_address: edge_common::detect_primary_local_ip().map(|ip| ip.to_string()),
+        local_address: edge_common::local_ip_toward(&config.peer.host).map(|ip| ip.to_string()),
         audio_buffers_ms: edge_control::AUDIO_BUFFERS_MS.to_vec(),
     })
 }
@@ -184,7 +184,10 @@ pub async fn save_settings(
     base: SettingsDraft,
 ) -> Result<SaveOutcome> {
     if backend.is_connected() {
-        return match backend.request(Request::SaveSettings { draft, base }).await? {
+        return match backend
+            .request(Request::SaveSettings { draft, base })
+            .await?
+        {
             Reply::Saved { restarting } => Ok(SaveOutcome { restarting }),
             other => Err(unexpected(other)),
         };

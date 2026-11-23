@@ -18,4 +18,6 @@ pub mod client;
 pub use draft::{
     AUDIO_BUFFERS_MS, ClipboardMode, FieldError, SettingsDraft, validate_notification_selection,
 };
-pub use status::{NodeStatus, NotificationComputer, NotificationSetup, PhoneEntry, PhonePairingEvent};
+pub use status::{
+    NodeStatus, NotificationComputer, NotificationSetup, PhoneEntry, PhonePairingEvent,
+};

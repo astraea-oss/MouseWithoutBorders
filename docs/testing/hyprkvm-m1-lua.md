@@ -68,3 +68,23 @@ writing, and phone pairing outcome plus cancellation on disconnect.
   so the Windows UI can only show "not running" today.
 - WebCodecs/HEVC decode (the M0 Windows gate) was not attempted.
 - Tera itself (NVENC host) was not available.
+
+## Re-test against the live link (2026-11-23, after `142d4d9`)
+
+Installed service backend on Lua, linked to Tera over the LAN. Driven through
+the control protocol and the UI on a headless output.
+
+| Check | Result |
+| --- | --- |
+| Snapshot: Linked, peer Tera, round trip in ms, Tera controlling | Pass |
+| Start at login reports the installed service as enabled (fix in `142d4d9`) | Pass |
+| Peer address validation: with port, bare IPv6, invalid name rejected; IPv4, `[IPv6]`, host name accepted; config untouched | Pass |
+| Input forwarding off/on: applied, pushed snapshot within the same tick | Pass |
+| Disconnect → Paused within 0.1 s; Reconnect → link and audio back | Pass |
+| Add a phone popup floats and centres at 380 × 520 without a window rule (fix in `142d4d9`) | Pass |
+| Closing the popup cancels the pairing | Pass |
+| Hero address under the peer's name | **Failed, fixed**: it showed this computer's VPN address (`tun0`). Now the peer's address when linked, and this computer's address on the route to the peer otherwise |
+
+Seen, not changed: on each backend start Lua's own dial to Tera is refused
+with "pairing needs approval on both computers" while Tera's dial to Lua
+succeeds a second later. It predates this branch's builds.

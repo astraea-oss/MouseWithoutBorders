@@ -29,16 +29,28 @@ const SLOW_RETRY: Duration = Duration::from_secs(3);
 pub enum Connection {
     Connecting,
     /// Nothing is serving the endpoint.
-    Absent { detail: String },
+    Absent {
+        detail: String,
+    },
     /// We asked it to start and are waiting for it.
     Starting,
-    Incompatible { server: u32, ours: u32 },
+    Incompatible {
+        server: u32,
+        ours: u32,
+    },
     /// A backend is running, but for different settings than this UI was
     /// started for (another portable folder).
-    OtherInstance { config_path: PathBuf, expected: PathBuf },
-    Connected { hello: Box<Hello> },
+    OtherInstance {
+        config_path: PathBuf,
+        expected: PathBuf,
+    },
+    Connected {
+        hello: Box<Hello>,
+    },
     /// Was connected; reconnecting.
-    Disconnected { detail: String },
+    Disconnected {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +264,7 @@ impl Backend {
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical(a) == canonical(b)
 }

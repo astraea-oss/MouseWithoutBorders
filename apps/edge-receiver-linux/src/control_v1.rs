@@ -228,6 +228,9 @@ fn done() -> (Outcome, After) {
 }
 
 impl Connection {
+    // The error is the reply itself, built once per request on a local
+    // socket; boxing it would only add noise to every `?`.
+    #[allow(clippy::result_large_err)]
     fn tray(&self) -> Result<&ReceiverTrayHandle, Outcome> {
         self.context.tray.as_ref().ok_or_else(|| {
             error(
@@ -367,7 +370,7 @@ impl Connection {
                         draft: SettingsDraft::from_config(&config),
                         config_path: absolute(&self.context.config_path),
                         connector_only: false,
-                        local_address: edge_common::detect_primary_local_ip()
+                        local_address: edge_common::local_ip_toward(&config.peer.host)
                             .map(|ip| ip.to_string()),
                         audio_buffers_ms: edge_control::AUDIO_BUFFERS_MS.to_vec(),
                     }))),

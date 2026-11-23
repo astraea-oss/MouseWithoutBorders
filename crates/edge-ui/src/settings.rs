@@ -7,9 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
-use edge_common::{
-    AppConfig, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
-};
+use edge_common::{AppConfig, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role};
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Ui};
 
 use crate::{

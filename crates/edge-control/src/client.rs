@@ -119,10 +119,13 @@ impl Client {
             .map_err(|error| no_answer(error.into()))?;
         // A backend from before this protocol waits for a text command line
         // and never answers the preamble. Report it as protocol 0.
-        let hello = time::timeout(HELLO_TIMEOUT, read_frame_async::<ServerMessage>(&mut reader))
-            .await
-            .map_err(|_| ConnectError::Incompatible { server: 0 })?
-            .map_err(no_answer)?;
+        let hello = time::timeout(
+            HELLO_TIMEOUT,
+            read_frame_async::<ServerMessage>(&mut reader),
+        )
+        .await
+        .map_err(|_| ConnectError::Incompatible { server: 0 })?
+        .map_err(no_answer)?;
         let hello = match hello {
             ServerMessage::Hello(hello) => hello,
             ServerMessage::Incompatible { server_protocol } => {
