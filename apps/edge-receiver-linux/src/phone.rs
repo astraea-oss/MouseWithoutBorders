@@ -281,6 +281,10 @@ pub(crate) enum PhoneRequest {
         reply: oneshot::Sender<PairingOffer>,
         paired: oneshot::Sender<String>,
     },
+    /// The client that opened pairing went away or cancelled it. Closes the
+    /// window only if nobody is still waiting on it, so a newer pairing from
+    /// another window survives.
+    ClosePairing,
     /// `unpair-phone`: replies whether the phone was paired.
     Unpair {
         name: String,
@@ -671,6 +675,17 @@ impl PhoneSessions {
                 self.paired_watcher = Some(paired);
                 append_portable_log(&self.log_path, "phone pairing opened for 5 minutes");
                 reply.send(offer).ok();
+            }
+            PhoneRequest::ClosePairing => {
+                if self
+                    .paired_watcher
+                    .as_ref()
+                    .is_some_and(oneshot::Sender::is_closed)
+                {
+                    self.pairing = None;
+                    self.paired_watcher = None;
+                    append_portable_log(&self.log_path, "phone pairing cancelled");
+                }
             }
             PhoneRequest::Unpair { name, reply } => {
                 let result = self

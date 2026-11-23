@@ -89,6 +89,7 @@ mod acceptor;
 mod clipboard_hub;
 mod control;
 mod control_link;
+mod control_v1;
 mod notification_hub;
 mod notification_removals;
 mod notification_setup;
@@ -138,6 +139,10 @@ struct Args {
     /// Show the phone pairing QR code for the running receiver.
     #[arg(long, hide = true)]
     add_phone: bool,
+    /// Stop the receiver with this pid and start it again with `--config`,
+    /// after settings were saved over the control socket.
+    #[arg(long, hide = true)]
+    restart_node: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -240,6 +245,10 @@ async fn run_main(receiver_log: PathBuf) -> Result<()> {
             &receiver_log,
             format!("failed to recover previous Linux audio routing: {error:#}"),
         );
+    }
+
+    if let Some(pid) = args.restart_node {
+        return restart_after_settings(pid, &config_path, &receiver_log).await;
     }
 
     if args.add_phone {
@@ -1275,7 +1284,7 @@ async fn run_linux_controller_session(
                             open_receiver_settings(config_path, log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::AddPhone) => {
-                            open_phone_pairing(log_path);
+                            open_phone_pairing(config_path, log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::ToggleInputForwarding) => {
                             if !session_paused
@@ -2533,6 +2542,7 @@ async fn run_node(
             error: notification_error,
             connected: connected_notification_peer.clone(),
         },
+        &config_path,
     )
     .await;
     // A newer connection from the connected peer, waiting for its session to end.
@@ -2600,7 +2610,7 @@ async fn run_node(
                             open_receiver_settings(&config_path, &log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::AddPhone) => {
-                            open_phone_pairing(&log_path);
+                            open_phone_pairing(&config_path, &log_path);
                         }
                         TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                             pairing_armed = true;
@@ -3298,7 +3308,53 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// During the migration the tray opens hyprKvm instead of the egui windows
+/// only when asked to with `EDGE_KVM_DESKTOP_UI=hyprkvm`, and only if the
+/// `hyprkvm` executable sits next to this one. A second launch of hyprKvm
+/// routes its running window rather than opening another.
+fn open_hyprkvm(route: &str, config_path: &Path, log_path: &Path) -> bool {
+    if std::env::var("EDGE_KVM_DESKTOP_UI").as_deref() != Ok("hyprkvm") {
+        return false;
+    }
+    let Some(ui) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("hyprkvm")))
+        .filter(|ui| ui.is_file())
+    else {
+        append_portable_log(
+            log_path,
+            "EDGE_KVM_DESKTOP_UI=hyprkvm but hyprkvm isn't next to the receiver; using the old windows",
+        );
+        return false;
+    };
+    match Command::new(&ui)
+        .arg("--route")
+        .arg(route)
+        .arg("--config")
+        .arg(config_path)
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap it; a second launch exits as soon as it hands over.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(error) => {
+            append_portable_log(
+                log_path,
+                format!("failed to start {}: {error}; using the old windows", ui.display()),
+            );
+            false
+        }
+    }
+}
+
 fn open_receiver_settings(config_path: &Path, log_path: &Path) {
+    if open_hyprkvm("home", config_path, log_path) {
+        return;
+    }
     let parent = std::process::id().to_string();
     spawn_window_process(
         &SETTINGS_PROCESS_OPEN,
@@ -3315,7 +3371,10 @@ fn open_receiver_settings(config_path: &Path, log_path: &Path) {
 }
 
 /// The phone pairing QR code, in a window of its own.
-fn open_phone_pairing(log_path: &Path) {
+fn open_phone_pairing(config_path: &Path, log_path: &Path) {
+    if open_hyprkvm("pair-phone", config_path, log_path) {
+        return;
+    }
     spawn_window_process(
         &PHONE_PAIRING_PROCESS_OPEN,
         "phone pairing",
@@ -3424,6 +3483,7 @@ async fn start_phone_sessions(
     tray: Option<&ReceiverTrayHandle>,
     log_path: &Path,
     notifications: notification_setup::NotificationControl,
+    config_path: &Path,
 ) -> (PhoneSessions, Option<AbortOnDropTask>) {
     let mut phones = PhoneSessions::new(
         LocalHello {
@@ -3457,8 +3517,14 @@ async fn start_phone_sessions(
     if let Some(tray) = tray {
         phones.set_tray(tray.clone()).await;
     }
-    let control =
-        control::spawn_server(phones.requests(), tray.cloned(), log_path, notifications).await;
+    let control = control::spawn_server(
+        phones.requests(),
+        tray.cloned(),
+        log_path,
+        notifications,
+        config_path,
+    )
+    .await;
     match control::socket_path() {
         Some(control) => {
             let icons = control.with_file_name("phone-icons");
@@ -4138,7 +4204,7 @@ async fn handle_controller(
                         open_receiver_settings(config_path, log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::AddPhone) => {
-                        open_phone_pairing(log_path);
+                        open_phone_pairing(config_path, log_path);
                     }
                     TrayCommandEvent::Command(TrayCommand::ArmPairing) => {
                         tracing::debug!("ignored pairing request while connected");

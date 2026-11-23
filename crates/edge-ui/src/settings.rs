@@ -6,11 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use edge_common::{
-    AppConfig, AudioLocalPlayback, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
-    TransportMode, parse_listen_port, update_listen_port, validate_device_name, validate_host,
-    validate_port,
+    AppConfig, AudioRoutePreference, GameCompatibilityMode, PeerPosition, Role,
 };
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Ui};
 
@@ -25,114 +23,11 @@ use crate::{
 
 const LABEL_WIDTH: f32 = 128.0;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const AUDIO_BUFFERS_MS: [u32; 5] = [40, 60, 80, 120, 160];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Clipboard {
-    Off,
-    Text,
-    TextAndImages,
-}
-
-/// Everything the page edits. Saving writes these into the config.
-#[derive(Debug, Clone, PartialEq)]
-struct Editor {
-    device_name: String,
-    /// Optional for a node: with an address it dials that computer, and
-    /// either way it accepts computers and phones that dial it.
-    peer_host: String,
-    port: String,
-    position: PeerPosition,
-    game_compatibility: GameCompatibilityMode,
-    clipboard: Clipboard,
-    forward_phone_clipboard: bool,
-    audio_route: AudioRoutePreference,
-    audio_play_local: bool,
-    jitter_target_ms: u32,
-    notifications: edge_common::NotificationConfig,
-}
-
-impl Editor {
-    fn from_config(config: &AppConfig) -> Self {
-        // Both computers use one port: the one this node listens on and the
-        // one it dials.
-        let port = match config.transport {
-            TransportMode::Connect => config.peer.port,
-            TransportMode::Listen => config
-                .listen
-                .as_deref()
-                .and_then(|listen| parse_listen_port(listen).ok())
-                .unwrap_or(42_420),
-        };
-        Self {
-            device_name: config.device_name.clone(),
-            peer_host: config.peer.host.clone(),
-            port: port.to_string(),
-            position: config.layout.listener_position,
-            game_compatibility: config.input.capture.game_compatibility,
-            clipboard: match (config.clipboard.enabled, config.clipboard.images_enabled) {
-                (false, _) => Clipboard::Off,
-                (true, false) => Clipboard::Text,
-                (true, true) => Clipboard::TextAndImages,
-            },
-            forward_phone_clipboard: config.phone.forward_clipboard_to_pcs,
-            audio_route: config.audio.route.unwrap_or(if config.audio.enabled {
-                AudioRoutePreference::PeerToLocal
-            } else {
-                AudioRoutePreference::Disabled
-            }),
-            audio_play_local: config.audio.local_playback == AudioLocalPlayback::Mirror,
-            jitter_target_ms: config.audio.jitter_target_ms,
-            notifications: config.notifications.clone(),
-        }
-    }
-
-    /// `connector_only` is for the Windows app, which can only dial, so it
-    /// needs an address and always connects.
-    fn apply(&self, original: &AppConfig, connector_only: bool) -> Result<AppConfig> {
-        validate_device_name(&self.device_name)?;
-        let port = self
-            .port
-            .trim()
-            .parse::<u16>()
-            .context("port must be a number between 1 and 65535")?;
-        validate_port(port)?;
-
-        let mut config = original.clone();
-        config.device_name = self.device_name.trim().to_string();
-        config.input.capture.game_compatibility = self.game_compatibility;
-        config.clipboard.enabled = self.clipboard != Clipboard::Off;
-        config.clipboard.images_enabled = self.clipboard == Clipboard::TextAndImages;
-        config.phone.forward_clipboard_to_pcs = self.forward_phone_clipboard;
-        config.audio.route = Some(self.audio_route);
-        config.audio.enabled = self.audio_route != AudioRoutePreference::Disabled;
-        config.audio.local_playback = if self.audio_play_local {
-            AudioLocalPlayback::Mirror
-        } else {
-            AudioLocalPlayback::Redirect
-        };
-        config.audio.jitter_target_ms = self.jitter_target_ms;
-        config.notifications = self.notifications.clone();
-        let host = self.peer_host.trim();
-        if connector_only || !host.is_empty() {
-            validate_host(host)?;
-        }
-        config.peer.host = host.to_string();
-        config.peer.port = port;
-        config.layout.listener_position = self.position;
-        if !connector_only {
-            config.listen = Some(update_listen_port(config.listen.as_deref(), port));
-        }
-        // Kept for older builds and the Windows app; a Linux node listens
-        // either way and dials whenever it has an address.
-        config.transport = if connector_only || !host.is_empty() {
-            TransportMode::Connect
-        } else {
-            TransportMode::Listen
-        };
-        Ok(config)
-    }
-}
+/// The settings page edits the shared draft, so the backend and every UI
+/// validate and apply it the same way.
+type Editor = edge_control::SettingsDraft;
+type Clipboard = edge_control::ClipboardMode;
+use edge_control::{AUDIO_BUFFERS_MS, validate_notification_selection};
 
 /// What the running node last reported.
 #[derive(Default)]
@@ -895,37 +790,6 @@ fn notification_choices<'a>(
     choices
 }
 
-fn validate_notification_selection(
-    config: &edge_common::NotificationConfig,
-    setup: Option<&crate::NotificationSetup>,
-) -> Result<()> {
-    if !config.enabled {
-        return Ok(());
-    }
-    let setup = setup.context("Connect to the running node before enabling notifications")?;
-    anyhow::ensure!(
-        !config.peers.is_empty(),
-        "Choose a paired computer to share notifications with"
-    );
-    anyhow::ensure!(
-        config
-            .peers
-            .iter()
-            .all(|id| setup.computers.iter().any(|p| &p.fingerprint == id)),
-        "Only paired computers can share notifications; remove any unpaired devices from the selection"
-    );
-    anyhow::ensure!(
-        config.coordinator_fingerprint == setup.identity
-            || config.peers.contains(&config.coordinator_fingerprint),
-        "Choose an enrolled computer to store history"
-    );
-    anyhow::ensure!(
-        !setup.has_store || config.coordinator_fingerprint == setup.coordinator,
-        "History already belongs to another computer; changing its owner requires migration"
-    );
-    Ok(())
-}
-
 fn grid(ui: &mut Ui, id: &str, rows: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
@@ -966,6 +830,8 @@ fn pairing_summary(pairing: &PairingUiState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use edge_common::TransportMode;
 
     #[test]
     fn editor_round_trips_the_config() {

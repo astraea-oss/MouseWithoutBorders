@@ -83,6 +83,9 @@ pub struct TrayStatus {
     pub peer: Option<String>,
     pub round_trip_ms: Option<u64>,
     pub diagnostics: Vec<(&'static str, String)>,
+    /// The same state, structured for the control protocol. Its revision is
+    /// assigned by the control server.
+    pub snapshot: edge_control::protocol::Snapshot,
 }
 
 /// Updated from session loops without waiting on the tray service.
@@ -147,6 +150,18 @@ impl ReceiverTrayHandle {
     /// The tray's status, refreshed on every change.
     pub fn status(&self) -> watch::Receiver<TrayStatus> {
         self.status.subscribe()
+    }
+
+    /// Picks where audio goes, as the menu's radio group does.
+    pub async fn choose_audio(&self, target: edge_control::protocol::AudioTarget) {
+        use edge_control::protocol::AudioTarget as Wire;
+        let target = match target {
+            Wire::Off => AudioTarget::Off,
+            Wire::ToPeer => AudioTarget::Pc(AudioChoice::Local),
+            Wire::FromPeer => AudioTarget::Pc(AudioChoice::Peer),
+            Wire::ToPhone { fingerprint } => AudioTarget::ToPhone(fingerprint),
+        };
+        self.update(move |tray| tray.choose_audio(target)).await;
     }
 
     /// Queues a command as if it came from the menu.
@@ -734,6 +749,89 @@ impl ReceiverTray {
                         .unwrap_or_else(|| "none".to_string()),
                 ),
             ],
+            snapshot: self.snapshot(),
+        }
+    }
+
+    fn snapshot(&self) -> edge_control::protocol::Snapshot {
+        use edge_control::protocol::{
+            AudioState, AudioTarget as Wire, Capabilities, Controller, Diagnostic, LinkState,
+            PhoneState, Snapshot,
+        };
+        let connected = self.state == TrayState::Connected;
+        let millis = |rtt: Duration| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+        let (target, from_phone) = match self.current_audio_target() {
+            AudioTarget::Off => (Wire::Off, None),
+            AudioTarget::Pc(AudioChoice::Local) => (Wire::ToPeer, None),
+            AudioTarget::Pc(_) => (Wire::FromPeer, None),
+            AudioTarget::ToPhone(fingerprint) => (Wire::ToPhone { fingerprint }, None),
+            AudioTarget::FromPhone(fingerprint) => (Wire::Off, Some(fingerprint)),
+        };
+        Snapshot {
+            revision: 0,
+            state: match self.state {
+                TrayState::Starting => LinkState::Starting,
+                TrayState::Listening => LinkState::Listening,
+                TrayState::Connected => LinkState::Connected,
+                TrayState::Paused => LinkState::Paused,
+                TrayState::Error => LinkState::Error,
+            },
+            summary: self.summary(),
+            local_name: self.local_device_name.clone(),
+            peer_name: self
+                .peer_device_name
+                .clone()
+                .or_else(|| self.connected_peer.clone()),
+            round_trip_ms: self.round_trip.filter(|_| connected).map(millis),
+            controller: if self.local_is_controller {
+                Controller::Local
+            } else {
+                Controller::Peer
+            },
+            can_switch_controller: connected && self.role_switch_available,
+            switching_controller: self.role_switching,
+            input_forwarding: self.input_forwarding_enabled,
+            remote_input_active: connected && (self.kvm_input_active || self.role_switching),
+            audio: AudioState {
+                target,
+                from_phone,
+                to_peer_available: connected && self.local_audio_available,
+                from_peer_available: connected && self.peer_audio_available,
+            },
+            pairing_armed: self.pairing_armed,
+            phones_supported: self.phone_requests.is_some(),
+            phones: self
+                .phones
+                .iter()
+                .map(|phone| PhoneState {
+                    fingerprint: phone.fingerprint.clone(),
+                    name: phone.name.clone(),
+                    connected: true,
+                    round_trip_ms: phone.round_trip.map(millis),
+                    accepts_audio: phone.accepts_audio_invite,
+                })
+                .collect(),
+            last_error: self.last_error.clone(),
+            capabilities: Capabilities {
+                phones: self.phone_requests.is_some(),
+                notifications: true,
+                autostart: true,
+                listens: true,
+                view_host: false,
+            },
+            diagnostics: [
+                ("transport", self.transport.clone()),
+                ("input backend", self.backend.clone()),
+                ("connections", self.connections.to_string()),
+                ("input events", self.input_events.to_string()),
+                ("clipboard events", self.clipboard_events.to_string()),
+            ]
+            .into_iter()
+            .map(|(key, value)| Diagnostic {
+                key: key.to_string(),
+                value,
+            })
+            .collect(),
         }
     }
 

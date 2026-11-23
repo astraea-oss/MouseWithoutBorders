@@ -1,0 +1,23 @@
+[package]
+name = "edge-control"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UI-independent local control contract between the edge-kvm backend and its desktop UIs"
+
+[features]
+default = []
+# Async framing and a client for the local control endpoint.
+tokio = ["dep:tokio"]
+
+[dependencies]
+anyhow.workspace = true
+edge-common = { path = "../edge-common" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

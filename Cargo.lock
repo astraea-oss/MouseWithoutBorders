@@ -967,6 +967,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "edge-control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "edge-common",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "edge-controller-win"
 version = "0.1.2"
 dependencies = [
@@ -1077,6 +1089,7 @@ dependencies = [
  "edge-audio",
  "edge-clipboard",
  "edge-common",
+ "edge-control",
  "edge-crypto",
  "edge-geometry",
  "edge-linux-audio",
@@ -1125,6 +1138,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "edge-common",
+ "edge-control",
  "eframe",
  "qrcode",
  "serde",

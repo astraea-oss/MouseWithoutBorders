@@ -190,6 +190,25 @@ impl NodeLink for ControlLink {
     }
 
     fn autostart(&self) -> Option<bool> {
+        autostart()
+    }
+
+    fn set_autostart(&self, enabled: bool) -> Result<()> {
+        set_autostart(enabled)
+    }
+
+    fn open_log(&self) -> Result<()> {
+        Command::new("xdg-open")
+            .arg(&self.log_path)
+            .spawn()
+            .context("failed to run xdg-open")?;
+        Ok(())
+    }
+}
+
+/// Whether the user service starts at login, or `None` without one.
+pub(crate) fn autostart() -> Option<bool> {
+    {
         let output = Command::new("systemctl")
             .args(["--user", "is-enabled", SERVICE])
             .output()
@@ -201,8 +220,10 @@ impl NodeLink for ControlLink {
             _ => None,
         }
     }
+}
 
-    fn set_autostart(&self, enabled: bool) -> Result<()> {
+pub(crate) fn set_autostart(enabled: bool) -> Result<()> {
+    {
         let status = Command::new("systemctl")
             .args([
                 "--user",
@@ -212,14 +233,6 @@ impl NodeLink for ControlLink {
             .status()
             .context("failed to run systemctl")?;
         anyhow::ensure!(status.success(), "systemctl couldn't change {SERVICE}");
-        Ok(())
-    }
-
-    fn open_log(&self) -> Result<()> {
-        Command::new("xdg-open")
-            .arg(&self.log_path)
-            .spawn()
-            .context("failed to run xdg-open")?;
         Ok(())
     }
 }

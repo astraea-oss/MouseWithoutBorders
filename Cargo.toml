@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
+# The Tauri UI has its own workspace so backend builds never need WebKitGTK.
+exclude = ["apps/hyprkvm-ui/src-tauri"]
 members = [
   "crates/edge-common",
+  "crates/edge-control",
   "crates/edge-clipboard",
   "crates/edge-audio",
   "crates/edge-audio-output",

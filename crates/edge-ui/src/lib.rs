@@ -10,7 +10,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, mpsc},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use anyhow::Result;
@@ -67,54 +67,9 @@ pub trait NodeLink: Send + Sync {
     fn open_log(&self) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct NotificationSetup {
-    pub identity: String,
-    pub computers: Vec<NotificationComputer>,
-    pub status: String,
-    pub active: bool,
-    pub has_store: bool,
-    pub coordinator: String,
-    pub shell_path: Option<PathBuf>,
-    pub socket_path: PathBuf,
-    pub bridge_installed: bool,
-    #[serde(default)]
-    pub bridge_connected: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NotificationComputer {
-    pub name: String,
-    pub fingerprint: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeStatus {
-    pub summary: String,
-    pub connected: bool,
-    pub peer: Option<String>,
-    pub round_trip_ms: Option<u64>,
-    pub diagnostics: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhoneEntry {
-    pub name: String,
-    pub connected: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PhonePairingEvent {
-    /// Show this link as a QR code until it expires.
-    Offer {
-        uri: String,
-        expires_in: Duration,
-    },
-    Paired(String),
-    /// Expired or replaced by a newer pairing.
-    Closed,
-    Failed(String),
-}
+pub use edge_control::{
+    NodeStatus, NotificationComputer, NotificationSetup, PhoneEntry, PhonePairingEvent,
+};
 
 #[derive(Debug, Clone)]
 pub struct PairingConfirmationInput {

@@ -1,0 +1,95 @@
+/* Home and sub-screen layout. One breakpoint at 600 px: below it a single
+   stacked column (279 px Hyprland column), above it two phone-width columns
+   (874 px), which keep their width and gain space at 1250 px. */
+
+html, body { height: 100%; overflow: hidden; }
+
+.app { height: 100vh; display: flex; flex-direction: column; container-type: inline-size; container-name: app; position: relative; }
+
+.hs { flex: 1; overflow: auto; padding: 10px; scrollbar-width: none; }
+.cols { display: grid; gap: 10px; }
+.col { display: grid; gap: 10px; align-content: start; min-width: 0; }
+
+.brand { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 16px; }
+.brand .name { color: var(--white); }
+.brand .meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hero { display: flex; flex-direction: column; gap: 10px; padding: 18px 16px; min-width: 0; }
+.hero h1 { font-size: 44px; overflow-wrap: anywhere; }
+.hero .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hero .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.hero p { margin: 0; color: var(--soft); font-size: 13px; }
+
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.c { padding: 6px 16px 10px; min-width: 0; }
+.c > .label { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px 0 4px; }
+.c > .label em { font-style: normal; color: var(--grey-dim); }
+.r { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 12px 0; border-top: 1px solid var(--line); min-width: 0; }
+.c > .label + .r { border-top: none; }
+.r > span:first-child { color: var(--grey); font-size: 13px; }
+.r .ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.r .hint { color: var(--grey); font-size: 12px; min-width: 0; }
+.r .err { color: var(--red); font-size: 12px; flex-basis: 100%; }
+.dev { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+.dev .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dev .grow small { display: block; color: var(--grey); font-size: 12px; }
+.devs { display: grid; gap: 10px; width: 100%; }
+
+.arrmap { height: 96px; position: relative; }
+.scr {
+  position: absolute; left: 50%; top: 50%; width: 76px; height: 48px; margin: -24px 0 0 -38px;
+  border-radius: 8px; display: grid; place-items: center; font: 9px var(--mono); letter-spacing: .1em;
+  text-transform: uppercase; transition: transform .2s; overflow: hidden; white-space: nowrap; padding: 0 4px;
+}
+.scr.me { border: 1px solid var(--white); }
+.scr.peer { border: 1px dashed var(--grey); color: var(--grey); }
+.edge { position: absolute; background: var(--red); border-radius: 2px; }
+
+.savebar {
+  position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 5; background: var(--surface-raised);
+  border: 1px solid var(--line); border-radius: 20px; padding: 10px 10px 10px 16px; display: flex;
+  align-items: center; gap: 8px; box-shadow: 0 20px 50px rgba(0, 0, 0, .7);
+}
+.savebar span { flex: 1; font-size: 12px; color: var(--soft); min-width: 0; }
+.savebar span.bad { color: var(--red); }
+
+.toast {
+  position: absolute; left: 50%; top: 12px; transform: translate(-50%, -6px); background: rgba(0, 0, 0, .9);
+  border: 1px solid var(--line); border-radius: 999px; padding: 7px 14px; font-family: var(--mono); font-size: 10px;
+  letter-spacing: .06em; white-space: nowrap; max-width: calc(100% - 20px); overflow: hidden; text-overflow: ellipsis;
+  opacity: 0; transition: opacity .15s, transform .15s; pointer-events: none; z-index: 9;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.bad { color: var(--red); border-color: var(--red); }
+
+/* Sub-screen header */
+.top { height: 52px; flex: none; display: flex; gap: 8px; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--line); }
+.ttl { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; font-size: 15px; font-weight: 500; }
+.ttl span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.over { flex: 1; display: grid; place-items: center; padding: 20px; background-color: #0a0a0a;
+  background-image: radial-gradient(circle, #1f1f1f 1px, transparent 1.2px); background-size: 10px 10px; }
+.over .box { display: grid; justify-items: center; gap: 12px; text-align: center; max-width: 380px; }
+.over .display { font-size: 44px; }
+.over p { margin: 0; color: var(--grey); font-size: 13px; }
+
+@container app (min-width: 600px) {
+  .hs { padding: 16px; }
+  .cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .col { gap: 12px; }
+  .brand { padding: 14px 22px; }
+  .hero { padding: 22px; }
+  .hero h1 { font-size: 72px; }
+  .tiles { gap: 12px; --tile-word: 46px; --tile-label: 11px; --tile-pad: 20px; }
+  .c { padding: 6px 20px 10px; }
+  .r { grid-template-columns: 118px minmax(0, 1fr); align-items: center; gap: 14px; }
+  .arrmap { height: 120px; }
+  .savebar { left: 16px; right: 16px; bottom: 16px; }
+  .top { height: 56px; padding: 0 12px; gap: 10px; }
+}
+
+/* Wide (1250 px): keep the columns phone-width and centred. */
+@container app (min-width: 1100px) {
+  .cols { max-width: 1100px; margin: 0 auto; }
+  .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); --tile-word: 30px; --tile-label: 10px; --tile-pad: 14px; }
+}
