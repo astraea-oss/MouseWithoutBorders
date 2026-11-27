@@ -106,6 +106,15 @@ pub enum Request {
     },
     /// Reply [`Reply::Diagnostics`].
     Diagnostics,
+    /// Send this computer's clipboard to a connected phone now. Reply
+    /// [`Reply::Message`] saying what happened.
+    SendClipboardToPhone {
+        fingerprint: String,
+    },
+    /// End a phone's Remote View of this computer.
+    StopPhoneView {
+        fingerprint: String,
+    },
     /// Stop the backend.
     Quit,
 }
@@ -176,7 +185,7 @@ pub enum Reply {
         enabled: Option<bool>,
     },
     Notifications {
-        setup: Option<NotificationSetup>,
+        setup: Option<Box<NotificationSetup>>,
     },
     Message {
         text: String,
@@ -334,7 +343,8 @@ impl Default for Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioState {
     pub target: AudioTarget,
-    /// From a phone; only the phone can start or change this.
+    /// The fingerprint of a phone streaming its audio here; only the phone
+    /// can start or change this.
     pub from_phone: Option<String>,
     pub to_peer_available: bool,
     pub from_peer_available: bool,
@@ -349,6 +359,12 @@ pub struct PhoneState {
     pub connected: bool,
     pub round_trip_ms: Option<u32>,
     pub accepts_audio: bool,
+    /// The phone is watching this computer through Remote View.
+    #[serde(default)]
+    pub viewing: bool,
+    /// ...and controlling it with touch.
+    #[serde(default)]
+    pub controlling: bool,
 }
 
 /// What this backend can do, so a UI shows unavailable controls as such

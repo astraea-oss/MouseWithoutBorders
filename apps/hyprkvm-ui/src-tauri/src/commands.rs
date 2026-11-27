@@ -233,7 +233,7 @@ pub async fn get_notifications(
     backend: State<'_, Arc<Backend>>,
 ) -> Result<Option<edge_control::NotificationSetup>> {
     match backend.request(Request::Notifications).await? {
-        Reply::Notifications { setup } => Ok(setup),
+        Reply::Notifications { setup } => Ok(setup.map(|setup| *setup)),
         other => Err(unexpected(other)),
     }
 }
@@ -250,6 +250,26 @@ pub async fn install_notification_bridge(
         Reply::Message { text } => Ok(text),
         other => Err(unexpected(other)),
     }
+}
+
+/// Sends this computer's clipboard to a phone; returns what happened.
+#[tauri::command]
+pub async fn send_clipboard_to_phone(
+    backend: State<'_, Arc<Backend>>,
+    fingerprint: String,
+) -> Result<String> {
+    match backend
+        .request(Request::SendClipboardToPhone { fingerprint })
+        .await?
+    {
+        Reply::Message { text } => Ok(text),
+        other => Err(unexpected(other)),
+    }
+}
+
+#[tauri::command]
+pub async fn stop_phone_view(backend: State<'_, Arc<Backend>>, fingerprint: String) -> Result<()> {
+    done(&backend, Request::StopPhoneView { fingerprint }).await
 }
 
 #[tauri::command]

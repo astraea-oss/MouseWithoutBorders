@@ -116,12 +116,18 @@ pub struct PhoneConfig {
     /// phone's clipboard on this machine only.
     #[serde(default = "default_true")]
     pub forward_clipboard_to_pcs: bool,
+    /// Send every copy on this machine to connected phones. Off by default:
+    /// a phone then gets this machine's clipboard only when it's sent on
+    /// purpose, while copies made on the phone still arrive here.
+    #[serde(default)]
+    pub send_clipboard_to_phones: bool,
 }
 
 impl Default for PhoneConfig {
     fn default() -> Self {
         Self {
             forward_clipboard_to_pcs: true,
+            send_clipboard_to_phones: false,
         }
     }
 }
@@ -1084,15 +1090,19 @@ backend = "auto"
     fn phone_settings_are_optional_and_share_the_clipboard_by_default() {
         let config = AppConfig::receiver_default();
         assert!(config.phone.forward_clipboard_to_pcs);
+        assert!(!config.phone.send_clipboard_to_phones);
         let saved = toml::to_string_pretty(&config).unwrap();
         assert!(!saved.contains("[phone]"), "{saved}");
         let reloaded: AppConfig = toml::from_str(&saved).unwrap();
         assert!(reloaded.phone.forward_clipboard_to_pcs);
 
         let mut text = saved;
-        text.push_str("\n[phone]\nforward_clipboard_to_pcs = false\n");
+        text.push_str(
+            "\n[phone]\nforward_clipboard_to_pcs = false\nsend_clipboard_to_phones = true\n",
+        );
         let loaded: AppConfig = toml::from_str(&text).unwrap();
         assert!(!loaded.phone.forward_clipboard_to_pcs);
+        assert!(loaded.phone.send_clipboard_to_phones);
     }
     #[test]
     fn explicit_notification_membership_survives_config_roundtrip() {

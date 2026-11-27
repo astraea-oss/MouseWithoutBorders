@@ -27,6 +27,10 @@ export interface PhoneState {
   connected: boolean;
   round_trip_ms: number | null;
   accepts_audio: boolean;
+  /** Watching this computer through Remote View... */
+  viewing: boolean;
+  /** ...and controlling it with touch. */
+  controlling: boolean;
 }
 
 export interface Snapshot {
@@ -44,6 +48,7 @@ export interface Snapshot {
   remote_input_active: boolean;
   audio: {
     target: AudioTarget;
+    /** Fingerprint of a phone streaming its audio here. */
     from_phone: string | null;
     to_peer_available: boolean;
     from_peer_available: boolean;
@@ -96,6 +101,7 @@ export interface SettingsDraft {
   game_compatibility: GameCompatibility;
   clipboard: ClipboardMode;
   forward_phone_clipboard: boolean;
+  send_clipboard_to_phones: boolean;
   audio_route: AudioRoute;
   audio_play_local: boolean;
   jitter_target_ms: number;

@@ -35,6 +35,9 @@ pub struct SettingsDraft {
     pub game_compatibility: GameCompatibilityMode,
     pub clipboard: ClipboardMode,
     pub forward_phone_clipboard: bool,
+    /// Send every copy here to connected phones, not only on request.
+    #[serde(default)]
+    pub send_clipboard_to_phones: bool,
     pub audio_route: AudioRoutePreference,
     pub audio_play_local: bool,
     pub jitter_target_ms: u32,
@@ -73,6 +76,7 @@ impl SettingsDraft {
                 (true, true) => ClipboardMode::TextAndImages,
             },
             forward_phone_clipboard: config.phone.forward_clipboard_to_pcs,
+            send_clipboard_to_phones: config.phone.send_clipboard_to_phones,
             audio_route: config.audio.route.unwrap_or(if config.audio.enabled {
                 AudioRoutePreference::PeerToLocal
             } else {
@@ -96,6 +100,7 @@ impl SettingsDraft {
         config.clipboard.enabled = self.clipboard != ClipboardMode::Off;
         config.clipboard.images_enabled = self.clipboard == ClipboardMode::TextAndImages;
         config.phone.forward_clipboard_to_pcs = self.forward_phone_clipboard;
+        config.phone.send_clipboard_to_phones = self.send_clipboard_to_phones;
         config.audio.route = Some(self.audio_route);
         config.audio.enabled = self.audio_route != AudioRoutePreference::Disabled;
         config.audio.local_playback = if self.audio_play_local {

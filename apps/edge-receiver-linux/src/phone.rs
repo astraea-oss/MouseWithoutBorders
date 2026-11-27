@@ -300,12 +300,22 @@ pub(crate) enum PhoneRequest {
         fingerprint: String,
         direction: Option<AudioDirection>,
     },
+    /// Send this computer's clipboard to a connected phone now. Replies with
+    /// what happened, to show the person who asked.
+    SendClipboard {
+        fingerprint: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// End a phone's Remote View of this computer.
+    StopView { fingerprint: String },
 }
 
 /// Work for one phone's session.
 #[derive(Debug)]
 enum PhoneCommand {
     Audio(Option<AudioDirection>),
+    SendClipboard(oneshot::Sender<Result<String, String>>),
+    StopView,
 }
 
 pub(crate) struct PairingOffer {
@@ -714,6 +724,26 @@ impl PhoneSessions {
                     running.commands.send(PhoneCommand::Audio(direction)).ok();
                 }
             }
+            PhoneRequest::SendClipboard { fingerprint, reply } => {
+                match self.sessions.get(&fingerprint) {
+                    Some(running) => {
+                        // A session that ends first drops the reply, which
+                        // the asker reports.
+                        running
+                            .commands
+                            .send(PhoneCommand::SendClipboard(reply))
+                            .ok();
+                    }
+                    None => {
+                        reply.send(Err("That phone isn't connected".into())).ok();
+                    }
+                }
+            }
+            PhoneRequest::StopView { fingerprint } => {
+                if let Some(running) = self.sessions.get(&fingerprint) {
+                    running.commands.send(PhoneCommand::StopView).ok();
+                }
+            }
         }
     }
 
@@ -972,6 +1002,7 @@ async fn run_phone_session(
     let mut ping_sequence = 0_u64;
     let mut ping_sent: Option<(u64, Instant)> = None;
     let mut reported_audio: Option<AudioDirection> = None;
+    let mut reported_view: Option<bool> = None;
     let dead = time::sleep(timings.dead_after);
     tokio::pin!(dead);
 
@@ -982,6 +1013,13 @@ async fn run_phone_session(
             if let Some(tray) = &context.tray {
                 tray.phone_audio(context.fingerprint.clone(), audio_now)
                     .await;
+            }
+        }
+        let view_now = remote.as_ref().map(|view| view.control);
+        if view_now != reported_view {
+            reported_view = view_now;
+            if let Some(tray) = &context.tray {
+                tray.phone_view(context.fingerprint.clone(), view_now).await;
             }
         }
         tokio::select! {
@@ -1002,6 +1040,36 @@ async fn run_phone_session(
                     if audio.take().is_some() {
                         send(&mut writer, &Frame::Phone(PhoneEvent::AudioStopped {
                             reason: "stopped on the computer".into(),
+                        }))
+                        .await?;
+                    }
+                }
+                PhoneCommand::SendClipboard(reply) => {
+                    let result = match clipboard.as_mut() {
+                        None => Err("Clipboard sharing is off, or this phone isn't allowed the clipboard".to_string()),
+                        // Forced: the phone gets the clipboard even if it was
+                        // offered before, since it may have copied since.
+                        Some(sync) => match sync.state.send_local_offer(&sync.config, &mut writer).await {
+                            Ok(true) => {
+                                tracing::info!(phone = %context.name, "sent clipboard to phone on request");
+                                Ok(format!("Sent the clipboard to {}", context.name))
+                            }
+                            Ok(false) => Ok("Nothing to send: the clipboard is empty, too large, or came from this phone".to_string()),
+                            Err(error) => Err(format!("Couldn't send the clipboard: {error:#}")),
+                        },
+                    };
+                    reply.send(result).ok();
+                }
+                PhoneCommand::StopView => {
+                    if let Some(view) = remote.take() {
+                        let view_id = view.view_id;
+                        view.stop().await;
+                        tracing::info!(phone = %context.name, "remote view stopped on the computer");
+                        send(&mut writer, &Frame::Phone(PhoneEvent::RemoteViewStatus {
+                            view_id,
+                            active: false,
+                            control: false,
+                            error: Some("Stopped on the computer".into()),
                         }))
                         .await?;
                     }
@@ -1051,6 +1119,9 @@ async fn run_phone_session(
             event = clipboard_changed(&mut clipboard) => {
                 let Some(sync) = clipboard.as_mut() else { continue };
                 match event {
+                    // Unless every copy is to go to phones, this machine's
+                    // clipboard reaches the phone only when sent on purpose.
+                    ClipboardWatchEvent::Changed if !sync.config.phone.send_clipboard_to_phones => {}
                     ClipboardWatchEvent::Changed => {
                         match sync.state.send_changed_offer(&sync.config, &mut writer).await {
                             Ok(true) => tracing::info!(phone = %context.name, "sent clipboard to phone"),

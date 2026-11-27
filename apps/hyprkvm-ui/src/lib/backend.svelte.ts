@@ -85,5 +85,7 @@ export const actions = {
   quitBackend: () => invoke<void>('quit_backend'),
   startBackend: () => invoke<string>('start_backend'),
   openLog: () => invoke<void>('open_log'),
-  openPhonePairing: () => invoke<void>('open_phone_pairing')
+  openPhonePairing: () => invoke<void>('open_phone_pairing'),
+  sendClipboardToPhone: (fingerprint: string) => invoke<string>('send_clipboard_to_phone', { fingerprint }),
+  stopPhoneView: (fingerprint: string) => invoke<void>('stop_phone_view', { fingerprint })
 };

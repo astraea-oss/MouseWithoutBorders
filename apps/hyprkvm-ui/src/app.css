@@ -1,22 +1,33 @@
-/* Home and sub-screen layout. One breakpoint at 600 px: below it a single
-   stacked column (279 px Hyprland column), above it two phone-width columns
-   (874 px), which keep their width and gain space at 1250 px. */
+/* Home and sub-screen layout: one column at every width, designed for a
+   ~280 px Hyprland column. Wider windows centre that same column rather
+   than spreading it out. */
 
 html, body { height: 100%; overflow: hidden; }
 
 .app { height: 100vh; display: flex; flex-direction: column; container-type: inline-size; container-name: app; position: relative; }
 
 .hs { flex: 1; overflow: auto; padding: 10px; scrollbar-width: none; }
-.cols { display: grid; gap: 10px; }
+/* Room so the save bar never covers the last card. */
+.hs.dirty { padding-bottom: 80px; }
+.cols { display: grid; gap: 10px; max-width: 420px; margin: 0 auto; }
 .col { display: grid; gap: 10px; align-content: start; min-width: 0; }
 
-.brand { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 16px; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 16px; min-height: 46px; }
 .brand .name { color: var(--white); }
-.brand .meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brand .meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: auto; }
+.ib.sm { width: 30px; height: 30px; }
+.ib:disabled { opacity: .35; }
 .hero { display: flex; flex-direction: column; gap: 10px; padding: 18px 16px; min-width: 0; }
-.hero h1 { font-size: 44px; overflow-wrap: anywhere; }
+/* Doto sits its dots on a grid of a tenth of the font size, so dot-matrix
+   text uses multiples of 10 px: every dot then lands on the same pixel phase
+   and the spacing looks even. */
+.hero h1 { font-size: 40px; overflow-wrap: anywhere; }
 .hero .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hero .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+/* The name row carries the actions as small icon buttons, so they don't
+   take a row of their own; negative margins keep the row label-height. */
+.hero-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.hero-top .label { flex: 1; min-width: 0; }
+.hero-top .acts { display: flex; gap: 6px; margin: -8px -6px -8px 0; }
 .hero p { margin: 0; color: var(--soft); font-size: 13px; }
 
 .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -24,8 +35,10 @@ html, body { height: 100%; overflow: hidden; }
 .c { padding: 6px 16px 10px; min-width: 0; }
 .c > .label { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px 0 4px; }
 .c > .label em { font-style: normal; color: var(--grey-dim); }
+.c > .label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .r { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 12px 0; border-top: 1px solid var(--line); min-width: 0; }
 .c > .label + .r { border-top: none; }
+.r.one { grid-template-columns: 1fr; }
 .r > span:first-child { color: var(--grey); font-size: 13px; }
 .r .ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
 .r .hint { color: var(--grey); font-size: 12px; min-width: 0; }
@@ -47,7 +60,7 @@ html, body { height: 100%; overflow: hidden; }
 
 .savebar {
   position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 5; background: var(--surface-raised);
-  border: 1px solid var(--line); border-radius: 20px; padding: 10px 10px 10px 16px; display: flex;
+  border: 1px solid var(--line); border-radius: 20px; padding: 10px 10px 10px 16px; display: flex; max-width: 420px; margin: 0 auto;
   align-items: center; gap: 8px; box-shadow: 0 20px 50px rgba(0, 0, 0, .7);
 }
 .savebar span { flex: 1; font-size: 12px; color: var(--soft); min-width: 0; }
@@ -63,33 +76,12 @@ html, body { height: 100%; overflow: hidden; }
 .toast.bad { color: var(--red); border-color: var(--red); }
 
 /* Sub-screen header */
-.top { height: 52px; flex: none; display: flex; gap: 8px; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--line); }
+.top { height: 52px; flex: none; display: flex; gap: 8px; align-items: center; padding: 0 max(8px, calc((100% - 420px) / 2)); border-bottom: 1px solid var(--line); }
 .ttl { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; font-size: 15px; font-weight: 500; }
 .ttl span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .over { flex: 1; display: grid; place-items: center; padding: 20px; background-color: #0a0a0a;
   background-image: radial-gradient(circle, #1f1f1f 1px, transparent 1.2px); background-size: 10px 10px; }
 .over .box { display: grid; justify-items: center; gap: 12px; text-align: center; max-width: 380px; }
-.over .display { font-size: 44px; }
+.over .display { font-size: 40px; }
 .over p { margin: 0; color: var(--grey); font-size: 13px; }
-
-@container app (min-width: 600px) {
-  .hs { padding: 16px; }
-  .cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
-  .col { gap: 12px; }
-  .brand { padding: 14px 22px; }
-  .hero { padding: 22px; }
-  .hero h1 { font-size: 72px; }
-  .tiles { gap: 12px; --tile-word: 46px; --tile-label: 11px; --tile-pad: 20px; }
-  .c { padding: 6px 20px 10px; }
-  .r { grid-template-columns: 118px minmax(0, 1fr); align-items: center; gap: 14px; }
-  .arrmap { height: 120px; }
-  .savebar { left: 16px; right: 16px; bottom: 16px; }
-  .top { height: 56px; padding: 0 12px; gap: 10px; }
-}
-
-/* Wide (1250 px): keep the columns phone-width and centred. */
-@container app (min-width: 1100px) {
-  .cols { max-width: 1100px; margin: 0 auto; }
-  .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); --tile-word: 30px; --tile-label: 10px; --tile-pad: 14px; }
-}

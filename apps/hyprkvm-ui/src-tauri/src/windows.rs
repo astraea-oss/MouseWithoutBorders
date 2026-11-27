@@ -21,11 +21,12 @@ const DECORATED: bool = cfg!(windows);
 pub enum Route {
     Home,
     View,
+    Settings,
     PairPhone,
 }
 
 impl Route {
-    /// `--route home|view|pair-phone`; Home without one.
+    /// `--route home|view|settings|pair-phone`; Home without one.
     pub fn from_args<S: AsRef<str>>(args: &[S]) -> Self {
         let mut args = args.iter().map(AsRef::as_ref);
         while let Some(arg) = args.next() {
@@ -36,6 +37,7 @@ impl Route {
             };
             match value {
                 Some("view") => return Self::View,
+                Some("settings") => return Self::Settings,
                 Some("pair-phone") => return Self::PairPhone,
                 Some(_) => return Self::Home,
                 None => {}
@@ -47,9 +49,13 @@ impl Route {
 
 pub fn route(app: &AppHandle, route: Route) -> Result<()> {
     match route {
-        Route::Home | Route::View => {
+        Route::Home | Route::View | Route::Settings => {
             let window = open_main(app)?;
-            let path = if route == Route::View { "/view" } else { "/" };
+            let path = match route {
+                Route::View => "/view",
+                Route::Settings => "/settings",
+                _ => "/",
+            };
             window.emit("ui://navigate", path)?;
             window.unminimize().ok();
             window.show().ok();
@@ -67,7 +73,7 @@ fn open_main(app: &AppHandle) -> Result<tauri::WebviewWindow> {
     Ok(
         WebviewWindowBuilder::new(app, MAIN, WebviewUrl::App("index.html".into()))
             .title("hyprKvm")
-            .inner_size(874.0, 900.0)
+            .inner_size(320.0, 900.0)
             .min_inner_size(279.0, 420.0)
             .decorations(DECORATED)
             .build()?,
@@ -109,6 +115,10 @@ mod tests {
         assert_eq!(
             Route::from_args(&["hyprkvm", "--route=pair-phone"]),
             Route::PairPhone
+        );
+        assert_eq!(
+            Route::from_args(&["hyprkvm", "--route", "settings"]),
+            Route::Settings
         );
         assert_eq!(
             Route::from_args(&["hyprkvm", "--route", "nope"]),

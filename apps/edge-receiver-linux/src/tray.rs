@@ -71,6 +71,8 @@ struct TrayPhone {
     audio: Option<AudioDirection>,
     /// The phone takes `AudioInvite`, so audio can be sent to it from here.
     accepts_audio_invite: bool,
+    /// Remote View of this computer: `Some(true)` with touch control.
+    view: Option<bool>,
 }
 
 /// What the tray shows, published on every change for the settings window,
@@ -376,6 +378,7 @@ impl ReceiverTrayHandle {
                 round_trip: None,
                 audio: None,
                 accepts_audio_invite,
+                view: None,
             });
             tray.phones.sort_by(|a, b| a.name.cmp(&b.name));
         })
@@ -395,6 +398,17 @@ impl ReceiverTrayHandle {
         self.update(move |tray| {
             if let Some(phone) = tray.phone_mut(&fingerprint) {
                 phone.audio = audio;
+            }
+        })
+        .await;
+    }
+
+    /// A phone started or stopped viewing this computer; `Some(true)` when
+    /// it also controls it.
+    pub async fn phone_view(&self, fingerprint: String, view: Option<bool>) {
+        self.update(move |tray| {
+            if let Some(phone) = tray.phone_mut(&fingerprint) {
+                phone.view = view;
             }
         })
         .await;
@@ -809,6 +823,8 @@ impl ReceiverTray {
                     connected: true,
                     round_trip_ms: phone.round_trip.map(millis),
                     accepts_audio: phone.accepts_audio_invite,
+                    viewing: phone.view.is_some(),
+                    controlling: phone.view == Some(true),
                 })
                 .collect(),
             last_error: self.last_error.clone(),
@@ -1370,6 +1386,7 @@ mod tests {
             round_trip: Some(Duration::from_millis(38)),
             audio: None,
             accepts_audio_invite,
+            view: None,
         });
         received
     }

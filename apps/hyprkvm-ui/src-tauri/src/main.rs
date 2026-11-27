@@ -67,6 +67,8 @@ fn main() {
             commands::start_backend,
             commands::open_log,
             commands::open_phone_pairing,
+            commands::send_clipboard_to_phone,
+            commands::stop_phone_view,
         ])
         .setup(move |app| {
             let backend = backend::Backend::new(app.handle().clone(), expected);

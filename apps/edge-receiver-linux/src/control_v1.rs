@@ -40,6 +40,8 @@ use crate::{
 /// Requests a client may queue before the server stops reading from it.
 const REQUEST_QUEUE: usize = 16;
 const PHONE_LIST_TIMEOUT: Duration = Duration::from_millis(500);
+/// Sending reads the clipboard, which can take a moment for an image.
+const PHONE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 static REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -428,7 +430,12 @@ impl Connection {
             }
             Request::Notifications => {
                 let setup = self.notification_setup().await;
-                (Outcome::Ok(Reply::Notifications { setup }), After::Nothing)
+                (
+                    Outcome::Ok(Reply::Notifications {
+                        setup: setup.map(Box::new),
+                    }),
+                    After::Nothing,
+                )
             }
             Request::InstallNotificationBridge { shell_path } => {
                 let setup = self.notification_setup().await.ok_or_else(|| {
@@ -441,6 +448,30 @@ impl Connection {
                 .map_err(|e| error(ErrorKind::Failed, e.to_string()))?
                 .map_err(|e| error(ErrorKind::Failed, format!("{e:#}")))?;
                 (Outcome::Ok(Reply::Message { text }), After::Nothing)
+            }
+            Request::SendClipboardToPhone { fingerprint } => {
+                let (reply, result) = oneshot::channel();
+                self.context
+                    .requests
+                    .send(PhoneRequest::SendClipboard { fingerprint, reply })
+                    .map_err(|_| error(ErrorKind::Unavailable, "phone sessions aren't running"))?;
+                match time::timeout(PHONE_SEND_TIMEOUT, result).await {
+                    Ok(Ok(Ok(text))) => (Outcome::Ok(Reply::Message { text }), After::Nothing),
+                    Ok(Ok(Err(text))) => return Err(error(ErrorKind::Failed, text)),
+                    Ok(Err(_)) => {
+                        return Err(error(ErrorKind::Unavailable, "the phone disconnected"));
+                    }
+                    Err(_) => {
+                        return Err(error(ErrorKind::Failed, "the phone didn't answer in time"));
+                    }
+                }
+            }
+            Request::StopPhoneView { fingerprint } => {
+                self.context
+                    .requests
+                    .send(PhoneRequest::StopView { fingerprint })
+                    .map_err(|_| error(ErrorKind::Unavailable, "phone sessions aren't running"))?;
+                done()
             }
             Request::Diagnostics => {
                 let report = self.report().await;
@@ -508,6 +539,8 @@ impl Connection {
                         connected: false,
                         round_trip_ms: None,
                         accepts_audio: false,
+                        viewing: false,
+                        controlling: false,
                     });
                 }
             }
