@@ -13,6 +13,7 @@ libei = ["edge-linux-input/libei"]
 anyhow.workspace = true
 clap.workspace = true
 edge-common = { path = "../../crates/edge-common" }
+edge-control = { path = "../../crates/edge-control", features = ["tokio"] }
 edge-clipboard = { path = "../../crates/edge-clipboard" }
 edge-audio = { path = "../../crates/edge-audio" }
 edge-crypto = { path = "../../crates/edge-crypto" }

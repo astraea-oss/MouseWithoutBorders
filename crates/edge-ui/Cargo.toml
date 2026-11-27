@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 edge-common = { path = "../edge-common" }
+edge-control = { path = "../edge-control" }
 eframe.workspace = true
 qrcode = { version = "0.14", default-features = false }
 tracing.workspace = true

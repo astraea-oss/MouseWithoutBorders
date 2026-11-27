@@ -17,8 +17,31 @@ use edge_ui::{NodeLink, NodeStatus, PhoneEntry, PhonePairingEvent};
 use crate::control::socket_path;
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
-/// The user unit installed by `scripts/install-linux-receiver.sh`.
+/// The user unit installed by `scripts/install-linux-receiver.sh`, used when
+/// this process isn't running under a systemd unit of its own.
 const SERVICE: &str = "edge-kvm-receiver.service";
+
+/// The systemd unit this process runs under, so Start at login follows an
+/// install whose unit has another name (an older `edge-kvm.service`, say).
+fn service_unit() -> &'static str {
+    static UNIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UNIT.get_or_init(|| {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|cgroup| unit_from_cgroup(&cgroup))
+            .unwrap_or_else(|| SERVICE.to_string())
+    })
+}
+
+/// The service unit named by the cgroup v2 line (`0::/…/app.slice/x.service`),
+/// or `None` when the process isn't in a service of its own: started by hand
+/// it sits in a session scope or directly under the user manager.
+fn unit_from_cgroup(cgroup: &str) -> Option<String> {
+    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let unit = path.trim_end().rsplit('/').next()?;
+    (unit.ends_with(".service") && !unit.starts_with("user@") && unit.len() > ".service".len())
+        .then(|| unit.to_string())
+}
 
 pub(crate) struct ControlLink {
     log_path: PathBuf,
@@ -190,29 +213,11 @@ impl NodeLink for ControlLink {
     }
 
     fn autostart(&self) -> Option<bool> {
-        let output = Command::new("systemctl")
-            .args(["--user", "is-enabled", SERVICE])
-            .output()
-            .ok()?;
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "enabled" => Some(true),
-            "disabled" => Some(false),
-            // Not installed as a service, so there's nothing to switch.
-            _ => None,
-        }
+        autostart()
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<()> {
-        let status = Command::new("systemctl")
-            .args([
-                "--user",
-                if enabled { "enable" } else { "disable" },
-                SERVICE,
-            ])
-            .status()
-            .context("failed to run systemctl")?;
-        anyhow::ensure!(status.success(), "systemctl couldn't change {SERVICE}");
-        Ok(())
+        set_autostart(enabled)
     }
 
     fn open_log(&self) -> Result<()> {
@@ -224,9 +229,76 @@ impl NodeLink for ControlLink {
     }
 }
 
+/// Whether the user service starts at login, or `None` without one.
+pub(crate) fn autostart() -> Option<bool> {
+    {
+        let output = Command::new("systemctl")
+            .args(["--user", "is-enabled", service_unit()])
+            .output()
+            .ok()?;
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "enabled" => Some(true),
+            "disabled" => Some(false),
+            // Not installed as a service, so there's nothing to switch.
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn set_autostart(enabled: bool) -> Result<()> {
+    {
+        let status = Command::new("systemctl")
+            .args([
+                "--user",
+                if enabled { "enable" } else { "disable" },
+                service_unit(),
+            ])
+            .status()
+            .context("failed to run systemctl")?;
+        anyhow::ensure!(
+            status.success(),
+            "systemctl couldn't change {}",
+            service_unit()
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_service_unit_comes_from_the_cgroup() {
+        assert_eq!(
+            unit_from_cgroup(
+                "1:net_cls:/\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/edge-kvm.service\n"
+            )
+            .as_deref(),
+            Some("edge-kvm.service")
+        );
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/edge-kvm-receiver.service")
+                .as_deref(),
+            Some("edge-kvm-receiver.service")
+        );
+        // Started from a terminal or the compositor: no unit of its own.
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user-1000.slice/session-2.scope"),
+            None
+        );
+        assert_eq!(
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-hyprland-kitty-1234.scope"
+            ),
+            None
+        );
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service"),
+            None
+        );
+        assert_eq!(unit_from_cgroup("12:cpu:/foo\n"), None);
+    }
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()

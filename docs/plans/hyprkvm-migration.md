@@ -1,7 +1,8 @@
 # hyprKvm desktop migration
 
-Status: consolidated implementation plan, 2026-11-16. Planning is complete;
-the feasibility spikes and implementation below have not been performed.
+Status: consolidated implementation plan, 2026-11-16. Implementation started
+2026-11-23 on `migration/hyprkvm`; see "Progress" below. No milestone has
+passed its exit gate yet.
 Baseline: `ba7a735` on main, including merged PR #26 and the revised
 [UI design study](../mockups/hyprkvm-ui.html).
 
@@ -58,6 +59,45 @@ Verified starting points:
 - Installed identity/pins/logs are under `~/.local/state/edge-kvm`; config is
   under `~/.config/edge-kvm`. Portable paths are beside the backend executable.
   Existing releases package one backend binary per platform.
+
+## Progress (2026-11-23)
+
+Evidence: [`docs/testing/hyprkvm-m1-lua.md`](../testing/hyprkvm-m1-lua.md),
+from Lua, not the target machines.
+
+Done, Linux:
+
+- `crates/edge-control`: UI-independent status DTOs and the settings draft
+  and validation moved out of `edge-ui` (egui now uses them); versioned,
+  bounded, length-prefixed JSON protocol with request IDs, typed errors,
+  snapshots, events and lossless u64s; async client.
+- Linux backend serves the protocol on the existing control socket beside
+  the text commands (a framed client starts with a NUL byte). Status,
+  capabilities, settings read/validate/save/restart with stale-draft
+  refusal, sharing controls, controller hand-over, audio routing, phones,
+  phone pairing with cancel-on-close, computer pairing arm, autostart,
+  notifications, diagnostics and quit. Hello carries the instance's
+  pid/config/state/log paths for instance matching.
+- `apps/hyprkvm-ui` (Tauri 2 + SvelteKit static, own Cargo workspace):
+  Home with every current settings-window section, Add a phone popup,
+  View shown as unavailable, single instance with `--route`, backend
+  absent/starting/incompatible/other-instance/disconnected states, offline
+  settings editing, start backend via the user service or sibling binary.
+- `packages/hypr-ui`: tokens, bundled OFL fonts, Card/Tile/Pill/Segment/
+  Switch/Label/StatusDot. Desktop-owned (no HyprMobile snapshot yet).
+- Tray opens hyprKvm only with `EDGE_KVM_DESKTOP_UI=hyprkvm`; egui stays
+  the default.
+- CI job `desktop-ui` (Linux and Windows): frozen npm install, checks,
+  build, UI crate tests/Clippy, Tauri build. Backend jobs unchanged.
+
+Not done:
+
+- M0 on Tera and the Windows WebCodecs/HEVC experiment.
+- M1 Windows control service (named pipe, current-user ACL) and the
+  Windows backend's snapshot/settings handling. The Windows UI builds but
+  can only report the backend as not running.
+- M2 HyprMobile snapshot delivery; M3 Confirm computer popup and live
+  grants; M4–M6.
 
 ## Architecture decisions
 

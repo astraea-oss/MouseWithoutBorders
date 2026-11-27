@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edge-kvm — UI concepts</title>
+<style>
+:root{
+  --bg:#0e1013; --stage:#15181d; --ink:#e7e9ee; --mute:#9aa1ad; --faint:#6b7280;
+  --line:#2a2f37; --line2:#353b45;
+  --win:#1c1f25; --win2:#22262d; --field:#2a2e36; --field-line:#3a3f49;
+  --menu:#24272e; --menu-hi:#33507a;
+  --accent:#4f8cff; --ok:#3ecf8e; --warn:#f2b45a; --bad:#f07178;
+  --r:8px; --font: system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.45 var(--font)}
+button{font:inherit;color:inherit}
+
+/* ---------- deck ---------- */
+.deck{height:100%;position:relative;overflow:hidden}
+.slide{position:absolute;inset:0;padding:28px 40px 70px;display:none;flex-direction:column;gap:18px;overflow:auto}
+.slide.on{display:flex}
+.slide>header{display:flex;align-items:baseline;gap:14px}
+.slide>header .num{font-size:12px;letter-spacing:.08em;color:var(--mute);text-transform:uppercase}
+.slide>header h2{margin:0;font-size:26px;font-weight:650;letter-spacing:-.01em}
+.slide>header p{margin:0;color:var(--mute);font-size:15px}
+.stage{flex:1;display:flex;gap:44px;align-items:flex-start;justify-content:center;background:var(--stage);border:1px solid var(--line);border-radius:14px;padding:34px 30px;min-height:540px}
+.col{display:flex;flex-direction:column;gap:10px}
+.cap{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.notes{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;font-size:13.5px;color:var(--mute)}
+.notes b{display:block;color:var(--ink);font-weight:600;margin-bottom:3px}
+.nav{position:fixed;left:0;right:0;bottom:0;height:52px;display:flex;align-items:center;justify-content:center;gap:6px;background:linear-gradient(transparent,var(--bg) 40%)}
+.nav button{background:none;border:1px solid var(--line2);border-radius:999px;padding:5px 12px;color:var(--mute);cursor:pointer;font-size:12.5px}
+.nav button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.nav .hint{position:absolute;right:22px;color:var(--faint);font-size:12px}
+
+/* ---------- native-ish menu ---------- */
+.menuwrap{position:relative;display:flex;align-items:flex-start}
+.menu{background:var(--menu);border:1px solid #3a3e47;border-radius:7px;padding:4px;min-width:250px;box-shadow:0 12px 30px #0008;font-size:13.5px;user-select:none}
+.mi{display:flex;align-items:center;gap:9px;padding:5px 10px 5px 8px;border-radius:4px;white-space:nowrap;cursor:default}
+.mi:hover{background:var(--menu-hi)}
+.mi .ic{width:16px;text-align:center;color:var(--mute);font-size:13px;flex:none}
+.mi .k{margin-left:auto;padding-left:18px;color:var(--faint);font-size:12px}
+.mi .arr{margin-left:auto;padding-left:18px;color:var(--mute)}
+.mi.dis{color:var(--mute)}
+.mi.dis:hover{background:none}
+.mi.head{color:var(--ink);font-weight:600}
+.mi.head:hover{background:none}
+.mi.open{background:var(--menu-hi)}
+.mi.small{font-size:12px;color:var(--faint);padding-top:0}
+.sep{height:1px;background:#3a3e47;margin:4px 6px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--ok);flex:none}
+.dot.warn{background:var(--warn)} .dot.idle{background:var(--faint)}
+.submenu{position:absolute;left:calc(100% - 6px);min-width:190px}
+.menuwrap:has(.submenu){margin-right:200px}
+.trayicon{display:flex;align-items:center;gap:8px;color:var(--faint);font-size:12px;margin-top:6px}
+.trayicon .bar{display:flex;gap:10px;background:#0b0c0f;border:1px solid var(--line);padding:5px 10px;border-radius:6px}
+.badge-native{font-size:11px;color:var(--faint)}
+
+/* ---------- window chrome ---------- */
+.win{background:var(--win);border:1px solid var(--line2);border-radius:10px;box-shadow:0 20px 50px #0009;overflow:hidden;display:flex;flex-direction:column}
+.tb{height:34px;display:flex;align-items:center;padding:0 8px 0 14px;font-size:12.5px;color:var(--mute);border-bottom:1px solid var(--line);background:#191c21;flex:none}
+.tb .x{margin-left:auto;display:flex;gap:2px}
+.tb .x span{width:26px;height:22px;border-radius:5px;display:grid;place-items:center;color:var(--faint)}
+.wb{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+
+/* ---------- controls ---------- */
+.row{display:flex;align-items:center;gap:12px;min-height:30px}
+.row>.l{flex:1;min-width:0}
+.row>.l small{display:block;color:var(--faint);font-size:12px;line-height:1.3}
+.tg{width:34px;height:20px;border-radius:999px;background:#3b404a;position:relative;flex:none;cursor:pointer;transition:background .15s}
+.tg::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#cfd3da;transition:left .15s}
+.tg.on{background:var(--accent)} .tg.on::after{left:16px;background:#fff}
+.sel,.inp{background:var(--field);border:1px solid var(--field-line);border-radius:6px;height:28px;padding:0 9px;display:inline-flex;align-items:center;gap:8px;font-size:13px;min-width:150px;justify-content:space-between}
+.sel::after{content:"▾";color:var(--faint);font-size:11px}
+.inp{justify-content:flex-start;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.inp.w-s{min-width:76px;width:76px}
+.seg{display:inline-flex;background:var(--field);border:1px solid var(--field-line);border-radius:7px;padding:2px;gap:2px}
+.seg span{padding:3px 10px;border-radius:5px;font-size:12.5px;color:var(--mute);cursor:pointer;white-space:nowrap}
+.seg span.on{background:#3d4350;color:var(--ink)}
+.btn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:6px;border:1px solid var(--field-line);background:#2c313a;font-size:13px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:#343a45}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:none;border-color:transparent;color:var(--mute)}
+.btn.sm{height:24px;padding:0 9px;font-size:12px}
+.btn.danger{color:var(--bad)}
+.sec{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);margin:6px 0 0}
+.hr{height:1px;background:var(--line)}
+.muted{color:var(--mute)} .faint{color:var(--faint)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mute);background:#262a31;border:1px solid var(--line2);border-radius:999px;padding:2px 9px}
+.card{background:var(--win2);border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+.list>.item{display:flex;align-items:center;gap:10px;padding:8px 2px;border-top:1px solid var(--line)}
+.list>.item:first-child{border-top:none}
+.devic{width:30px;height:30px;border-radius:7px;background:#2a2f38;display:grid;place-items:center;font-size:15px;flex:none;color:var(--mute)}
+.foot{display:flex;align-items:center;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#191c21}
+.foot .grow{flex:1}
+
+/* ---------- version 1: sidebar ---------- */
+.v1 .win{width:640px;height:440px}
+.v1 .split{display:flex;flex:1;min-height:0}
+.v1 .side{width:158px;border-right:1px solid var(--line);padding:10px 8px;display:flex;flex-direction:column;gap:2px;background:#191c21}
+.v1 .side a{padding:6px 10px;border-radius:6px;color:var(--mute);cursor:pointer;display:flex;gap:9px;align-items:center;font-size:13px}
+.v1 .side a.on{background:#2b3039;color:var(--ink)}
+.v1 .side .st{margin-top:auto;padding:8px 10px;font-size:12px;color:var(--mute);display:flex;gap:7px;align-items:center}
+.v1 .pane{flex:1;padding:16px 20px;display:none;flex-direction:column;gap:8px;overflow:auto}
+.v1 .pane.on{display:flex}
+.v1 .pane h3{margin:0 0 4px;font-size:16px;font-weight:600}
+
+/* ---------- version 2: one page ---------- */
+.v2 .win{width:470px;height:640px}
+.v2 .scroll{flex:1;overflow:auto;padding:4px 18px 14px}
+.v2 .grp{display:grid;grid-template-columns:128px 1fr;row-gap:6px;column-gap:14px;align-items:center;padding:8px 0}
+.v2 .grp .l{color:var(--mute);font-size:13px}
+.v2 .sec{grid-column:1/-1;margin:10px 0 2px}
+.v2 .statusbar{display:flex;align-items:center;gap:8px;padding:9px 18px;border-bottom:1px solid var(--line);font-size:13px}
+
+/* ---------- version 3: devices first ---------- */
+.v3 .win{width:600px;height:500px}
+.v3 .layoutbox{background:#15181d;border:1px solid var(--line);border-radius:9px;height:132px;position:relative}
+.v3 .scr{position:absolute;border-radius:6px;display:grid;place-items:center;font-size:12px;text-align:center;line-height:1.25}
+.v3 .scr.me{background:#2c3a55;border:1.5px solid var(--accent)}
+.v3 .scr.peer{background:#2a2e36;border:1.5px dashed #59606d;cursor:grab}
+.v3 .devgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.v3 .dev{background:var(--win2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.v3 .dev .top{display:flex;align-items:center;gap:10px}
+.v3 .dev .top b{font-weight:600}
+.v3 .dev.add{border-style:dashed;align-items:center;justify-content:center;color:var(--mute);cursor:pointer;min-height:118px}
+.v3 .dev.add:hover{border-color:var(--accent);color:var(--ink)}
+
+/* ---------- version 4: tabs ---------- */
+.v4 .win{width:520px;height:470px}
+.v4 .tabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--line);background:#191c21}
+.v4 .tabs a{padding:7px 12px;font-size:13px;color:var(--mute);border-radius:6px 6px 0 0;cursor:pointer;border:1px solid transparent;border-bottom:none;margin-bottom:-1px}
+.v4 .tabs a.on{color:var(--ink);background:var(--win);border-color:var(--line)}
+.v4 .tp{display:none;padding:14px 18px;flex-direction:column;gap:6px;flex:1;overflow:auto}
+.v4 .tp.on{display:flex}
+.v4 .sb{display:flex;align-items:center;gap:10px;padding:7px 14px;border-top:1px solid var(--line);background:#191c21;font-size:12px;color:var(--mute)}
+.v4 .sb .grow{flex:1}
+
+/* ---------- version 5: popover ---------- */
+.v5 .pop{width:318px;background:#20232a;border:1px solid #3a3e47;border-radius:14px;box-shadow:0 20px 50px #000a;padding:12px;display:flex;flex-direction:column;gap:10px}
+.v5 .ph{display:flex;align-items:center;gap:10px}
+.v5 .ph b{font-size:14px}
+.v5 .ph .grow{flex:1}
+.v5 .icb{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;color:var(--mute);cursor:pointer}
+.v5 .icb:hover{background:#2c313a;color:var(--ink)}
+.v5 .tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.v5 .tile{background:#2a2e36;border-radius:10px;padding:9px 11px;cursor:pointer;display:flex;flex-direction:column;gap:2px;border:1px solid transparent}
+.v5 .tile b{font-size:13px;font-weight:600}
+.v5 .tile small{color:var(--mute);font-size:11.5px}
+.v5 .tile.on{background:#24395e;border-color:#35558c}
+.v5 .chips{display:flex;flex-wrap:wrap;gap:6px}
+.v5 .win{width:470px;height:600px}
+.v5 details{border-top:1px solid var(--line);padding:2px 0}
+.v5 details:first-of-type{border-top:none}
+.v5 summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:9px 2px;font-weight:600;font-size:13.5px}
+.v5 summary::-webkit-details-marker{display:none}
+.v5 summary::after{content:"›";margin-left:auto;color:var(--faint);transition:transform .15s;font-size:16px}
+.v5 details[open] summary::after{transform:rotate(90deg)}
+.v5 summary .faint{font-weight:400;font-size:12.5px}
+.v5 .db{display:flex;flex-direction:column;gap:6px;padding:0 2px 10px}
+
+/* ---------- before slide ---------- */
+.before .menu{min-width:280px}
+.flag{font-size:11px;color:var(--bad);margin-left:auto;padding-left:12px}
+.oldwin{width:440px}
+.oldgrid{display:grid;grid-template-columns:140px 1fr;gap:6px 12px;align-items:center;font-size:13px}
+.oldgrid .l{color:var(--mute)}
+.principles{display:grid;grid-template-columns:1fr 1fr;gap:10px 26px;max-width:620px;font-size:13.5px;color:var(--mute)}
+.principles b{color:var(--ink);font-weight:600}
+
+/* ---------- QR dialog ---------- */
+.ov{position:fixed;inset:0;background:#000a;display:none;place-items:center;z-index:50}
+.ov.on{display:grid}
+.qrwin{width:380px}
+.qrbox{background:#fff;border-radius:10px;padding:12px;width:220px;height:220px;margin:4px auto 0}
+.qrbox canvas{width:196px;height:196px;image-rendering:pixelated;display:block}
+.qrstate{display:flex;align-items:center;justify-content:center;gap:8px;font-size:13px;color:var(--mute);min-height:22px}
+.spin{width:12px;height:12px;border-radius:50%;border:2px solid #4b5160;border-top-color:var(--accent);animation:sp 0.8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.okmark{width:220px;height:220px;margin:4px auto 0;border-radius:10px;background:#18392c;display:none;place-items:center;font-size:64px;color:var(--ok)}
+.qrwin.done .qrbox{display:none} .qrwin.done .okmark{display:grid}
+.qrwin details summary{cursor:pointer;color:var(--faint);font-size:12px;list-style:none;text-align:center}
+.qrwin details summary::-webkit-details-marker{display:none}
+.demo{font-size:11.5px;color:var(--faint);text-align:center}
+.demo a{color:var(--faint);text-decoration:underline;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+<!-- ============================================================ 0: today -->
+<section class="slide before" data-title="Today">
+  <header><span class="num">Start</span><h2>Where it is today</h2><p>Laptop “Lua” is receiving from “Main PC”. A phone is paired.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Current right-click menu: 21 rows</div>
+      <div class="menu">
+        <div class="mi dis">Status: Connected<span class="flag">debug</span></div>
+        <div class="mi dis">Transport: Listen 0.0.0.0:42420<span class="flag">debug</span></div>
+        <div class="mi dis">Input backend: uinput<span class="flag">debug</span></div>
+        <div class="mi dis">Pairing: not armed<span class="flag">debug</span></div>
+        <div class="mi dis">Peer: Main PC</div>
+        <div class="mi dis">Connections: 14<span class="flag">debug</span></div>
+        <div class="mi dis">Input events: 182344<span class="flag">debug</span></div>
+        <div class="mi dis">Clipboard events: 61<span class="flag">debug</span></div>
+        <div class="mi dis">Last error: None<span class="flag">debug</span></div>
+        <div class="sep"></div>
+        <div class="mi dis"><span class="ic">⇄</span>Pair or replace peer...</div>
+        <div class="mi"><span class="ic">⏻</span>Disconnect</div>
+        <div class="mi"><span class="ic">◉</span>Main PC controls Lua</div>
+        <div class="mi"><span class="ic">○</span>Lua controls Main PC</div>
+        <div class="mi"><span class="ic">✓</span>Forward mouse and keyboard</div>
+        <div class="sep"></div>
+        <div class="mi dis">Audio routing</div>
+        <div class="mi"><span class="ic">○</span>Audio off</div>
+        <div class="mi"><span class="ic">◉</span>Lua → Main PC</div>
+        <div class="mi"><span class="ic">○</span>Main PC → Lua</div>
+        <div class="mi"><span class="ic">⚙</span>Settings...</div>
+        <div class="mi"><span class="ic">✕</span>Quit edge-kvm</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="cap">Current settings window</div>
+      <div class="win oldwin">
+        <div class="tb">edge-kvm Settings<div class="x"><span>✕</span></div></div>
+        <div class="wb">
+          <div style="font-size:18px;font-weight:600">edge-kvm Settings</div>
+          <div class="oldgrid">
+            <span class="l">Name</span><span class="inp">Lua</span>
+            <span class="l">Game compatibility</span><span class="inp faint">Linux: not used</span>
+            <span class="l">Local IP</span><span class="inp faint">192.168.0.11</span>
+            <span class="l">Connection mode</span><span class="sel">Wait for the other computer</span>
+            <span></span><small class="faint">This computer waits. Set the other computer to Connect.</small>
+            <span class="l">Peer IP</span><span class="inp faint">Not needed while waiting</span>
+            <span class="l">Port</span><span class="inp">42420</span>
+            <span class="l">Screen location</span><span class="inp faint">Set on connecting computer</span>
+            <span class="l">Pairing status</span><span>Paired with Main PC</span>
+            <span class="l">Clipboard images</span><span>☑ Sync images on connection</span>
+            <span class="l">Audio streaming</span><span class="sel">Lua → Main PC</span>
+            <span class="l">Local playback</span><span>☐ Keep playing locally</span>
+            <span class="l">Playback output</span><span class="inp faint">Follow system default</span>
+          </div>
+          <div style="text-align:right"><span class="btn">Save and restart</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="col" style="max-width:330px">
+      <div class="cap">What every version below fixes</div>
+      <div class="principles" style="grid-template-columns:1fr">
+        <div><b>Menu = actions.</b> Status is one line. Counters, backend, transport and last error move to a Diagnostics section in Settings (with a Copy button for bug reports).</div>
+        <div><b>Add phone… is a button.</b> It's in the menu and in Settings, and opens the QR dialog. No terminal needed. Try it on any slide.</div>
+        <div><b>No dead fields.</b> Disabled boxes saying “not used” or “not needed” are hidden instead.</div>
+        <div><b>Phones are visible.</b> Paired phones are listed with their state and a Remove button.</div>
+        <div><b>One window, one save model.</b> Settings apply instantly. Only changes to the connection itself ask for a restart.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 1: quiet sidebar -->
+<section class="slide v1" data-title="1 · Quiet">
+  <header><span class="num">Version 1</span><h2>Quiet</h2><p>A short menu with submenus, and settings organised with a sidebar like a system settings app.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Right-click menu: 9 rows <span class="badge-native">(native)</span></div>
+      <div class="menuwrap">
+        <div class="menu">
+          <div class="mi head"><span class="dot"></span>Connected to Main PC</div>
+          <div class="sep"></div>
+          <div class="mi"><span class="ic">✓</span>Share mouse &amp; keyboard</div>
+          <div class="mi open"><span class="ic">♪</span>Audio<span class="arr">▸</span></div>
+          <div class="mi"><span class="ic">⇆</span>Control<span class="arr">▸</span></div>
+          <div class="sep"></div>
+          <div class="mi js-qr"><span class="ic">▣</span>Add phone…</div>
+          <div class="mi"><span class="ic">⚙</span>Settings…</div>
+          <div class="sep"></div>
+          <div class="mi"><span class="ic"></span>Quit</div>
+        </div>
+        <div class="menu submenu" style="top:58px">
+          <div class="mi"><span class="ic">◉</span>This laptop → Main PC</div>
+          <div class="mi"><span class="ic">○</span>Main PC → this laptop</div>
+          <div class="mi"><span class="ic">○</span>Off</div>
+        </div>
+      </div>
+      <div class="trayicon">Tooltip: <span class="pill"><span class="dot"></span>edge-kvm · Connected to Main PC</span></div>
+    </div>
+    <div class="col">
+      <div class="cap">Settings</div>
+      <div class="win">
+        <div class="tb">edge-kvm<div class="x"><span>–</span><span>✕</span></div></div>
+        <div class="split">
+          <nav class="side" data-tabs>
+            <a class="on" data-p="v1-gen">⌂ General</a>
+            <a data-p="v1-dev">▣ Devices</a>
+            <a data-p="v1-clip">⎘ Clipboard</a>
+            <a data-p="v1-aud">♪ Audio</a>
+            <a data-p="v1-diag">⚑ Diagnostics</a>
+            <div class="st"><span class="dot"></span>Connected</div>
+          </nav>
+          <div class="pane on" id="v1-gen">
+            <h3>General</h3>
+            <div class="row"><div class="l">Name</div><span class="inp" style="min-width:190px">Lua</span></div>
+            <div class="row"><div class="l">Connection<small>Main PC connects to this laptop</small></div><div class="seg"><span>Connect</span><span class="on">Wait</span></div></div>
+            <div class="row"><div class="l">Port</div><span class="inp w-s">42420</span></div>
+            <div class="row"><div class="l">Share mouse &amp; keyboard</div><div class="tg on"></div></div>
+            <div class="row"><div class="l">Start at login</div><div class="tg on"></div></div>
+            <div class="hr" style="margin:6px 0"></div>
+            <div class="row"><div class="l">Paired computer<small>Main PC</small></div><span class="btn sm">Pair another…</span></div>
+          </div>
+          <div class="pane" id="v1-dev">
+            <h3>Devices</h3>
+            <div class="list">
+              <div class="item"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg></div><div class="l" style="flex:1">Main PC<br><small class="faint">Computer · connected</small></div><span class="btn sm ghost">Forget</span></div>
+              <div class="item"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4" y="1.5" width="8" height="13" rx="1.8"/><path d="M7 12.2h2"/></svg></div><div class="l" style="flex:1">CMF Phone 2 Pro<br><small class="faint">Phone · connected</small></div><span class="btn sm ghost">Remove</span></div>
+            </div>
+            <div><span class="btn primary js-qr">＋ Add phone</span></div>
+            <div class="row" style="margin-top:6px"><div class="l">Send phone clipboard to Main PC</div><div class="tg on"></div></div>
+            <div class="row"><div class="l">Show phone notifications</div><div class="tg on"></div></div>
+          </div>
+          <div class="pane" id="v1-clip">
+            <h3>Clipboard</h3>
+            <div class="row"><div class="l">Share clipboard</div><div class="tg on"></div></div>
+            <div class="row"><div class="l">Include images</div><div class="tg on"></div></div>
+            <div class="row"><div class="l">Largest text</div><span class="sel" style="min-width:110px">1 MB</span></div>
+            <div class="row"><div class="l">Largest image</div><span class="sel" style="min-width:110px">4 MB</span></div>
+          </div>
+          <div class="pane" id="v1-aud">
+            <h3>Audio</h3>
+            <div class="row"><div class="l">Stream audio</div><div class="seg"><span class="on">To Main PC</span><span>From Main PC</span><span>Off</span></div></div>
+            <div class="row"><div class="l">Also play here<small>Otherwise this laptop goes quiet while streaming</small></div><div class="tg"></div></div>
+            <div class="row"><div class="l">Buffer<small>Raise if audio crackles on Wi-Fi</small></div><span class="sel" style="min-width:110px">60 ms</span></div>
+          </div>
+          <div class="pane" id="v1-diag">
+            <h3>Diagnostics</h3>
+            <div class="card mono" style="line-height:1.7">
+              transport&nbsp;&nbsp;&nbsp;listen 0.0.0.0:42420<br>backend&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;uinput<br>connections 14 · input 182,344 · clipboard 61<br>audio&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;0.0 ms dropped · 58 ms queued<br>last error&nbsp;&nbsp;none
+            </div>
+            <div style="display:flex;gap:8px"><span class="btn sm">Copy report</span><span class="btn sm">Open log</span><span class="btn sm">Test audio</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>Feels like</b>GNOME / Windows 11 settings. Each page is short, so nothing scrolls.</div>
+    <div><b>Menu</b>Audio and Control directions move into submenus, so the top level is just the status line, the input toggle, two submenus, Add phone, Settings and Quit.</div>
+    <div><b>Trade-off</b>Changing audio direction takes two clicks instead of one. The sidebar is a lot of navigation for about 15 settings.</div>
+  </div>
+</section>
+
+<!-- ============================================================ 2: one page -->
+<section class="slide v2" data-title="2 · One page">
+  <header><span class="num">Version 2</span><h2>One page</h2><p>A flat menu where every common action is one click, and a single compact settings page with no navigation.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Right-click menu: 11 rows, no submenus <span class="badge-native">(native)</span></div>
+      <div class="menu">
+        <div class="mi head"><span class="dot"></span>Main PC is controlling this laptop</div>
+        <div class="sep"></div>
+        <div class="mi"><span class="ic">✓</span>Share mouse &amp; keyboard</div>
+        <div class="mi"><span class="ic">✓</span>Share clipboard</div>
+        <div class="sep"></div>
+        <div class="mi small">Audio</div>
+        <div class="mi"><span class="ic">◉</span>Send to Main PC</div>
+        <div class="mi"><span class="ic">○</span>Play from Main PC</div>
+        <div class="mi"><span class="ic">○</span>Off</div>
+        <div class="sep"></div>
+        <div class="mi js-qr"><span class="ic">▣</span>Add phone…</div>
+        <div class="mi"><span class="ic">⚙</span>Settings…</div>
+        <div class="mi"><span class="ic"></span>Quit</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="cap">Settings</div>
+      <div class="win">
+        <div class="tb">edge-kvm settings<div class="x"><span>✕</span></div></div>
+        <div class="statusbar"><span class="dot"></span><span>Connected to <b>Main PC</b></span><span class="faint" style="margin-left:auto">192.168.0.11:42420</span></div>
+        <div class="scroll">
+          <div class="grp">
+            <div class="sec">This laptop</div>
+            <span class="l">Name</span><span class="inp">Lua</span>
+            <span class="l">Connection</span><div class="seg" style="justify-self:start"><span>Connect to…</span><span class="on">Wait for others</span></div>
+            <span class="l">Port</span><span class="inp w-s">42420</span>
+            <span class="l">Start at login</span><div class="tg on"></div>
+
+            <div class="sec">Devices</div>
+            <span class="l">Computer</span><div class="row" style="min-height:0"><span>Main PC</span><span class="btn sm ghost" style="margin-left:auto">Pair another…</span></div>
+            <span class="l">Phones</span><div class="row" style="min-height:0"><span>CMF Phone 2 Pro <span class="faint">· connected</span></span><span class="btn sm ghost" style="margin-left:auto">Remove</span></div>
+            <span></span><div><span class="btn sm primary js-qr">＋ Add phone</span></div>
+
+            <div class="sec">Sharing</div>
+            <span class="l">Clipboard</span><div class="seg" style="justify-self:start"><span>Off</span><span>Text</span><span class="on">Text + images</span></div>
+            <span class="l">Phone clipboard</span><div class="row" style="min-height:0"><div class="tg on"></div><span class="faint" style="font-size:12.5px">also send to Main PC</span></div>
+            <span class="l">Audio</span><div class="seg" style="justify-self:start"><span class="on">To Main PC</span><span>From Main PC</span><span>Off</span></div>
+            <span class="l">Play here too</span><div class="tg"></div>
+
+            <div class="sec">Advanced</div>
+            <span class="l">Audio buffer</span><span class="sel" style="min-width:100px;justify-self:start">60 ms</span>
+            <span class="l">Diagnostics</span><div style="display:flex;gap:6px"><span class="btn sm">Copy report</span><span class="btn sm">Open log</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>Feels like</b>A tidied version of today's window: the same grid, grouped, with dead fields gone and segmented controls instead of dropdowns.</div>
+    <div><b>Menu</b>No submenus. Audio direction and clipboard sharing are one click. The status line says who is controlling whom.</div>
+    <div><b>Trade-off</b>The page scrolls slightly. This is the least work to build, since it's closest to the current egui code.</div>
+  </div>
+</section>
+
+<!-- ============================================================ 3: devices first -->
+<section class="slide v3" data-title="3 · Devices">
+  <header><span class="num">Version 3</span><h2>Devices first</h2><p>Organised around what's connected. The screen layout is a picture, and each device has its own options.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Right-click menu: grouped by device <span class="badge-native">(native)</span></div>
+      <div class="menuwrap">
+        <div class="menu">
+          <div class="mi head"><span class="dot"></span>Main PC</div>
+          <div class="mi"><span class="ic">✓</span>Share mouse &amp; keyboard</div>
+          <div class="mi open"><span class="ic">♪</span>Audio<span class="arr">▸</span></div>
+          <div class="sep"></div>
+          <div class="mi head"><span class="dot"></span>CMF Phone 2 Pro</div>
+          <div class="mi"><span class="ic">✓</span>Notifications</div>
+          <div class="mi"><span class="ic">♪</span>Audio<span class="arr">▸</span></div>
+          <div class="sep"></div>
+          <div class="mi js-qr"><span class="ic">＋</span>Add phone…</div>
+          <div class="mi"><span class="ic">⚙</span>Settings…</div>
+          <div class="mi"><span class="ic"></span>Quit</div>
+        </div>
+        <div class="menu submenu" style="top:58px">
+          <div class="mi"><span class="ic">◉</span>Send this laptop's audio</div>
+          <div class="mi"><span class="ic">○</span>Play Main PC's audio</div>
+          <div class="mi"><span class="ic">○</span>Off</div>
+        </div>
+      </div>
+      <div class="trayicon" style="max-width:270px">Scales to several phones without getting longer at the top level: each device is a heading with two items.</div>
+    </div>
+    <div class="col">
+      <div class="cap">Settings</div>
+      <div class="win">
+        <div class="tb">edge-kvm<div class="x"><span>–</span><span>✕</span></div></div>
+        <div class="wb">
+          <div class="row" style="min-height:0"><span class="sec" style="margin:0">Screen layout</span><span class="faint" style="margin-left:auto;font-size:12px">drag Main PC to the side you cross into it from</span></div>
+          <div class="layoutbox">
+            <div class="scr peer" style="left:150px;top:30px;width:120px;height:72px">Main PC<br><span class="faint">2560×1440</span></div>
+            <div class="scr me" style="left:274px;top:38px;width:104px;height:64px">Lua<br><span class="faint">this laptop</span></div>
+          </div>
+          <div class="devgrid">
+            <div class="dev">
+              <div class="top"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg></div><div><b>Main PC</b><br><small class="faint"><span class="dot" style="width:6px;height:6px"></span> connected · controls this laptop</small></div></div>
+              <div class="row" style="min-height:24px"><div class="l">Mouse &amp; keyboard</div><div class="tg on"></div></div>
+              <div class="row" style="min-height:24px"><div class="l">Audio</div><div class="seg"><span class="on">→</span><span>←</span><span>Off</span></div></div>
+            </div>
+            <div class="dev">
+              <div class="top"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4" y="1.5" width="8" height="13" rx="1.8"/><path d="M7 12.2h2"/></svg></div><div><b>CMF Phone 2 Pro</b><br><small class="faint"><span class="dot" style="width:6px;height:6px"></span> connected</small></div></div>
+              <div class="row" style="min-height:24px"><div class="l">Notifications</div><div class="tg on"></div></div>
+              <div class="row" style="min-height:24px"><div class="l">Clipboard → Main PC</div><div class="tg on"></div></div>
+            </div>
+            <div class="dev add js-qr"><div style="font-size:22px">＋</div><div>Add phone</div><small class="faint">Shows a QR code</small></div>
+            <div class="dev">
+              <div class="top"><div class="devic">⚙</div><div><b>This laptop</b><br><small class="faint">Lua · waiting on :42420</small></div></div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap"><span class="btn sm">Clipboard…</span><span class="btn sm">Connection…</span><span class="btn sm">Diagnostics…</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>Feels like</b>Bluetooth device settings. You manage things you can see instead of reading config labels.</div>
+    <div><b>Menu</b>Grouped by device, so phone options sit next to the phone. The menu grows by about 3 rows for each extra phone.</div>
+    <div><b>Trade-off</b>The drag-to-arrange screen layout is the most build work. Global settings like clipboard size limits go one level deeper.</div>
+  </div>
+</section>
+
+<!-- ============================================================ 4: tabs -->
+<section class="slide v4" data-title="4 · Tabs">
+  <header><span class="num">Version 4</span><h2>Compact tabs</h2><p>The smallest menu, and a small fixed-size window with four tabs. Nothing scrolls.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Right-click menu: 7 rows <span class="badge-native">(native)</span></div>
+      <div class="menuwrap">
+        <div class="menu">
+          <div class="mi head"><span class="dot"></span>Connected · Main PC</div>
+          <div class="sep"></div>
+          <div class="mi"><span class="ic">⏸</span>Pause sharing</div>
+          <div class="mi"><span class="ic">♪</span>Audio: to Main PC<span class="arr">▸</span></div>
+          <div class="mi js-qr"><span class="ic">▣</span>Add phone…</div>
+          <div class="sep"></div>
+          <div class="mi"><span class="ic">⚙</span>Settings…</div>
+          <div class="mi"><span class="ic"></span>Quit</div>
+        </div>
+      </div>
+      <div class="trayicon" style="max-width:260px">The submenu's label shows the current choice, so you can see the audio state without opening it.</div>
+    </div>
+    <div class="col">
+      <div class="cap">Settings</div>
+      <div class="win">
+        <div class="tb">edge-kvm<div class="x"><span>✕</span></div></div>
+        <div class="tabs" data-tabs>
+          <a class="on" data-p="v4-con">Connection</a>
+          <a data-p="v4-dev">Devices</a>
+          <a data-p="v4-shr">Sharing</a>
+          <a data-p="v4-adv">Advanced</a>
+        </div>
+        <div class="tp on" id="v4-con">
+          <div class="row"><div class="l">This laptop's name</div><span class="inp" style="min-width:180px">Lua</span></div>
+          <div class="row"><div class="l">How to connect</div><div class="seg"><span>Connect to…</span><span class="on">Wait</span></div></div>
+          <div class="row"><div class="l">Port</div><span class="inp w-s">42420</span></div>
+          <div class="row"><div class="l">Start at login</div><div class="tg on"></div></div>
+          <div class="card" style="margin-top:6px;display:flex;align-items:center;gap:10px"><span class="dot"></span><div style="flex:1">Paired with <b>Main PC</b><br><small class="faint">Waiting on 192.168.0.11:42420</small></div><span class="btn sm">Pair another…</span></div>
+        </div>
+        <div class="tp" id="v4-dev">
+          <div class="list">
+            <div class="item"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg></div><div style="flex:1">Main PC<br><small class="faint">connected</small></div><span class="btn sm ghost">Forget</span></div>
+            <div class="item"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4" y="1.5" width="8" height="13" rx="1.8"/><path d="M7 12.2h2"/></svg></div><div style="flex:1">CMF Phone 2 Pro<br><small class="faint">connected · notifications on</small></div><span class="btn sm ghost">Remove</span></div>
+          </div>
+          <div><span class="btn primary js-qr">＋ Add phone</span></div>
+        </div>
+        <div class="tp" id="v4-shr">
+          <div class="row"><div class="l">Clipboard</div><div class="seg"><span>Off</span><span>Text</span><span class="on">Text + images</span></div></div>
+          <div class="row"><div class="l">Phone clipboard reaches Main PC</div><div class="tg on"></div></div>
+          <div class="row"><div class="l">Phone notifications</div><div class="tg on"></div></div>
+          <div class="hr" style="margin:4px 0"></div>
+          <div class="row"><div class="l">Audio</div><div class="seg"><span class="on">To Main PC</span><span>From</span><span>Off</span></div></div>
+          <div class="row"><div class="l">Play here too</div><div class="tg"></div></div>
+        </div>
+        <div class="tp" id="v4-adv">
+          <div class="row"><div class="l">Audio buffer</div><span class="sel" style="min-width:100px">60 ms</span></div>
+          <div class="row"><div class="l">Largest clipboard text / image</div><span class="sel" style="min-width:100px">1 / 4 MB</span></div>
+          <div class="row"><div class="l">Input backend</div><span class="sel" style="min-width:100px">Automatic</span></div>
+          <div class="card mono" style="margin-top:4px;line-height:1.7">uinput · 14 connections · 182,344 input · 61 clipboard · no errors</div>
+          <div style="display:flex;gap:6px"><span class="btn sm">Copy report</span><span class="btn sm">Open log</span></div>
+        </div>
+        <div class="sb"><span class="dot"></span>Connected to Main PC<span class="grow"></span>Changes apply right away</div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>Feels like</b>A classic utility preferences window: small and predictable, and every tab fits without scrolling.</div>
+    <div><b>Menu</b>The smallest of the five. “Pause sharing” replaces the checkbox, and the audio submenu's label shows its current state.</div>
+    <div><b>Trade-off</b>Tabs hide things, so you have to know that phones are under Devices. The status bar keeps the connection visible on every tab.</div>
+  </div>
+</section>
+
+<!-- ============================================================ 5: popover -->
+<section class="slide v5" data-title="5 · Panel">
+  <header><span class="num">Version 5</span><h2>Quick panel</h2><p>Left-click opens a small control panel like a phone's quick settings. Right-click stays a tiny native menu.</p></header>
+  <div class="stage">
+    <div class="col">
+      <div class="cap">Left-click: quick panel <span class="badge-native">(custom window)</span></div>
+      <div class="pop">
+        <div class="ph"><span class="dot"></span><div class="grow"><b>Main PC</b><br><small class="faint">controls this laptop</small></div><span class="icb" title="Settings">⚙</span></div>
+        <div class="tiles">
+          <div class="tile on js-tile"><b>⌨ Mouse &amp; keyboard</b><small>Shared</small></div>
+          <div class="tile on js-tile"><b>⎘ Clipboard</b><small>Text + images</small></div>
+          <div class="tile on js-tile"><b>♪ Audio</b><small>To Main PC</small></div>
+          <div class="tile js-tile"><b>⇆ Swap control</b><small>Lua controls Main PC</small></div>
+        </div>
+        <div class="sec" style="margin:0">Phones</div>
+        <div class="chips"><span class="pill"><span class="dot" style="width:6px;height:6px"></span>CMF Phone 2 Pro</span><span class="pill js-qr" style="cursor:pointer;color:var(--ink)">＋ Add phone</span></div>
+      </div>
+      <div class="cap" style="margin-top:10px">Right-click: 4 rows <span class="badge-native">(native)</span></div>
+      <div class="menu" style="min-width:200px">
+        <div class="mi"><span class="ic">⏸</span>Pause sharing</div>
+        <div class="mi js-qr"><span class="ic">▣</span>Add phone…</div>
+        <div class="mi"><span class="ic">⚙</span>Settings…</div>
+        <div class="mi"><span class="ic"></span>Quit</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="cap">Settings</div>
+      <div class="win">
+        <div class="tb">edge-kvm<div class="x"><span>✕</span></div></div>
+        <div class="wb" style="gap:0;overflow:auto">
+          <details open><summary>Connection <span class="faint">waiting on :42420 · paired with Main PC</span></summary>
+            <div class="db">
+              <div class="row"><div class="l">Name</div><span class="inp" style="min-width:170px">Lua</span></div>
+              <div class="row"><div class="l">How to connect</div><div class="seg"><span>Connect to…</span><span class="on">Wait</span></div></div>
+              <div class="row"><div class="l">Port</div><span class="inp w-s">42420</span></div>
+              <div class="row"><div class="l">Start at login</div><div class="tg on"></div></div>
+            </div>
+          </details>
+          <details open><summary>Phones <span class="faint">1 paired</span></summary>
+            <div class="db">
+              <div class="row"><div class="devic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4" y="1.5" width="8" height="13" rx="1.8"/><path d="M7 12.2h2"/></svg></div><div class="l">CMF Phone 2 Pro<small>connected · notifications on</small></div><span class="btn sm ghost">Remove</span></div>
+              <div class="row"><div class="l">Send phone clipboard to Main PC</div><div class="tg on"></div></div>
+              <div><span class="btn sm primary js-qr">＋ Add phone</span></div>
+            </div>
+          </details>
+          <details><summary>Clipboard <span class="faint">text + images</span></summary>
+            <div class="db">
+              <div class="row"><div class="l">Share</div><div class="seg"><span>Off</span><span>Text</span><span class="on">Text + images</span></div></div>
+              <div class="row"><div class="l">Limits</div><span class="sel" style="min-width:110px">1 MB / 4 MB</span></div>
+            </div>
+          </details>
+          <details><summary>Audio <span class="faint">to Main PC</span></summary>
+            <div class="db">
+              <div class="row"><div class="l">Play here too</div><div class="tg"></div></div>
+              <div class="row"><div class="l">Buffer</div><span class="sel" style="min-width:100px">60 ms</span></div>
+            </div>
+          </details>
+          <details><summary>Diagnostics <span class="faint">no errors</span></summary>
+            <div class="db">
+              <div class="card mono" style="line-height:1.7">uinput · listen 0.0.0.0:42420<br>14 connections · 182,344 input · 61 clipboard</div>
+              <div style="display:flex;gap:6px"><span class="btn sm">Copy report</span><span class="btn sm">Open log</span></div>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>Feels like</b>macOS Control Centre or the Windows 11 quick settings panel. Everyday changes take one click, on big targets.</div>
+    <div><b>Settings</b>Collapsed sections show a one-line summary, so the closed window still tells you the whole state.</div>
+    <div><b>Trade-off</b>The most work. On Hyprland/Niri the panel can't place itself next to the tray, so it would need a layer-shell surface or to open centred. Windows is straightforward.</div>
+  </div>
+</section>
+
+</div>
+
+<!-- QR dialog (shared) -->
+<div class="ov" id="qr">
+  <div class="win qrwin" id="qrwin">
+    <div class="tb">Add a phone<div class="x"><span class="js-close" style="cursor:pointer">✕</span></div></div>
+    <div class="wb" style="gap:12px">
+      <div style="text-align:center"><b id="qrtitle">Scan with HyprMobile</b><br><small class="faint" id="qrsub">Open HyprMobile on the phone and scan this code</small></div>
+      <div class="qrbox"><canvas id="qrc" width="33" height="33"></canvas></div>
+      <div class="okmark">✓</div>
+      <div class="qrstate" id="qrstate"><span class="spin"></span>Waiting for the phone… <span class="mono" id="qrtime">4:59</span></div>
+      <details><summary>Can't scan? Show details</summary>
+        <div class="card mono" style="margin-top:8px;line-height:1.6">192.168.0.11:42420<br>fingerprint 7F3A·91C2·0D4E·B8A1<br>one-time code K4Q9-2MZT</div>
+      </details>
+      <div class="demo">mockup: <a id="qrsim">simulate the phone scanning</a></div>
+    </div>
+    <div class="foot"><span class="faint" style="font-size:12px">The phone must be on the same network</span><span class="grow"></span><span class="btn js-close" id="qrbtn">Cancel</span></div>
+  </div>
+</div>
+
+<div class="nav" id="nav"><span class="hint">← → to move · 0–5 to jump</span></div>
+
+<script>
+const slides=[...document.querySelectorAll('.slide')];
+const nav=document.getElementById('nav');
+let cur=0;
+slides.forEach((s,i)=>{const b=document.createElement('button');b.textContent=s.dataset.title;b.onclick=()=>show(i);nav.appendChild(b)});
+function show(i){cur=(i+slides.length)%slides.length;slides.forEach((s,j)=>s.classList.toggle('on',j===cur));[...nav.querySelectorAll('button')].forEach((b,j)=>b.classList.toggle('on',j===cur));history.replaceState(null,'','#'+cur)}
+addEventListener('keydown',e=>{if(document.getElementById('qr').classList.contains('on')){if(e.key==='Escape')closeQr();return}
+  if(e.key==='ArrowRight'||e.key===' ')show(cur+1);else if(e.key==='ArrowLeft')show(cur-1);else if(/^[0-5]$/.test(e.key))show(+e.key)});
+show(+(location.hash.slice(1))||0);
+
+// tabs / sidebars
+document.querySelectorAll('[data-tabs]').forEach(t=>t.addEventListener('click',e=>{const a=e.target.closest('[data-p]');if(!a)return;
+  t.querySelectorAll('[data-p]').forEach(x=>{x.classList.toggle('on',x===a);document.getElementById(x.dataset.p).classList.toggle('on',x===a)})}));
+// toggles, segments, tiles
+document.addEventListener('click',e=>{const tg=e.target.closest('.tg');if(tg)tg.classList.toggle('on');
+  const sp=e.target.closest('.seg span');if(sp){sp.parentElement.querySelectorAll('span').forEach(x=>x.classList.toggle('on',x===sp))}
+  const tl=e.target.closest('.js-tile');if(tl)tl.classList.toggle('on');
+  if(e.target.closest('.js-qr'))openQr();
+  if(e.target.closest('.js-close'))closeQr()});
+
+// fake QR: finder patterns + seeded noise (not a real code)
+function drawQr(seed){const c=document.getElementById('qrc'),x=c.getContext('2d'),n=33;x.fillStyle='#fff';x.fillRect(0,0,n,n);x.fillStyle='#111';
+  let s=seed;const r=()=>(s=(s*1103515245+12345)&0x7fffffff)/0x7fffffff;
+  const finder=(ox,oy)=>{for(let i=0;i<7;i++)for(let j=0;j<7;j++){const e=i==0||j==0||i==6||j==6||(i>1&&i<5&&j>1&&j<5);if(e)x.fillRect(ox+i,oy+j,1,1)}};
+  const inF=(i,j)=>(i<8&&j<8)||(i>n-9&&j<8)||(i<8&&j>n-9);
+  for(let i=0;i<n;i++)for(let j=0;j<n;j++){if(inF(i,j))continue;if(i==6||j==6){if((i+j)%2==0)x.fillRect(i,j,1,1);continue}if(r()<.47)x.fillRect(i,j,1,1)}
+  finder(0,0);finder(n-7,0);finder(0,n-7)}
+let timer,left;
+function openQr(){const w=document.getElementById('qrwin');w.classList.remove('done');
+  document.getElementById('qrtitle').textContent='Scan with HyprMobile';document.getElementById('qrsub').textContent='Open HyprMobile on the phone and scan this code';
+  document.getElementById('qrbtn').textContent='Cancel';drawQr(Date.now()&0xffff);left=300;tick();clearInterval(timer);timer=setInterval(tick,1000);
+  document.getElementById('qr').classList.add('on')}
+function tick(){left--;const st=document.getElementById('qrstate');if(left<=0){clearInterval(timer);st.innerHTML='Code expired · <a style="color:var(--accent);cursor:pointer" onclick="openQr()">Show a new one</a>';return}
+  st.innerHTML='<span class="spin"></span>Waiting for the phone… <span class="mono">'+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')+'</span>'}
+function closeQr(){clearInterval(timer);document.getElementById('qr').classList.remove('on')}
+document.getElementById('qrsim').onclick=()=>{clearInterval(timer);document.getElementById('qrwin').classList.add('done');
+  document.getElementById('qrtitle').textContent='CMF Phone 2 Pro added';document.getElementById('qrsub').textContent='Clipboard and notifications are on. Change them in Settings › Devices.';
+  document.getElementById('qrstate').innerHTML='';document.getElementById('qrbtn').textContent='Done'};
+document.getElementById('qr').addEventListener('click',e=>{if(e.target.id==='qr')closeQr()});
+</script>
+</body>
+</html>

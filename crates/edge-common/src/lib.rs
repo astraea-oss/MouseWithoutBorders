@@ -39,6 +39,12 @@ pub enum ConfigValidationError {
     InvalidPort,
     #[error("host must not be empty")]
     EmptyHost,
+    #[error("enter the address without a port; the port has its own field")]
+    HostHasPort,
+    #[error("put an IPv6 address in brackets, like [fd00::1]")]
+    UnbracketedIpv6,
+    #[error("not a valid IP address or host name")]
+    InvalidHost,
     #[error("listen address must include a port")]
     MissingListenPort,
     #[error("listen port is invalid")]
@@ -110,12 +116,18 @@ pub struct PhoneConfig {
     /// phone's clipboard on this machine only.
     #[serde(default = "default_true")]
     pub forward_clipboard_to_pcs: bool,
+    /// Send every copy on this machine to connected phones. Off by default:
+    /// a phone then gets this machine's clipboard only when it's sent on
+    /// purpose, while copies made on the phone still arrive here.
+    #[serde(default)]
+    pub send_clipboard_to_phones: bool,
 }
 
 impl Default for PhoneConfig {
     fn default() -> Self {
         Self {
             forward_clipboard_to_pcs: true,
+            send_clipboard_to_phones: false,
         }
     }
 }
@@ -736,6 +748,32 @@ pub fn portable_app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The local address on the route to `peer_host` (an IP literal, IPv6 with
+/// or without brackets): the address the other computer sees, rather than
+/// whatever carries the default route, which may be a VPN. Host names and an
+/// empty host fall back to [`detect_primary_local_ip`] so this never waits
+/// on DNS.
+pub fn local_ip_toward(peer_host: &str) -> Option<IpAddr> {
+    let host = peer_host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(peer) = host.parse::<IpAddr>() else {
+        return detect_primary_local_ip();
+    };
+    let unspecified: IpAddr = match peer {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    let toward = || {
+        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).ok()?;
+        socket.connect(SocketAddr::new(peer, 9)).ok()?;
+        Some(socket.local_addr().ok()?.ip()).filter(|ip| !ip.is_unspecified())
+    };
+    toward().or_else(detect_primary_local_ip)
+}
+
 pub fn detect_primary_local_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
     socket.connect(SocketAddr::from(([1, 1, 1, 1], 80))).ok()?;
@@ -782,12 +820,61 @@ pub fn validate_port(port: u16) -> std::result::Result<(), ConfigValidationError
     }
 }
 
+/// Accepts what the node can dial as `{host}:{port}`: an IPv4 address, an
+/// IPv6 address in brackets, or a DNS host name.
 pub fn validate_host(host: &str) -> std::result::Result<(), ConfigValidationError> {
-    if host.trim().is_empty() {
-        Err(ConfigValidationError::EmptyHost)
-    } else {
-        Ok(())
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(ConfigValidationError::EmptyHost);
     }
+    if let Some(inner) = host.strip_prefix('[') {
+        return match inner.split_once(']') {
+            Some((address, "")) if address.parse::<std::net::Ipv6Addr>().is_ok() => Ok(()),
+            Some((address, rest))
+                if address.parse::<std::net::Ipv6Addr>().is_ok() && rest.starts_with(':') =>
+            {
+                Err(ConfigValidationError::HostHasPort)
+            }
+            _ => Err(ConfigValidationError::InvalidHost),
+        };
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err(ConfigValidationError::UnbracketedIpv6);
+    }
+    if let Some((name, port)) = host.rsplit_once(':') {
+        return if !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && (name.parse::<Ipv4Addr>().is_ok() || is_host_name(name))
+        {
+            Err(ConfigValidationError::HostHasPort)
+        } else {
+            Err(ConfigValidationError::InvalidHost)
+        };
+    }
+    if host.parse::<Ipv4Addr>().is_ok() || is_host_name(host) {
+        Ok(())
+    } else {
+        Err(ConfigValidationError::InvalidHost)
+    }
+}
+
+/// An RFC 1123 host name: dot-separated labels of letters, digits and
+/// hyphens, none starting or ending with a hyphen. A name made only of
+/// digits and dots is a mistyped IPv4 address, not a name.
+fn is_host_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty()
+        && name.len() <= 253
+        && !name.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn split_host_port(value: &str) -> Option<(&str, &str)> {
@@ -802,6 +889,19 @@ fn split_host_port(value: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ip_toward_follows_the_route_to_the_peer() {
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        assert_eq!(local_ip_toward("127.0.0.1"), Some(loopback));
+        assert_eq!(
+            local_ip_toward("[::1]"),
+            Some(std::net::Ipv6Addr::LOCALHOST.into())
+        );
+        // Host names and an empty host never resolve; they use the default route.
+        assert_eq!(local_ip_toward("tera.local"), detect_primary_local_ip());
+        assert_eq!(local_ip_toward(""), detect_primary_local_ip());
+    }
 
     #[tokio::test]
     async fn config_round_trip() {
@@ -956,18 +1056,53 @@ backend = "auto"
     }
 
     #[test]
+    fn hosts_must_be_dialable() {
+        for ok in [
+            "192.168.0.11",
+            " 192.168.0.11 ",
+            "lua",
+            "lua.local",
+            "my-pc.example.com.",
+            "[fd00::1]",
+            "[::1]",
+        ] {
+            assert_eq!(validate_host(ok), Ok(()), "{ok}");
+        }
+        for (bad, expected) in [
+            ("not a host!", ConfigValidationError::InvalidHost),
+            ("lua_pc", ConfigValidationError::InvalidHost),
+            ("-lua", ConfigValidationError::InvalidHost),
+            ("192.168.0.300", ConfigValidationError::InvalidHost),
+            ("192.168.0", ConfigValidationError::InvalidHost),
+            ("[fd00::1", ConfigValidationError::InvalidHost),
+            ("[lua]", ConfigValidationError::InvalidHost),
+            ("http://lua", ConfigValidationError::InvalidHost),
+            ("fd00::1", ConfigValidationError::UnbracketedIpv6),
+            ("192.168.0.11:42420", ConfigValidationError::HostHasPort),
+            ("lua.local:42420", ConfigValidationError::HostHasPort),
+            ("[fd00::1]:42420", ConfigValidationError::HostHasPort),
+        ] {
+            assert_eq!(validate_host(bad), Err(expected), "{bad}");
+        }
+    }
+
+    #[test]
     fn phone_settings_are_optional_and_share_the_clipboard_by_default() {
         let config = AppConfig::receiver_default();
         assert!(config.phone.forward_clipboard_to_pcs);
+        assert!(!config.phone.send_clipboard_to_phones);
         let saved = toml::to_string_pretty(&config).unwrap();
         assert!(!saved.contains("[phone]"), "{saved}");
         let reloaded: AppConfig = toml::from_str(&saved).unwrap();
         assert!(reloaded.phone.forward_clipboard_to_pcs);
 
         let mut text = saved;
-        text.push_str("\n[phone]\nforward_clipboard_to_pcs = false\n");
+        text.push_str(
+            "\n[phone]\nforward_clipboard_to_pcs = false\nsend_clipboard_to_phones = true\n",
+        );
         let loaded: AppConfig = toml::from_str(&text).unwrap();
         assert!(!loaded.phone.forward_clipboard_to_pcs);
+        assert!(loaded.phone.send_clipboard_to_phones);
     }
     #[test]
     fn explicit_notification_membership_survives_config_roundtrip() {

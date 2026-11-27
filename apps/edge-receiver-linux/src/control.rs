@@ -17,7 +17,8 @@
 //! arm-pairing         → ok | error <message>
 //! ```
 //!
-//! The settings window uses the same commands.
+//! The settings window uses the same commands. A client that starts with a
+//! NUL byte speaks the framed protocol in `control_v1` instead.
 
 use std::{
     os::unix::fs::PermissionsExt,
@@ -28,7 +29,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
     time,
@@ -36,6 +37,7 @@ use tokio::{
 
 use crate::{
     AbortOnDropTask, append_portable_log,
+    control_v1::ControlContext,
     phone::{PairingOffer, PhoneRequest},
     tray::{ReceiverTrayHandle, TrayCommand, TrayStatus},
 };
@@ -51,8 +53,7 @@ pub(crate) enum ControlCommand {
 }
 
 pub(crate) fn socket_path() -> Option<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    Some(PathBuf::from(runtime).join("edge-kvm").join("control.sock"))
+    edge_control::endpoint::socket_path()
 }
 
 /// Starts serving the control socket. Returns `None` (after logging why) if
@@ -62,6 +63,7 @@ pub(crate) async fn spawn_server(
     tray: Option<ReceiverTrayHandle>,
     log_path: &Path,
     notifications: crate::notification_setup::NotificationControl,
+    config_path: &Path,
 ) -> Option<AbortOnDropTask> {
     let Some(path) = socket_path() else {
         append_portable_log(
@@ -72,14 +74,14 @@ pub(crate) async fn spawn_server(
     };
     match bind(&path).await {
         Ok(listener) => {
-            let log_path = log_path.to_path_buf();
-            Some(AbortOnDropTask(tokio::spawn(serve(
-                listener,
+            let context = ControlContext {
                 requests,
                 tray,
-                log_path,
-                notifications,
-            ))))
+                notifications: Some(notifications),
+                config_path: config_path.to_path_buf(),
+                log_path: log_path.to_path_buf(),
+            };
+            Some(AbortOnDropTask(tokio::spawn(serve(listener, context))))
         }
         Err(error) => {
             tracing::warn!(%error, "control socket unavailable");
@@ -106,44 +108,44 @@ async fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn serve(
-    listener: UnixListener,
-    requests: mpsc::UnboundedSender<PhoneRequest>,
-    tray: Option<ReceiverTrayHandle>,
-    log_path: PathBuf,
-    notifications: crate::notification_setup::NotificationControl,
-) {
+async fn serve(listener: UnixListener, context: ControlContext) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(error) => {
                 append_portable_log(
-                    &log_path,
+                    &context.log_path,
                     format!("control socket accept failed: {error:#}"),
                 );
                 time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
-        let requests = requests.clone();
-        let tray = tray.clone();
-        let notifications = notifications.clone();
+        let context = context.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, requests, tray, Some(notifications)).await {
+            if let Err(error) = handle_client(stream, context).await {
                 tracing::debug!(%error, "control client ended");
             }
         });
     }
 }
 
-async fn handle_client(
-    stream: UnixStream,
-    requests: mpsc::UnboundedSender<PhoneRequest>,
-    tray: Option<ReceiverTrayHandle>,
-    notifications: Option<crate::notification_setup::NotificationControl>,
-) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut line = String::new();
+async fn handle_client(stream: UnixStream, context: ControlContext) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut first = [0; 1];
+    if reader.read(&mut first).await? == 0 {
+        return Ok(());
+    }
+    if first[0] == 0 {
+        return Ok(crate::control_v1::serve(reader, writer, context).await?);
+    }
+    let ControlContext {
+        requests,
+        tray,
+        notifications,
+        ..
+    } = context;
+    let mut line = String::from_utf8_lossy(&first).into_owned();
     BufReader::new(reader).read_line(&mut line).await?;
     let mut words = line.split_whitespace();
     let response = match (words.next(), words.collect::<Vec<_>>().join(" ")) {
@@ -294,6 +296,16 @@ fn render_qr(data: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn test_context(requests: mpsc::UnboundedSender<PhoneRequest>) -> ControlContext {
+        ControlContext {
+            requests,
+            tray: None,
+            notifications: None,
+            config_path: PathBuf::from("receiver.toml"),
+            log_path: PathBuf::from("receiver.log"),
+        }
+    }
+
     #[test]
     fn pairing_links_fit_in_a_terminal_qr_code() {
         let uri = "hyprmobile://pair?v=1&fp=bb73d9ee:6e6f1951:991b0dec:b716843a&port=42420\
@@ -307,7 +319,7 @@ mod tests {
     async fn pair_phone_reports_the_link_and_the_paired_phone() {
         let (requests_tx, mut requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx, None, None));
+        tokio::spawn(handle_client(server, test_context(requests_tx)));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"pair-phone\n").await.unwrap();
 
@@ -340,6 +352,7 @@ mod tests {
             peer: Some("Main PC".to_string()),
             round_trip_ms: Some(4),
             diagnostics: vec![("last error", "none".to_string())],
+            snapshot: crate::control_v1::headless_snapshot(),
         };
         assert_eq!(
             status_reply(&status),
@@ -351,7 +364,7 @@ mod tests {
     async fn unknown_commands_are_refused() {
         let (requests_tx, _requests) = mpsc::unbounded_channel();
         let (client, server) = UnixStream::pair().unwrap();
-        tokio::spawn(handle_client(server, requests_tx, None, None));
+        tokio::spawn(handle_client(server, test_context(requests_tx)));
         let (reader, mut writer) = client.into_split();
         writer.write_all(b"format-disk\n").await.unwrap();
         let mut lines = BufReader::new(reader).lines();
